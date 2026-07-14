@@ -217,7 +217,24 @@ log:
 
 #### Step 1: Dataset Download & Preprocessing
 ```bash
-# First, download datasets from their original sources (see Dataset Guide)
+# Download selected OpenNeuro datasets to the expected raw-data layout
+# (preferred: datalad; fallback: git + git-annex)
+scripts/download_datasets.sh
+
+# Optional examples:
+# scripts/download_datasets.sh --dataset adftd
+# scripts/download_datasets.sh --dataset chisco --timeout 10800
+# scripts/download_datasets.sh --force
+
+# Dataset install targets:
+# assets/data/raw/ADFTD/data
+# assets/data/raw/Chisco/data
+
+# Notes:
+# - Already installed datasets are skipped automatically.
+# - If a download times out, rerun to resume or increase timeout via
+#   --timeout or OPENNEURO_TIMEOUT_SECONDS.
+
 # Then preprocess with standardized pipeline
 # Config file can be identified by absolute path or relative path to CONF_ROOT
 python preproc.py conf_file=preproc/preproc_example.yaml
