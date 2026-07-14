@@ -1,46 +1,12 @@
-# Please install torch by official command in https://pytorch.org/get-started/locally/
-# IMPORTANT: torchaudio is not supported since torch 2.9, but it is required by braindecode
+# 1) Install torch first using the official selector:
+#    https://pytorch.org/get-started/locally/
+#
+# 2) Install essential dependencies for model evaluation + basic plots (e.g. t-SNE):
+#    pip install -r requirements.txt
+#
+# Optional extras:
+#    pip install -r requirements/supervised.txt       # EEGNet / EEGConformer (braindecode)
+#    pip install -r requirements/bendr.txt            # BENDR-specific extras
+#    pip install --no-deps -r requirements/interpretabilty.txt  # Integrated Gradients (captum)
 
-# torch
-# torchaudio
-# torchvision
-
-# These packages are required in some scenarios but may cause conflicts with other packages
-# IMPORTANT: EEGNet and EEGConformer require braindecode package
-# IMPORTANT: captum can be installed with --no-deps option as it supports numpy > 2.0
-
-# braindecode
-# moabb
-# captum
-
-mne
-s3fs
-tqdm
-h5py
-dill
-pytz
-timm
-torch
-scipy
-numpy
-wandb
-plotly
-pyyaml
-pandas
-einops
-seaborn
-debugpy
-pyarrow
-comet_ml
-openpyxl
-pydantic
-mne-bids
-datasets
-omegaconf
-matplotlib
-safetensors
-multiprocess
-transformers
-scikit-learn
-huggingface_hub
-linear_attention_transformer
+-r requirements/base.txt

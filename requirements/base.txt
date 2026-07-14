@@ -1,0 +1,30 @@
+# Essential dependencies for model evaluation and basic analysis plots.
+# Torch is intentionally excluded; install it first from:
+# https://pytorch.org/get-started/locally/
+
+mne
+mne-bids
+numpy
+scipy
+pandas
+matplotlib
+seaborn
+scikit-learn
+pyyaml
+pydantic
+omegaconf
+tqdm
+h5py
+pyarrow
+multiprocess
+datasets
+s3fs
+pytz
+einops
+timm
+transformers
+safetensors
+huggingface_hub
+linear_attention_transformer
+wandb
+comet_ml

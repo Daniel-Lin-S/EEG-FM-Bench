@@ -1,0 +1,5 @@
+# required for the supervised baselines EEGNet and EEGConformer
+
+-r base.txt
+
+braindecode

@@ -1,0 +1,7 @@
+# required if the EEG-FM model BENDR needs to be tested.
+
+-r base.txt
+
+moabb
+parse
+pyyaml-include
