@@ -1,0 +1,133 @@
+# parameters for the pre-trained versions of BrainOmni
+# (a multitask foundation model for EEG and MEG)
+
+# Basic configuration
+seed: 42
+master_port: 51901
+multitask: true
+model_type: brainomni
+
+# Data configuration
+data:
+  batch_size: 32
+  num_workers: 1
+  datasets:
+    tuab: finetune
+    seed: finetune_sub_dependent
+    hmc: finetune
+    # ...
+
+# Model configuration
+model:
+  # Directory containing model_cfg.json and BrainOmni.pt
+  pretrained_path: BrainOmni/ckpt_collection/tiny
+
+  # Deprecated compatibility field; ignored in vendored runtime mode
+  repo_path: null
+
+  position_montage: auto
+  normalize_input: true
+  normalize_position: true
+  allow_missing_positions: true  # set to true if allow missing positions to be filled with zeros
+  signal_normalize_eps: 1.0e-5
+  position_normalize_eps: 1.0e-8
+
+  # Checkpoint loading behavior
+  freeze_tokenizer: false
+  strict_load: false
+
+  # Fallback architecture configuration (used only when pretrained_path is null)
+  window_length: 512
+  n_filters: 32
+  ratios: [8, 4, 2]
+  kernel_size: 5
+  last_kernel_size: 5
+  n_dim: 256
+  n_head: 4
+  n_neuro: 16
+  dropout: 0.0
+  codebook_dim: 256
+  codebook_size: 512
+  num_quantizers: 4
+  rotation_trick: true
+  quantize_optimize_method: ema
+
+  overlap_ratio: 0.25
+  lm_dim: 256
+  lm_head: 8
+  lm_depth: 12
+  lm_dropout: 0.1
+  mask_ratio: 0.5
+  num_quantizers_used: 4
+
+  # Classifier head configuration
+  classifier_head:
+    # Options: avg_pool, attention_pool, dual_stream_fusion, flatten_mlp, flatten_linear
+    head_type: avg_pool
+
+    # Common parameters
+    hidden_dims: [128]
+    dropout: 0.3
+
+    # Attention pool parameters
+    attn_n_head: 4
+    attn_head_dim: 64
+
+    # Dual stream fusion parameters
+    # Options for fusion_mode: time_first, channel_first, dual
+    fusion_mode: dual
+    fusion_n_head: 4
+    fusion_head_dim: 64
+    fusion_use_rope: true
+    fusion_rope_theta: 10000.0
+    fusion_max_seq_len: 1024
+
+# Training configuration
+training:
+  max_epochs: 20
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+
+  lr_schedule: cosine
+  max_lr: 5e-4
+  encoder_lr_scale: 0.5
+  warmup_epochs: 2
+  warmup_scale: 1e-1
+  pct_start: 0.2
+  min_lr: 5e-5
+
+  use_amp: true
+  freeze_encoder: false
+
+  # LoRA configuration
+  lora:
+    use_lora: false
+    lora_r: 8
+    lora_alpha: 16
+    lora_dropout: 0.0
+    lora_target_modules: [default]
+    lora_exclude_modules: null
+    # Options: default, full, attention, ffn
+    lora_target_type: default
+    # Options: transformer, full
+    lora_scope: transformer
+    lora_lr_scale: 1.0
+
+# Logging configuration
+logging:
+  experiment_name: brainomni
+  run_dir: assets/run
+
+  use_cloud: true
+  cloud_backend: wandb
+  project: brainomni
+  offline: false
+
+  tags:
+    - brainomni
+    - uni
+    - avg_pool
+    - full
+
+  log_step_interval: 1
+  ckpt_interval: 20

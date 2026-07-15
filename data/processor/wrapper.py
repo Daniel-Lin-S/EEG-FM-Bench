@@ -1,6 +1,8 @@
 import logging
-from typing import Type, Optional
+import warnings
+from typing import Optional, Type
 
+import mne
 import torch
 import datasets
 from torch import Tensor
@@ -87,6 +89,78 @@ DATASET_SELECTOR: dict[str, Type[EEGDatasetBuilder]] = {
     'chisco': ChiscoBuilder,
     'open_miir': OpenMiirBuilder,
 }
+
+
+def split_dataset_montage_key(montage_key: str) -> tuple[str, str]:
+    """Split EEG-FM-Bench montage key into dataset and montage name.
+
+    Parameters
+    ----------
+    montage_key : str
+        Full montage key in the canonical EEG-FM-Bench format
+        ``<dataset_name>/<montage_name>``.
+
+    Returns
+    -------
+    tuple[str, str]
+        A tuple of ``(dataset_name, montage_name)``.
+
+    Raises
+    ------
+    ValueError
+        If ``montage_key`` is empty or does not follow
+        ``<dataset_name>/<montage_name>`` format.
+    """
+    if not montage_key or not montage_key.strip():
+        raise ValueError("Expected non-empty montage key, but got an empty value.")
+
+    dataset_name, sep, montage_name = montage_key.partition("/")
+    if sep == "" or not dataset_name or not montage_name:
+        raise ValueError(
+            "Expected montage key format '<dataset_name>/<montage_name>', "
+            f"but got '{montage_key}'."
+        )
+
+    return dataset_name, montage_name
+
+
+def resolve_mne_montage_name(montage_name: str) -> str:
+    """Resolve a benchmark montage name to an MNE-compatible montage name.
+
+    If the name is already a known MNE montage (case-insensitive), it returns the correct case.
+    Otherwise, it checks a predefined mapping.
+    If no mapping exists, it defaults to 'standard_1020'.
+    """
+    try:
+        raw_entries = mne.channels.get_builtin_montages(descriptions=False)
+    except TypeError:
+        raw_entries = mne.channels.get_builtin_montages()
+
+    # Check for direct match (case-insensitive)
+    for entry in raw_entries:
+        candidate = entry[0] if isinstance(entry, (tuple, list)) else entry
+        if str(candidate).lower() == montage_name.lower():
+            return str(candidate)
+
+    # Custom mapping for benchmark-specific names
+    _BENCHMARK_TO_MNE_MAP = {
+        "01_tcp_ar": "standard_1020",
+        "02_tcp_le": "standard_1020",
+        "03_tcp_ar_a": "standard_1020",
+        "10_20": "standard_1020",
+    }
+
+    if montage_name in _BENCHMARK_TO_MNE_MAP:
+        return _BENCHMARK_TO_MNE_MAP[montage_name]
+
+    # Default to standard_1020 if nothing else matches
+    log.warning(
+        "Montage name '%s' not found in MNE built-ins or benchmark mapping. "
+        "Defaulting to 'standard_1020'.",
+        montage_name,
+    )
+    return "standard_1020"
+
 
 def get_dataset_patch_len(dataset_name: str, config_name: str) -> int:
     config: EEGConfig = DATASET_SELECTOR[dataset_name].builder_configs.get(config_name)

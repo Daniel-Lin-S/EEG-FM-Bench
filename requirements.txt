@@ -7,6 +7,7 @@
 # Optional extras:
 #    pip install -r requirements/supervised.txt       # EEGNet / EEGConformer (braindecode)
 #    pip install -r requirements/bendr.txt            # BENDR-specific extras
+#    pip install -r requirements/brainomni.txt        # BrainOmni-specific runtime deps
 #    pip install --no-deps -r requirements/interpretabilty.txt  # Integrated Gradients (captum)
 
 -r requirements/base.txt

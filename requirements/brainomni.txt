@@ -1,0 +1,10 @@
+# required for the BrainOmni baseline runtime in EEG-FM-Bench
+
+-r base.txt
+
+einx==0.3.0
+vector-quantize-pytorch==1.22.10
+
+# optional: install for multi-process distributed communication matching
+# upstream BrainOmni behavior; single-process inference/training uses fallback.
+# deepspeed==0.16.3

@@ -19,6 +19,9 @@ from baseline.bendr.bendr_config import BendrConfig
 from baseline.bendr.bendr_trainer import BendrTrainer
 from baseline.biot.biot_config import BiotConfig
 from baseline.biot.biot_trainer import BiotTrainer
+from baseline.brainomni.brainomni_adapter import BrainOmniDataLoaderFactory
+from baseline.brainomni.brainomni_config import BrainOmniConfig
+from baseline.brainomni.brainomni_trainer import BrainOmniTrainer
 from baseline.mantis import MantisConfig, MantisDataLoaderFactory, MantisTrainer
 from baseline.moment import MomentConfig, MomentDataLoaderFactory, MomentTrainer
 from baseline.reve.reve_adapter import ReveDataLoaderFactory
@@ -51,6 +54,13 @@ ModelRegistry.register_model(
     config_class=BiotConfig,
     adapter_class=None,
     trainer_class=BiotTrainer
+)
+
+ModelRegistry.register_model(
+    model_type='brainomni',
+    config_class=BrainOmniConfig,
+    adapter_class=BrainOmniDataLoaderFactory,
+    trainer_class=BrainOmniTrainer
 )
 
 ModelRegistry.register_model(

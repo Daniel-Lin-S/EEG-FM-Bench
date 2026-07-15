@@ -18,7 +18,32 @@ logger = logging.getLogger('baseline')
 
 
 class AbstractDatasetAdapter(Dataset, ABC):
-    """Abstract base adapter for dataset processing."""
+    """
+    Abstract base adapter for dataset processing.
+
+    This provides a common interface to build model-specific
+    input tensors from raw EEG datasets. Subclasses should implement
+    the `get_supported_channels` method.
+
+    Attributes
+    ----------
+    model_name : str
+        Name of the model.
+    dataset : HFDataset
+        The Hugging Face dataset instance.
+    dataset_names : List[str]
+        Names of the datasets.
+    dataset_configs : List[str]
+        Configurations of the datasets.
+    montage_mappings : Dict[str, Dict[str, Any]]
+        Mappings from montages to model-specific channel indices.
+        Will be filled by the `_build_montage_mappings` method.
+    scale : float
+        The scaling factor applied to the raw EEG data.
+        The raw EEG provided in HFDataset is in microvolts,
+        this scale can be used for unit conversion or magnitude control.
+        For example, if the model accepts mV, set scale to 0.001.
+    """
     
     def __init__(self, dataset: HFDataset, dataset_names: List[str], dataset_configs: List[str]):
         self.model_name = ''

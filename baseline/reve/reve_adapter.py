@@ -2,7 +2,6 @@ from typing import List, Dict, Any
 
 import torch
 from datasets import Dataset as HFDataset
-from torch import Tensor
 
 from baseline.abstract.adapter import AbstractDatasetAdapter, AbstractDataLoaderFactory
 from baseline.reve.pos_bank import RevePositionBank
