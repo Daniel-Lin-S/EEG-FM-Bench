@@ -7,8 +7,6 @@ from typing import Optional, Union, Any
 
 import datasets
 import mne_bids
-import numpy as np
-import pandas as pd
 from mne.io import BaseRaw
 from pandas import DataFrame
 from tqdm import tqdm
@@ -204,78 +202,6 @@ class HBNBuilder(EEGDatasetBuilder):
         'E83': 'O2',
     }
 
-    def preproc(self, n_proc: Optional[int] = None):
-        if self._is_preproc_cached():
-            logger.info(f'Using cached summary info at {self.info_csv_path}')
-            return
-
-        if self.config.is_remote_fs:
-            self._run_func_parallel(self._s3_link_test, [None], desc='Testing S3')
-
-        np.random.seed(self.config.seed)
-        self.clean_disk_cache()
-        self.create_dir_structure()
-
-        self._fix_channel_tsv(n_proc)
-        data_files = self._walk_raw_data_files()
-        info_df = self._gather_data_info(data_files, n_proc)
-        info_df = self._exclude_wrong_data(info_df, n_proc)
-        split_df = self._divide_split(info_df)
-        split_df.to_csv(self.info_csv_path, index=False)
-
-        self._generate_middle_files(split_df, n_proc)
-
-        self._mark_preproc_done()
-
-    def _fix_channel_tsv(self, n_proc: Optional[int] = None):
-        target_rels = [10]
-        logger.info('Checking HBN BIDS channel config...')
-        tsv_list = []
-        for rel in target_rels:
-            if rel not in self.config.release:
-                continue
-
-            release_path = os.path.join(self.config.raw_path, self.config.scan_sub_dir, f"HBN{str(rel)}")
-            bids_path = BIDSPath(
-                datatype="eeg",
-                root=release_path,
-                suffix='channels',
-                extension=".tsv"
-            )
-            matched_paths = bids_path.match()
-            tsv_list.extend([str(path.fpath) for path in matched_paths])
-
-            # for subject in get_entity_vals(release_path, "subject"):
-            #     bids_path = BIDSPath(
-            #         subject=subject, datatype="eeg", root=release_path,
-            #         extension=".tsv", suffix='channels'
-            #     )
-            #
-            #     for path in matched_paths:
-            #         tsv_list.append(path.fpath)
-            #         # logger.info(f'Find tsv file {path.fpath}')
-
-        self._run_func_parallel(
-            self._fix_tsv,
-            tsv_list,
-            n_proc=n_proc,
-            desc='Fixing tsv files'
-        )
-
-    @staticmethod
-    def _fix_tsv(path: str):
-        df = pd.read_csv(str(path), sep='\t', na_values=["n/a"])
-        pattern = r'^E(12[0-8]|1[0-1][0-9]|[1-9]?[0-9])$|^Cz$'
-        mask = df["name"].str.match(pattern, na=False)
-
-        df["type"] = df["type"].astype(object)
-        df["units"] = df["units"].astype(object)
-        df.loc[mask, "type"] = "EEG"
-        df.loc[mask, "units"] = "uV"
-
-        df.to_csv(str(path), sep='\t', index=False)
-        logger.info(f'Fixing channel tsv file at {path}')
-
     def _walk_raw_data_files(self):
         raw_data_files = []
         logger.info('Parsing HBN BIDS path...')
@@ -346,6 +272,14 @@ class HBNBuilder(EEGDatasetBuilder):
             )
             bids_path = mne_bids.get_bids_path_from_fname(file_path)
             raw = mne_bids.read_raw_bids(bids_path, verbose=verbose)
+            # HBN release 10 marks these channels incorrectly in channels.tsv.
+            # Correct their interpretation in memory; never alter source files.
+            eeg_channels = {
+                name: 'eeg' for name in raw.ch_names
+                if name == 'Cz' or (name.startswith('E') and name[1:].isdigit() and 1 <= int(name[1:]) <= 128)
+            }
+            if eeg_channels:
+                raw.set_channel_types(eeg_channels, on_unit_change='ignore')
             raw = raw.load_data()
             return raw
         # bids_path = mne_bids.get_bids_path_from_fname(file_path)

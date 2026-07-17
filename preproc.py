@@ -1,3 +1,37 @@
+"""Build preprocessed datasets from a YAML configuration.
+
+Configuration parameters
+------------------------
+conf_file : str, optional (CLI only), default=None
+    Path, name, or repository-relative name of the YAML to load. When omitted,
+    no file is loaded and ``BasePreprocArgs`` defaults are used.
+fs : int, optional, default=256
+    Sampling rate in Hz supplied to every dataset builder. It determines the
+    resampled data written to disk and must match training.
+clean_middle_cache : bool, optional, default=False
+    Clears a selected builder's intermediate disk cache before rebuilding it.
+clean_shared_info : bool, optional, default=False
+    Also clears shared builder metadata during cache cleanup; ignored unless
+    ``clean_middle_cache`` is true.
+num_preproc_arrow_writers : int, optional, default=4
+    Worker processes used by ``download_and_prepare`` to materialize the final
+    Arrow dataset.
+num_preproc_mid_workers : int, optional, default=6
+    Worker processes used by the builder's ``preproc`` call to create
+    intermediate processed records.
+pretrain_datasets : list[str], optional, default=[]
+    Registry names built with the builder configuration named ``pretrain``.
+finetune_datasets : dict[str, str], optional, default={}
+    Dataset registry name to builder-configuration mapping for fine-tuning,
+    e.g. ``tuab: finetune``.
+    For 'pretrain' configuration, no label is stored and test ratio is 0.
+    For 'finetune' or related configurations (e.g., `finetune-reach`), segments are labelled and test-split is preserved.
+
+Values passed after ``conf_file`` on the command line override YAML values.
+Every dataset and configuration is checked against ``DATASET_SELECTOR`` before
+it runs. ``common.conf.BasePreprocArgs`` documents the validation schema.
+"""
+
 import logging
 from typing import Type
 

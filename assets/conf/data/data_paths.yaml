@@ -1,0 +1,11 @@
+# Git-tracked template. Copy to data_paths.local.yaml and edit that local file.
+# The local file is ignored by Git and is loaded by every Python entry point.
+#
+# Generated processed datasets, cache files, summaries, logs, and default runs
+# are stored below output_root.
+# Summaries are stored at output_root/summary/<dataset_name>/<config>.
+output_root: /path/to/eeg-fm-bench
+
+# Each value is the exact directory scanned for that dataset. Omit an entry to retain the default legacy layout:
+# assets/data/raw/<suffix_path>/<scan_sub_dir>.
+raw_roots: {}

@@ -20,10 +20,7 @@ data:
 # Model configuration
 model:
   # Directory containing model_cfg.json and BrainOmni.pt
-  pretrained_path: BrainOmni/ckpt_collection/tiny
-
-  # Deprecated compatibility field; ignored in vendored runtime mode
-  repo_path: null
+  pretrained_path: ... # FILL
 
   position_montage: auto
   normalize_input: true

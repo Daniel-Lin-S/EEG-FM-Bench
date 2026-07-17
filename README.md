@@ -186,15 +186,44 @@ For bash/zsh:
 ```bash
 export EEGFM_PROJECT_ROOT=$PWD
 export EEGFM_CONF_ROOT=$PWD/assets/conf
-export EEGFM_RUN_ROOT=$PWD/assets/run
 ```
 
 For PowerShell:
 ```powershell
 $env:EEGFM_PROJECT_ROOT = (Get-Location).Path
 $env:EEGFM_CONF_ROOT = "$env:EEGFM_PROJECT_ROOT/assets/conf"
-$env:EEGFM_RUN_ROOT = "$env:EEGFM_PROJECT_ROOT/assets/run"
 ```
+
+### Shared data paths
+
+All Python entry points read the ignored project-specific file
+`assets/conf/data/data_paths.local.yaml`. Create it from the tracked template once:
+
+```bash
+cp assets/conf/data/data_paths.yaml assets/conf/data/data_paths.local.yaml
+```
+
+Then set one writable output root and, optionally, exact scan roots for individual
+datasets in `data_paths.local.yaml`:
+
+```yaml
+output_root: /data/eeg-fm-bench
+raw_roots:
+  adftd: /data/neural_data/datasets/adftd
+```
+
+A `raw_roots` value is the final directory scanned by that dataset: the framework
+does not append its built-in dataset suffix or `scan_sub_dir`. If a dataset is not
+listed, the legacy layout remains `assets/data/raw/<suffix_path>/<scan_sub_dir>`.
+Generated Arrow datasets, cache files, summaries, logs, and default runs are written
+under `output_root`; summaries are stored at
+`<output_root>/summary/<dataset_name>/<config>/`. Existing summaries in the legacy
+`processed/<dataset-suffix>/summary/<config>/` layout are migrated automatically
+when that dataset/config is next initialized.
+
+Mount configured raw directories read-only (or remove write permission) to enforce
+source-data protection independently of the framework. The sole documented exception
+is `scripts/download_datasets.sh`, which intentionally installs raw source data.
 
 Step 2: **Configure your experiment** using YAML files under `assets/conf/` (values not assigned will be filled by the corresponding Pydantic config class):
 ```yaml
