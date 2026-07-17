@@ -1,20 +1,16 @@
 #!/bin/bash
 #SBATCH --job-name=preproc
-#SBATCH --output=/path/to/your/code/%x_%j.log
-#SBATCH --error=/path/to/your/code/%x_%j.err
+#SBATCH --output=logs/%x_%j.log
+#SBATCH --error=logs/%x_%j.err
+#SBATCH --partition=your_partition
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
-#SBATCH --partition=your_partition
 #SBATCH --mem=256G
 
 
 set -eo pipefail
 SCRIPT_ARGS="$@"
-
-
-ROOT_PATH=/path/to/your/code
-cd $ROOT_PATH
 
 
 echo "======= SLURM ENVIRONMENT ======="
@@ -32,11 +28,6 @@ echo "Current working path: $ROOT_PATH"
 echo "Script arguments: $SCRIPT_ARGS"
 echo "PATH: $PATH"
 echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
-
-
-echo "======= CONDA ENV ======="
-
-conda activate your_conda_env
 echo "Python path: $(which python)"
 
 

@@ -10,6 +10,8 @@ env/
 venv/
 ENV/
 
+logs
+
 *.lock
 *.pyc
 *.bak
@@ -19,3 +21,6 @@ data.lock
 *.pt
 *.ckpt
 *.pth
+
+# Local configurations
+*.local.yaml

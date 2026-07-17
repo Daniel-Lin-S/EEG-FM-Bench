@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=baseline
-#SBATCH --output=/path/to/your/code/%x_%j.log
-#SBATCH --error=/path/to/your/code/%x_%j.err
+#SBATCH --output=logs/%x_%j.log
+#SBATCH --error=logs/%x_%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=2
 #SBATCH --cpus-per-task=8
@@ -12,10 +12,6 @@
 
 # set -eo pipefail
 SCRIPT_ARGS="$@"
-
-
-ROOT_PATH=/path/to/your/code
-cd $ROOT_PATH
 
 # Debug Option
 #export CUDA_LAUNCH_BLOCKING=1
@@ -37,9 +33,6 @@ echo "Current working path: $ROOT_PATH"
 echo "Script arguments: $SCRIPT_ARGS"
 echo "PATH: $PATH"
 echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
-
-
-conda activate your_conda_env
 echo "Python path: $(which python)"
 
 
