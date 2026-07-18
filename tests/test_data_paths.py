@@ -9,6 +9,20 @@ from common.summary import build_summary_path, migrate_legacy_summary_artifacts
 
 
 class DataPathTests(unittest.TestCase):
+    def test_inria_bci_discovers_only_recording_csvs_from_root_layout(self):
+        source = Path('data/dataset/inria_bci.py').read_text()
+        self.assertIn('scan_sub_dir: str = ""', source)
+        self.assertIn('return self._filter_raw_data_file_candidates(raw_data_files)', source)
+        self.assertIn("path_parts[0] in {'train', 'test'}", source)
+        self.assertIn("re.fullmatch(r'Data_S\\d{2}_Sess\\d{2}\\.csv', path_parts[1])", source)
+
+    def test_inria_bci_uses_shared_candidate_validation_guard(self):
+        source = Path('data/processor/builder.py').read_text()
+        self.assertIn('def _is_valid_raw_data_file(self, file_path: str) -> bool:', source)
+        self.assertIn('def _filter_raw_data_file_candidates(self, file_paths: list[str]) -> list[str]:', source)
+        self.assertIn("logger.warning(f'Skipping non-recording data file: {file_path}')", source)
+        self.assertIn('if not self._is_valid_raw_data_file(data):', source)
+
     def test_runtime_uses_ignored_local_data_paths_file(self):
         self.assertTrue(path.DATA_PATHS_FILE.endswith('data_paths.local.yaml'))
         self.assertTrue(path.DATA_PATHS_TEMPLATE_FILE.endswith('data_paths.yaml'))

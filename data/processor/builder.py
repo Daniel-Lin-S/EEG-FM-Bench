@@ -735,6 +735,25 @@ class EEGDatasetBuilder(datasets.GeneratorBasedBuilder, ABC):
                     raw_data_files.append(os.path.normpath(file_path))
         return raw_data_files
 
+    def _is_valid_raw_data_file(self, file_path: str) -> bool:
+        """Return whether a discovered file is a recording for this dataset.
+
+        Dataset builders can override this hook when their raw directories contain
+        auxiliary files with the same extension as recordings. The default keeps
+        the existing permissive discovery behavior.
+        """
+        return True
+
+    def _filter_raw_data_file_candidates(self, file_paths: list[str]) -> list[str]:
+        """Remove non-recording candidates before metadata parsing."""
+        valid_files = []
+        for file_path in file_paths:
+            if self._is_valid_raw_data_file(file_path):
+                valid_files.append(file_path)
+            else:
+                logger.warning(f'Skipping non-recording data file: {file_path}')
+        return valid_files
+
     def _gather_data_info(self, data_files: list[str], n_proc: Optional[int] = None):
         results = self._run_func_parallel(
             self._gather_files,
@@ -751,6 +770,9 @@ class EEGDatasetBuilder(datasets.GeneratorBasedBuilder, ABC):
 
     def _gather_files(self, data: str):
         try:
+            if not self._is_valid_raw_data_file(data):
+                logger.warning(f'Skipping non-recording data file: {data}')
+                return None
             info = {'path': data}
             info.update(self._resolve_exp_meta_info(data))
             annotations = self._resolve_exp_events(data, info)

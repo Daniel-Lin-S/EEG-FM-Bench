@@ -1,4 +1,5 @@
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Optional, Union, Any
 
@@ -67,7 +68,7 @@ class InriaBciConfig(EEGConfig):
     wnd_post: int = 2
 
     suffix_path: str = os.path.join('Infra BCI Challenge', 'inria-bci-challenge')
-    scan_sub_dir: str = "data"
+    scan_sub_dir: str = ""
 
     category: list[str] = field(default_factory=lambda: [
         'wrong', 'correct'
@@ -95,7 +96,17 @@ class InriaBciBuilder(EEGDatasetBuilder):
                         continue
                     file_path = os.path.join(root, file)
                     raw_data_files.append(os.path.normpath(file_path))
-        return raw_data_files
+        return self._filter_raw_data_file_candidates(raw_data_files)
+
+    def _is_valid_raw_data_file(self, file_path: str) -> bool:
+        """Accept only Inria BCI recording CSVs directly under train/ or test/."""
+        relative_path = os.path.relpath(file_path, self.config.raw_path)
+        path_parts = relative_path.split(os.sep)
+        return (
+            len(path_parts) == 2
+            and path_parts[0] in {'train', 'test'}
+            and re.fullmatch(r'Data_S\d{2}_Sess\d{2}\.csv', path_parts[1]) is not None
+        )
 
     def _resolve_file_name(self, file_path: str) -> dict[str, Any]:
         file_name = self._extract_file_name(file_path)
