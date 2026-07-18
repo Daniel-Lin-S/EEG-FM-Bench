@@ -31,7 +31,7 @@ echo "Current working path: ${ROOT_PATH}"
 printf 'Script arguments  :'
 printf ' %q' "$@"
 printf '\n'
-echo "Python path: $(which python)"
+echo "Python command    : ${PYTHON}"
 
 echo "======= SYSTEM SETUP ======="
 echo "PATH: ${PATH}"
@@ -47,5 +47,10 @@ else
   EXIT_CODE=$?
 fi
 
-report_exit_status "${EXIT_CODE}" "preprocessing"
+# Normal runs end with the dataset-level summary emitted by preproc.py. Only
+# append a shell fallback when Python could not report its own final status.
+case "${EXIT_CODE}" in
+  126|127|130|137|143) report_exit_status "${EXIT_CODE}" "preprocessing" ;;
+esac
+
 exit "${EXIT_CODE}"

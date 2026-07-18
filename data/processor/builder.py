@@ -322,6 +322,8 @@ class EEGDatasetBuilder(datasets.GeneratorBasedBuilder, ABC):
 
         self._std_chs_cache:dict[str, list[str]] = {}
         self._std_chs_idx_cache: dict[str, ndarray] = {}
+        self.preproc_warning_count = 0
+        self.preproc_warning_messages: list[str] = []
 
         if self.config.is_remote_fs:
             self.s3_conf = OmegaConf.load(self.config.s3_conf_path)
@@ -416,6 +418,8 @@ class EEGDatasetBuilder(datasets.GeneratorBasedBuilder, ABC):
             logger.info(f'Using cached summary info at {self.info_csv_path}')
             return
 
+        self.preproc_warning_count = 0
+        self.preproc_warning_messages = []
         if self.config.is_remote_fs:
             self._run_func_parallel(self._s3_link_test, [None], desc='Testing S3')
 
@@ -424,8 +428,18 @@ class EEGDatasetBuilder(datasets.GeneratorBasedBuilder, ABC):
         self.create_dir_structure()
 
         data_files = self._walk_raw_data_files()
+        if not data_files:
+            scan_root = os.path.join(self.config.raw_path, self.config.scan_sub_dir)
+            raise RuntimeError(
+                f'No raw recording files matching *.{self.config.file_ext} found under '
+                f'{scan_root} for {self.config.dataset_name}/{self.config.name}'
+            )
         info_df = self._gather_data_info(data_files, n_proc)
         info_df = self._exclude_wrong_data(info_df, n_proc)
+        if info_df.empty:
+            raise RuntimeError(
+                f'No usable recordings remain for {self.config.dataset_name}/{self.config.name}'
+            )
         split_df = self._divide_split(info_df)
         split_df.to_csv(self.info_csv_path, index=False)
 
@@ -435,6 +449,13 @@ class EEGDatasetBuilder(datasets.GeneratorBasedBuilder, ABC):
         self._mark_preproc_done()
 
     # Custom Methods
+    def _record_preproc_warning(self, message: str, count: int = 1) -> None:
+        if count < 1:
+            return
+        self.preproc_warning_count += count
+        self.preproc_warning_messages.append(message)
+        logger.warning(message)
+
     def create_dir_structure(self):
         os.makedirs(self.summary_path, exist_ok=True)
         if self.config.is_remote_fs:
@@ -574,7 +595,17 @@ class EEGDatasetBuilder(datasets.GeneratorBasedBuilder, ABC):
             desc='Generating wnd samples and persisting parquet files')
 
         mid_dfs = [item for item in results if item is not None]
+        skipped_count = len(results) - len(mid_dfs)
+        if skipped_count:
+            self._record_preproc_warning(
+                f'{skipped_count} recording(s) produced no persisted samples',
+                skipped_count,
+            )
+        if not mid_dfs:
+            raise RuntimeError('No recordings produced usable preprocessed samples')
         mid_df: DataFrame = pd.concat(mid_dfs, ignore_index=True, axis=0)
+        if int(mid_df['cnt'].sum()) < 1:
+            raise RuntimeError('Preprocessing produced zero samples')
         mid_df.to_csv(self.mid_file_csv_path, index=False)
 
     def _build_output_dir(self, split: str, filename: str):
@@ -620,7 +651,7 @@ class EEGDatasetBuilder(datasets.GeneratorBasedBuilder, ABC):
                         engine='pyarrow',
                         index=False)
         except Exception as e:
-            logger.error(f"Error persisting example file {path}: {str(e)}")
+            logger.warning(f"Skipping example file {path}: {str(e)}")
             return None
 
         mid_df = pd.DataFrame(data={
@@ -714,14 +745,86 @@ class EEGDatasetBuilder(datasets.GeneratorBasedBuilder, ABC):
             wnds.extend(example_dicts)
         return wnds
 
+    def _done_marker_path(self) -> str:
+        return os.path.join(
+            self.summary_path,
+            f'{self.config.name}_{self.config.get_fs_id()}.done',
+        )
+
     def _mark_preproc_done(self):
-        # Done marker is sampling rate specific
-        with open(os.path.join(self.summary_path, f'{self.config.name}_{self.config.get_fs_id()}.done'), 'w'):
-            pass
+        with open(self._done_marker_path(), 'w', encoding='utf-8') as marker:
+            json.dump({
+                'warning_count': self.preproc_warning_count,
+                'warning_messages': self.preproc_warning_messages,
+            }, marker)
 
     def _is_preproc_cached(self):
-        # Check done marker for specific sampling rate
-        return os.path.exists(os.path.join(self.summary_path, f'{self.config.name}_{self.config.get_fs_id()}.done'))
+        marker_path = self._done_marker_path()
+        required_files = [marker_path, self.info_csv_path, self.mid_file_csv_path]
+        missing_summary_files = [path for path in required_files if not os.path.isfile(path)]
+        if missing_summary_files:
+            if os.path.exists(marker_path):
+                logger.warning(
+                    'Ignoring stale preprocessing marker; missing summary file(s): '
+                    + ', '.join(missing_summary_files)
+                )
+            return False
+
+        try:
+            info_df = pd.read_csv(self.info_csv_path)
+            mid_df = pd.read_csv(self.mid_file_csv_path)
+        except Exception as error:
+            logger.warning(f'Ignoring unreadable preprocessing cache: {error}')
+            return False
+
+        required_columns = {'key', 'split', 'cnt'}
+        if info_df.empty or mid_df.empty or not required_columns.issubset(mid_df.columns):
+            logger.warning('Ignoring incomplete preprocessing cache summary')
+            return False
+        if int(mid_df['cnt'].sum()) < 1:
+            logger.warning('Ignoring preprocessing cache with zero samples')
+            return False
+
+        if not self.config.is_remote_fs:
+            missing_middle_files = []
+            for row in mid_df.to_dict(orient='records'):
+                middle_file = self._build_output_dir(str(row['split']), str(row['key']))
+                if not os.path.isfile(middle_file):
+                    missing_middle_files.append(middle_file)
+            if missing_middle_files:
+                preview = ', '.join(missing_middle_files[:3])
+                suffix = (
+                    '' if len(missing_middle_files) <= 3
+                    else f' (+{len(missing_middle_files) - 3} more)'
+                )
+                logger.warning(
+                    f'Ignoring stale preprocessing marker; missing intermediate '
+                    f'file(s): {preview}{suffix}'
+                )
+                return False
+
+        self.preproc_warning_count = 0
+        self.preproc_warning_messages = []
+        try:
+            with open(marker_path, encoding='utf-8') as marker:
+                marker_data = json.load(marker)
+        except (json.JSONDecodeError, TypeError):
+            marker_data = {}
+        except OSError as error:
+            logger.warning(f'Ignoring unreadable preprocessing marker: {error}')
+            return False
+        if isinstance(marker_data, dict):
+            try:
+                warning_count = int(marker_data.get('warning_count', 0))
+                warning_messages = marker_data.get('warning_messages', [])
+                if warning_count < 0 or not isinstance(warning_messages, list):
+                    raise ValueError('invalid warning metadata')
+            except (TypeError, ValueError) as error:
+                logger.warning(f'Ignoring invalid preprocessing marker: {error}')
+                return False
+            self.preproc_warning_count = warning_count
+            self.preproc_warning_messages = warning_messages
+        return True
 
     def _walk_raw_data_files(self):
         logger.info('Walking eeg data files...')
@@ -761,12 +864,16 @@ class EEGDatasetBuilder(datasets.GeneratorBasedBuilder, ABC):
             n_proc=n_proc,
             desc='Gathering metadata'
         )
-        data_info = []
-        for result in results:
-            if result is not None:
-                data_info.append(result)
-        df = DataFrame(data_info)
-        return df
+        data_info = [result for result in results if result is not None]
+        skipped_count = len(results) - len(data_info)
+        if skipped_count:
+            self._record_preproc_warning(
+                f'{skipped_count} recording(s) skipped during metadata extraction',
+                skipped_count,
+            )
+        if not data_info:
+            raise RuntimeError('No recordings yielded usable metadata')
+        return DataFrame(data_info)
 
     def _gather_files(self, data: str):
         try:
@@ -779,7 +886,7 @@ class EEGDatasetBuilder(datasets.GeneratorBasedBuilder, ABC):
             info.update({'label': json.dumps(annotations)})
             return info
         except Exception as e:
-            logger.error(f"Error accessing metadata in file {data}: {str(e)}")
+            logger.warning(f"Skipping metadata for file {data}: {str(e)}")
             return None
 
     def _check_data_length(self, df: DataFrame):
