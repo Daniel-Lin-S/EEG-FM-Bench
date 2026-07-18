@@ -69,6 +69,7 @@ class BCIC1AConfig(EEGConfig):
     scan_sub_dir: str = "BCICIV_1calib_1000Hz_mat"
     scan_eval_sub_dir: str = "BCICIV_1eval_1000Hz_mat"
 
+    true_labels_sub_dir: str = "true_labels"
     category: list[str] = field(default_factory=lambda: ['left', 'right', 'foot'])
 
 
@@ -84,8 +85,8 @@ class BCIC1ABuilder(EEGDatasetBuilder):
 
     def _walk_raw_data_files(self):
         scan_path = [os.path.join(self.config.raw_path, self.config.scan_sub_dir)]
-        if not self.config.is_finetune:
-            scan_path.append(os.path.join(self.config.raw_path, self.config.scan_eval_sub_dir))
+        eval_path = os.path.join(self.config.raw_path, self.config.scan_eval_sub_dir)
+        scan_path.append(eval_path)
         raw_data_files = []
         for path in scan_path:
             for root, dirs, files in os.walk(path):
@@ -93,7 +94,36 @@ class BCIC1ABuilder(EEGDatasetBuilder):
                     if file.endswith(self.config.file_ext):
                         file_path = os.path.join(root, file)
                         raw_data_files.append(os.path.normpath(file_path))
+
+        if self.config.is_finetune:
+            eval_files = [path for path in raw_data_files if self._is_eval_file(path)]
+            if eval_files:
+                true_labels_dir = self._true_labels_dir()
+                if not os.path.isdir(true_labels_dir):
+                    raise FileNotFoundError(
+                        'BCIC IV 1a finetune requires the released evaluation labels at '
+                        f'{true_labels_dir}; evaluation recordings were found in {eval_path}.'
+                    )
+                missing_label_files = [
+                    self._true_label_path(path) for path in eval_files
+                    if not os.path.isfile(self._true_label_path(path))
+                ]
+                if missing_label_files:
+                    raise FileNotFoundError(
+                        'Missing BCIC IV 1a evaluation label files: '
+                        + ', '.join(missing_label_files)
+                    )
         return raw_data_files
+
+    def _true_labels_dir(self) -> str:
+        return os.path.join(self.config.raw_path, self.config.true_labels_sub_dir)
+
+    def _is_eval_file(self, file_path: str) -> bool:
+        return os.path.basename(os.path.dirname(file_path)) == self.config.scan_eval_sub_dir
+
+    def _true_label_path(self, file_path: str) -> str:
+        file_name = self._extract_file_name(file_path)
+        return os.path.join(self._true_labels_dir(), f'{file_name}_true_y.mat')
 
     def _resolve_file_name(self, file_path: str) -> dict[str, Any]:
         file_name = self._extract_file_name(file_path)
@@ -121,20 +151,77 @@ class BCIC1ABuilder(EEGDatasetBuilder):
             return [('default', 0, -1)]
 
         data = loadmat(file_path)
+        if self._is_eval_file(file_path):
+            return self._resolve_eval_events(file_path, data)
+
         # time points are given in unit sample
         fs = data['nfo']['fs'][0, 0].item()
         tims = data['mrk']['pos'][0, 0].squeeze() / fs
         labels = data['mrk']['y'][0, 0].squeeze()
-        cls = data['nfo']['classes'][0, 0].squeeze().tolist()
+        cls = self._resolve_class_names(data)
 
         annotations = []
         for i in range(len(labels)):
-            c = cls[0][0] if labels[i] == -1 else cls[1][0]
+            c = cls[0] if labels[i] == -1 else cls[1]
             start = round(1000 * (tims[i].item()))
             end = round(start + 6 * 1000)
-            assert c in self.config.category
+            self._validate_class_name(c, file_path)
             annotations.append((c, start, end))
         return annotations
+
+    def _resolve_eval_events(self, file_path: str, data: dict[str, Any]):
+        """Build labelled motor-imagery intervals from the released true_y vector."""
+        fs = data['nfo']['fs'][0, 0].item()
+        classes = self._resolve_class_names(data)
+        true_y = np.asarray(loadmat(self._true_label_path(file_path))['true_y']).reshape(-1)
+        n_samples = min(data['cnt'].shape[0], len(true_y))
+        true_y = true_y[:n_samples]
+
+        annotations = []
+        sample = 0
+        while sample < n_samples:
+            label = true_y[sample]
+            if not np.isfinite(label) or label == 0:
+                sample += 1
+                continue
+
+            if label not in (-1, 1):
+                raise ValueError(
+                    f'Unexpected true_y value {label!r} in evaluation label file '
+                    f'{self._true_label_path(file_path)}.'
+                )
+
+            end_sample = sample + 1
+            while end_sample < n_samples and true_y[end_sample] == label:
+                end_sample += 1
+
+            class_name = classes[0] if label == -1 else classes[1]
+            self._validate_class_name(class_name, file_path)
+            annotations.append((
+                class_name,
+                round(1000 * sample / fs),
+                round(1000 * end_sample / fs),
+            ))
+            sample = end_sample
+        return annotations
+
+    @staticmethod
+    def _unwrap_matlab_value(value: Any) -> str:
+        while isinstance(value, (list, tuple, np.ndarray)):
+            if len(value) != 1:
+                break
+            value = value[0]
+        return str(value)
+
+    def _resolve_class_names(self, data: dict[str, Any]) -> list[str]:
+        classes = data['nfo']['classes'][0, 0].squeeze().tolist()
+        return [self._unwrap_matlab_value(class_name) for class_name in classes]
+
+    def _validate_class_name(self, class_name: str, file_path: str) -> None:
+        if class_name not in self.config.category:
+            raise ValueError(
+                f'Class {class_name!r} in {file_path} is not configured for BCIC IV 1a.'
+            )
 
     def _divide_split(self, df: DataFrame) -> DataFrame:
         return self._divide_all_split_by_sub(df)
