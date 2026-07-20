@@ -17,8 +17,8 @@ class BasePreprocArgs(BaseModel):
         Sampling rate in Hz supplied to every dataset builder. It defines the
         resampled dataset written to disk and must match the model's requirements
     clean_middle_cache : bool, optional, default=False
-        Calls ``clean_disk_cache`` before rebuilding each selected dataset's
-        intermediate artifacts.
+        Clears intermediate artifacts and dependent processed Arrow output before
+        rebuilding each selected dataset.
     clean_shared_info : bool, optional, default=False
         Includes shared builder metadata in cache cleanup. Has no effect unless
         ``clean_middle_cache`` is enabled.

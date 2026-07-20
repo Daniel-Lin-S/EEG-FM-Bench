@@ -125,7 +125,7 @@ def prepare_dataset(
         logger.info(f"Preparing dataset {dataset_name} {config_name} at fs={conf.fs}Hz...")
         builder = builder_cls(config_name, fs=conf.fs)
         if conf.clean_middle_cache:
-            builder.clean_disk_cache(clean_shared_info=conf.clean_shared_info)
+            builder.clean_all_cache(clean_shared_info=conf.clean_shared_info)
         builder.preproc(n_proc=conf.num_preproc_mid_workers)
         builder.download_and_prepare(num_proc=conf.num_preproc_arrow_writers)
         dataset = builder.as_dataset()

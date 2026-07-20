@@ -53,8 +53,8 @@ def make_builder(name, root, events, *, fail=False, warnings=0, create_artifact=
                 [f'{warnings} recording(s) skipped'] if warnings else []
             )
 
-        def clean_disk_cache(self, clean_shared_info=False):
-            events.append((name, 'clean'))
+        def clean_all_cache(self, clean_shared_info=False):
+            events.append((name, 'clean_all', clean_shared_info))
 
         def preproc(self, n_proc=None):
             events.append((name, 'preproc'))
@@ -125,6 +125,29 @@ class PreprocessingStatusTests(unittest.TestCase):
         self.assertIn('SUCCESS WITH WARNINGS: warned/finetune', output.getvalue())
         self.assertIn('2 recording(s) skipped', output.getvalue())
         self.assertIn('OVERALL: SUCCESS', output.getvalue())
+
+    def test_clean_middle_cache_rebuilds_processed_arrow_cache(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            events = []
+            builder = make_builder('rebuilt', temp_dir, events)
+            conf = self._conf(['rebuilt'])
+            conf.clean_middle_cache = True
+            conf.clean_shared_info = True
+            result = preproc_module.prepare_dataset(conf, builder, 'rebuilt', 'finetune')
+
+        self.assertTrue(result.succeeded)
+        self.assertEqual(events[0], ('rebuilt', 'clean_all', True))
+
+    def test_non_clean_run_does_not_clear_caches(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            events = []
+            builder = make_builder('reused', temp_dir, events)
+            result = preproc_module.prepare_dataset(
+                self._conf(['reused']), builder, 'reused', 'finetune',
+            )
+
+        self.assertTrue(result.succeeded)
+        self.assertFalse(any(event[1] == 'clean_all' for event in events))
 
     def test_missing_arrow_artifact_is_a_dataset_failure(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -245,6 +268,40 @@ class BuilderCacheStatusTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'No recordings yielded usable metadata'):
             builder._gather_data_info(['one', 'two'], n_proc=1)
         self.assertEqual(builder.preproc_warning_count, 2)
+
+    def test_empty_test_selection_does_not_create_test_split(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_files = Path(temp_dir) / 'cache_files.csv'
+            pd.DataFrame([
+                {'key': 'train.parquet', 'split': 'train', 'cnt': 1},
+                {'key': 'valid.parquet', 'split': 'valid', 'cnt': 1},
+            ]).to_csv(cache_files, index=False)
+            builder = object.__new__(EEGDatasetBuilder)
+            builder.mid_file_csv_path = str(cache_files)
+            builder.config = SimpleNamespace(is_finetune=True)
+            splits = builder._split_generators(None)
+
+        self.assertEqual([str(split.name) for split in splits], ['train', 'validation'])
+
+    def test_clearing_arrow_cache_resets_loaded_split_metadata(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            arrow_path = root / 'dataset' / 'finetune'
+            arrow_path.mkdir(parents=True)
+            (arrow_path / 'dataset_info.json').touch()
+            builder = object.__new__(EEGDatasetBuilder)
+            builder.info = SimpleNamespace(splits={'test': 'stale'})
+            builder.config = SimpleNamespace(
+                data_path=str(root),
+                dataset_name='dataset',
+                name='finetune',
+                database_proc_root=str(root),
+                get_fs_id=lambda: 'fs_256',
+            )
+            builder.clean_arrow_set()
+
+        self.assertFalse(arrow_path.exists())
+        self.assertIsNone(builder.info.splits)
 
 
 class LoggingAndShellStatusTests(unittest.TestCase):

@@ -378,7 +378,7 @@ class EEGDatasetBuilder(datasets.GeneratorBasedBuilder, ABC):
         ]
 
         test_data = self.select_split_to_dict(info_df, 'test')
-        if len(test_data) > 0 and self.config.is_finetune:
+        if test_data.get('key') and self.config.is_finetune:
             gen_list.append(
                 SplitGenerator(
                     name=datasets.Split.TEST,
@@ -513,6 +513,9 @@ class EEGDatasetBuilder(datasets.GeneratorBasedBuilder, ABC):
             arrow_path = os.path.join(self.config.data_path, self.config.dataset_name, self.config.name)
             if not self.config.database_proc_root.startswith('s3://'):
                 shutil.rmtree(arrow_path, ignore_errors=True)
+                # The builder may have loaded dataset_info.json before cleanup.
+                # Do not validate regenerated split sizes against that stale info.
+                self.info.splits = None
             else:
                 pass
                 # self._rm_s3_path(arrow_path, n_proc=self.config.s3_delete_worker)
