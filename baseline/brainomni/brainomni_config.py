@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 from pydantic import Field
 
@@ -15,21 +15,40 @@ from baseline.abstract.config import (
 )
 
 
-class BrainOmniDataArgs(BaseDataArgs):
-	"""BrainOmni data configuration."""
-
-	datasets: Dict[str, str] = Field(default_factory=lambda: {})
-	batch_size: int = 32
-	num_workers: int = 2
-
-
 class BrainOmniModelArgs(BaseModelArgs):
-	"""BrainOmni model configuration."""
+	"""BrainOmni preprocessing and scratch-architecture settings.
 
-	# Paths
-	pretrained_path: Optional[str] = None
-	# Deprecated compatibility field. EEG-FM-Bench now uses vendored runtime.
-	repo_path: Optional[str] = None
+	The inherited ``pretrained_path`` must name a directory containing
+	``model_cfg.json`` and ``BrainOmni.pt``. Its JSON configuration determines
+	the pretrained architecture; the fields below are used only when that path
+	is unset.
+
+	Parameters
+	----------
+	position_montage : str
+		MNE standard montage used to derive six-dimensional sensor metadata;
+		``"auto"`` resolves it from each benchmark montage key.
+	normalize_input : bool
+		Whether to remove the per-timepoint channel mean and divide each sample
+		by its global population standard deviation before encoding.
+	normalize_position : bool
+		Whether to center and scale sensor xyz coordinates before encoding.
+	allow_missing_positions : bool
+		Whether channels absent from the resolved montage may use zero position
+		and orientation vectors.
+	signal_normalize_eps, position_normalize_eps : float
+		Positive numerical floors used by signal and position normalization.
+	freeze_tokenizer : bool
+		Whether tokenizer parameters are excluded from gradient updates.
+	strict_load : bool
+		Whether checkpoint state-dict loading must match the encoder exactly.
+	window_length, n_filters, ratios, kernel_size, last_kernel_size, n_dim, n_head,
+	n_neuro, dropout, codebook_dim, codebook_size, num_quantizers,
+	rotation_trick, quantize_optimize_method, overlap_ratio, lm_dim, lm_head,
+	lm_depth, lm_dropout, mask_ratio, num_quantizers_used
+		Scratch-only arguments forwarded unchanged to the vendored ``BrainOmni``
+		constructor.
+	"""
 
 	# Adapter behavior
 	position_montage: str = "auto"
@@ -44,6 +63,7 @@ class BrainOmniModelArgs(BaseModelArgs):
 	strict_load: bool = False
 
 	# Fallback architecture configuration (used when pretrained_path is None)
+	# see docstring of BrainOmni for details of each parameter
 	window_length: int = 512
 	n_filters: int = 32
 	ratios: List[int] = Field(default_factory=lambda: [8, 4, 2])
@@ -69,51 +89,89 @@ class BrainOmniModelArgs(BaseModelArgs):
 
 
 class BrainOmniTrainingArgs(BaseTrainingArgs):
-	"""BrainOmni training configuration."""
+	"""BrainOmni overrides of shared training defaults.
+
+	All unlisted settings, including weight decay, clipping, AMP, encoder
+	freezing, OneCycleLR fraction, and LoRA, inherit from ``BaseTrainingArgs``.
+
+	Parameters
+	----------
+	max_epochs : int
+		Number of complete passes over each training loader.
+	lr_schedule : {"onecycle", "cosine"}
+		Schedule used by the shared optimizer setup.
+	max_lr : float
+		Classifier learning rate and base rate for encoder parameters.
+	encoder_lr_scale : float
+		Multiplier applied to ``max_lr`` for trainable encoder parameters.
+	warmup_epochs : int
+		Number of loader-length epochs used for cosine-schedule warmup.
+	warmup_scale : float
+		Initial learning-rate fraction during cosine-schedule warmup.
+	min_lr : float
+		Final learning-rate floor for cosine annealing.
+	"""
 
 	max_epochs: int = 20
-
-	weight_decay: float = 0.01
-	max_grad_norm: float = 1.0
 
 	lr_schedule: str = "cosine"
 	max_lr: float = 5e-4
 	encoder_lr_scale: float = 0.5
 	warmup_epochs: int = 2
 	warmup_scale: float = 1e-1
-	pct_start: float = 0.2
 	min_lr: float = 5e-5
-
-	use_amp: bool = True
-	freeze_encoder: bool = False
 
 
 class BrainOmniLoggingArgs(BaseLoggingArgs):
-	"""BrainOmni logging configuration."""
+	"""BrainOmni overrides of shared experiment-tracking defaults.
+
+	All unlisted logging settings inherit from ``BaseLoggingArgs``.
+
+	Parameters
+	----------
+	experiment_name : str
+		Default run name used in local and cloud logs.
+	use_cloud : bool
+		Whether cloud experiment tracking is enabled by default.
+	project : str or None
+		Default cloud project name.
+	ckpt_interval : int
+		Number of completed epochs between checkpoint saves.
+		Default: 10
+	"""
 
 	experiment_name: str = "brainomni"
-	run_dir: str = "assets/run"
 
 	use_cloud: bool = True
-	cloud_backend: str = "wandb"
 	project: Optional[str] = "brainomni"
-	entity: Optional[str] = None
 
-	api_key: Optional[str] = None
-	offline: bool = False
-	tags: List[str] = Field(default_factory=lambda: [])
-
-	log_step_interval: int = 1
-	ckpt_interval: int = 20
+	ckpt_interval: int = 10
 
 
 class BrainOmniConfig(AbstractConfig):
-	"""BrainOmni top-level configuration."""
+	"""Top-level configuration for the BrainOmni trainer.
+
+	Shared run, dataset, sampling-frequency, and base configuration fields
+	inherit from ``AbstractConfig``. BrainOmni uses the base data arguments
+	directly because it does not change their defaults.
+
+	Parameters
+	----------
+	model_type : str
+		Registry identifier fixed to ``"brainomni"``.
+	data : BaseDataArgs
+		Dataset mapping and data-loader settings.
+	model : BrainOmniModelArgs
+		BrainOmni preprocessing, pretrained loading, and scratch architecture.
+	training : BrainOmniTrainingArgs
+		BrainOmni training-default overrides.
+	logging : BrainOmniLoggingArgs
+		BrainOmni logging-default overrides.
+	"""
 
 	model_type: str = "brainomni"
-	fs: int = 256
 
-	data: BrainOmniDataArgs = Field(default_factory=BrainOmniDataArgs)
+	data: BaseDataArgs = Field(default_factory=BaseDataArgs)
 	model: BrainOmniModelArgs = Field(default_factory=BrainOmniModelArgs)
 	training: BrainOmniTrainingArgs = Field(default_factory=BrainOmniTrainingArgs)
 	logging: BrainOmniLoggingArgs = Field(default_factory=BrainOmniLoggingArgs)

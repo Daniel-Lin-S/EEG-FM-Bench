@@ -174,7 +174,6 @@ class BrainOmniTrainer(AbstractTrainer):
 			logger.info("Loading BrainOmni pretrained checkpoint from: %s", cfg.pretrained_path)
 			encoder, embed_dim = load_brainomni_from_pretrained(
 				pretrained_path=cfg.pretrained_path,
-				repo_path=cfg.repo_path,
 				strict=cfg.strict_load,
 				freeze_tokenizer=cfg.freeze_tokenizer,
 				map_location=self.device,
@@ -206,7 +205,7 @@ class BrainOmniTrainer(AbstractTrainer):
 			"num_quantizers_used": cfg.num_quantizers_used,
 		}
 
-		encoder = build_brainomni_from_cfg(model_cfg=constructor_cfg, repo_path=cfg.repo_path)
+		encoder = build_brainomni_from_cfg(model_cfg=constructor_cfg)
 		if cfg.freeze_tokenizer and hasattr(encoder, "tokenizer"):
 			for param in encoder.tokenizer.parameters():
 				param.requires_grad = False

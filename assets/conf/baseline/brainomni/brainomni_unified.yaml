@@ -4,12 +4,13 @@
 # Basic configuration
 seed: 42
 master_port: 51901
-multitask: true
+multitask: false   # set to true to fine-tune with training samples from all datasets.
 model_type: brainomni
+fs: 256
 
 # Data configuration
 data:
-  batch_size: 32
+  batch_size: 64
   num_workers: 1
   datasets:
     tuab: finetune
@@ -20,80 +21,40 @@ data:
 # Model configuration
 model:
   # Directory containing model_cfg.json and BrainOmni.pt
-  pretrained_path: ... # FILL
+  pretrained_path: /data/lyh/model_weights/BrainOmni/tiny
 
   position_montage: auto
   normalize_input: true
   normalize_position: true
   allow_missing_positions: true  # set to true if allow missing positions to be filled with zeros
-  signal_normalize_eps: 1.0e-5
-  position_normalize_eps: 1.0e-8
 
-  # Checkpoint loading behavior
   freeze_tokenizer: false
-  strict_load: false
 
-  # Fallback architecture configuration (used only when pretrained_path is null)
-  window_length: 512
-  n_filters: 32
-  ratios: [8, 4, 2]
-  kernel_size: 5
-  last_kernel_size: 5
-  n_dim: 256
-  n_head: 4
-  n_neuro: 16
-  dropout: 0.0
-  codebook_dim: 256
-  codebook_size: 512
-  num_quantizers: 4
-  rotation_trick: true
-  quantize_optimize_method: ema
-
-  overlap_ratio: 0.25
-  lm_dim: 256
-  lm_head: 8
-  lm_depth: 12
-  lm_dropout: 0.1
-  mask_ratio: 0.5
-  num_quantizers_used: 4
+  # add architecture-related parameters as well if the
+  # architecture is different from the public pre-trained version of BrainOmni
 
   # Classifier head configuration
   classifier_head:
-    # Options: avg_pool, attention_pool, dual_stream_fusion, flatten_mlp, flatten_linear
-    head_type: avg_pool
+    head_type: avg_pool # options: avg_pool, attention_pool, dual_stream_fusion, flatten_mlp, flatten_linear
 
-    # Common parameters
     hidden_dims: [128]
     dropout: 0.3
 
-    # Attention pool parameters
-    attn_n_head: 4
-    attn_head_dim: 64
-
-    # Dual stream fusion parameters
-    # Options for fusion_mode: time_first, channel_first, dual
-    fusion_mode: dual
-    fusion_n_head: 4
-    fusion_head_dim: 64
-    fusion_use_rope: true
-    fusion_rope_theta: 10000.0
-    fusion_max_seq_len: 1024
-
 # Training configuration
 training:
-  max_epochs: 20
+  max_epochs: 30
   weight_decay: 0.01
   max_grad_norm: 1.0
 
+  # learning rate-related parameters (important in parameter searching)
   lr_schedule: cosine
   max_lr: 5e-4
-  encoder_lr_scale: 0.5
-  warmup_epochs: 2
-  warmup_scale: 1e-1
-  pct_start: 0.2
   min_lr: 5e-5
+  encoder_lr_scale: 0.5
+  # learning rate warm-up
+  warmup_epochs: 3
+  warmup_scale: 1e-1
 
-  use_amp: true
   freeze_encoder: false
 
   # LoRA configuration
@@ -113,11 +74,15 @@ training:
 # Logging configuration
 logging:
   experiment_name: brainomni
+
+  ckpt_interval: 10
+
+  # local logging
   run_dir: assets/run
 
+  # cloud logging
   use_cloud: true
   cloud_backend: wandb
-  project: brainomni
   offline: false
 
   tags:
@@ -125,6 +90,3 @@ logging:
     - uni
     - avg_pool
     - full
-
-  log_step_interval: 1
-  ckpt_interval: 20

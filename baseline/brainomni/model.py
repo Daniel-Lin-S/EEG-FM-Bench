@@ -26,7 +26,6 @@ _CODES_ROOT = _EEG_FM_BENCH_ROOT.parent
 _VENDORED_BRAINOMNI_ROOT = _THIS_FILE.parent / "vendor"
 
 _DEEPSPEED_FALLBACK_ENABLED = False
-_REPO_PATH_DEPRECATION_WARNED = False
 
 
 def resolve_existing_path(path_str: str) -> Path:
@@ -77,32 +76,6 @@ def resolve_existing_path(path_str: str) -> Path:
         "Could not resolve path "
         f"'{path_str}'. Tried: {[str(c) for c in deduped_candidates]}"
     )
-
-
-def resolve_brainomni_repo_root(repo_path: Optional[str] = None) -> Path:
-    """Resolve BrainOmni runtime root used by EEG-FM-Bench.
-
-    Parameters
-    ----------
-    repo_path : Optional[str], optional
-        Deprecated compatibility argument. It is ignored.
-
-    Returns
-    -------
-    Path
-        Vendored BrainOmni runtime root.
-    """
-    global _REPO_PATH_DEPRECATION_WARNED
-
-    if repo_path and not _REPO_PATH_DEPRECATION_WARNED:
-        logger.warning(
-            "BrainOmni repo_path is ignored because EEG-FM-Bench uses a vendored "
-            "BrainOmni runtime. Received repo_path='%s'.",
-            repo_path,
-        )
-        _REPO_PATH_DEPRECATION_WARNED = True
-
-    return _VENDORED_BRAINOMNI_ROOT.resolve()
 
 
 def resolve_pretrained_dir(pretrained_path: str) -> Path:
@@ -209,25 +182,18 @@ def import_brainomni_class() -> type[nn.Module]:
     return getattr(module, "BrainOmni")
 
 
-def build_brainomni_from_cfg(
-    model_cfg: Dict[str, Any],
-    repo_path: Optional[str] = None,
-) -> nn.Module:
+def build_brainomni_from_cfg(model_cfg: Dict[str, Any]) -> nn.Module:
     """Build BrainOmni model from a model configuration dictionary.
 
     Parameters
     ----------
     model_cfg : Dict[str, Any]
         BrainOmni constructor kwargs.
-    repo_path : Optional[str], optional
-        Deprecated compatibility argument. It is ignored.
-
     Returns
     -------
     nn.Module
         Instantiated BrainOmni model.
     """
-    resolve_brainomni_repo_root(repo_path)
     brainomni_cls = import_brainomni_class()
     return brainomni_cls(**model_cfg)
 
@@ -282,7 +248,6 @@ def load_brainomni_weights(
 
 def load_brainomni_from_pretrained(
     pretrained_path: str,
-    repo_path: Optional[str] = None,
     strict: bool = False,
     freeze_tokenizer: bool = False,
     map_location: str | torch.device = "cpu",
@@ -292,9 +257,8 @@ def load_brainomni_from_pretrained(
     Parameters
     ----------
     pretrained_path : str
-        Directory containing BrainOmni checkpoint files.
-    repo_path : Optional[str], optional
-        Deprecated compatibility argument. It is ignored.
+        Directory containing the ``model_cfg.json`` architecture definition
+        and ``BrainOmni.pt`` weights.
     strict : bool, optional
         Whether to enforce strict state-dict loading.
     freeze_tokenizer : bool, optional
@@ -310,7 +274,7 @@ def load_brainomni_from_pretrained(
     pretrained_dir = resolve_pretrained_dir(pretrained_path)
     model_cfg = load_brainomni_model_cfg(pretrained_dir)
 
-    model = build_brainomni_from_cfg(model_cfg=model_cfg, repo_path=repo_path)
+    model = build_brainomni_from_cfg(model_cfg=model_cfg)
     missing_keys, unexpected_keys = load_brainomni_weights(
         model=model,
         pretrained_path=str(pretrained_dir),
