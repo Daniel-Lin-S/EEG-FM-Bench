@@ -48,6 +48,13 @@ class DistributedTimeFilter(Filter):
         return True
 
 
+class BelowWarningFilter(Filter):
+    """Keep warning/error records out of the stdout handler."""
+
+    def filter(self, record):
+        return record.levelno < logging.WARNING
+
+
 def format_console_log_dict(log_data: dict, prefix: str = 'train'):
     prefix = f"{prefix}/"
     log_data = {key[len(prefix):] if key.startswith(prefix) else key: value for key, value in log_data.items()}
@@ -74,6 +81,7 @@ def setup_log(
 
     stdout_handler = StreamHandler(sys.stdout)
     stdout_handler.setLevel(logging.DEBUG if level is None else level)
+    stdout_handler.addFilter(BelowWarningFilter())
     stderr_handler = StreamHandler(sys.stderr)
     stderr_handler.setLevel(logging.WARNING)
     handlers = [stdout_handler, stderr_handler]
@@ -90,6 +98,8 @@ def setup_log(
         handlers.append(file_handler)
 
     logger.handlers.clear()
+    if name is not None:
+        logger.propagate = False
     for handler in handlers:
         handler.addFilter(time_filter)
         handler.setFormatter(formatter)

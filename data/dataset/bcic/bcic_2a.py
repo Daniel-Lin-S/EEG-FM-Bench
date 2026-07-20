@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import warnings
 from dataclasses import dataclass, field
 from typing import Optional, Union, Any
@@ -9,6 +10,7 @@ import mne.io
 import numpy as np
 from mne.io import BaseRaw
 from pandas import DataFrame
+from scipy.io import loadmat
 
 from common.type import DatasetTaskType
 from data.processor.builder import EEGConfig, EEGDatasetBuilder
@@ -38,19 +40,15 @@ class BCIC2AConfig(EEGConfig):
     dataset_name: Optional[str] = 'bcic_2a'
     task_type: DatasetTaskType = DatasetTaskType.MOTOR_IMAGINARY
 
-    # !IMPORTANT, in mne 1.9.0 and numpy 2.1.3, gdf reading can result in uint8 out of bound
-    # Please refer to https://github.com/mne-tools/mne-python/issues/13111 in mne\io\edf\edf.py at line 1455, then change mne package source code
-
-    # And runs are seperated by multiple NaN in signal data
-    file_ext: str = 'set'
+    file_ext: str = 'gdf'
     montage: dict[str, list[str]] = field(default_factory=lambda: {
         '10_20': [
-                              'Fz',
-                  'E2', 'E3', 'E4', 'E5', 'E6',
-            'E7', 'C3', 'E9', 'Cz', 'E11', 'C4', 'E13',
-                'E14', 'E15', 'E16', 'E17', 'E18',
-                       'E19', 'Pz', 'E21',
-                              'E22'
+                                'EEG-Fz',
+                'EEG-0', 'EEG-1', 'EEG-2', 'EEG-3', 'EEG-4',
+            'EEG-5', 'EEG-C3', 'EEG-6', 'EEG-Cz', 'EEG-7', 'EEG-C4', 'EEG-8',
+                'EEG-9', 'EEG-10', 'EEG-11', 'EEG-12', 'EEG-13',
+                         'EEG-14', 'EEG-Pz', 'EEG-15',
+                                  'EEG-16',
         ]
     })
 
@@ -58,7 +56,7 @@ class BCIC2AConfig(EEGConfig):
     test_ratio: float = 0.10
     wnd_div_sec: int = 4
     suffix_path: str = os.path.join('BCI Competition IV', '2a')
-    scan_sub_dir: str = "set"
+    scan_sub_dir: str = ''
 
     category: list[str] = field(default_factory=lambda: [
         'left', 'right', 'foot', 'tongue'
@@ -71,6 +69,14 @@ class BCIC2ABuilder(EEGDatasetBuilder):
         BUILDER_CONFIG_CLASS(name='pretrain'),
         BUILDER_CONFIG_CLASS(name='finetune', is_finetune=True)
     ]
+
+    _TRAIN_EVENT_LABELS = {
+        '769': 'left',
+        '770': 'right',
+        '771': 'foot',
+        '772': 'tongue',
+    }
+    _EVALUATION_EVENT = '783'
 
     def __init__(self, config_name='pretrain', **kwargs):
         super().__init__(config_name, **kwargs)
@@ -90,14 +96,15 @@ class BCIC2ABuilder(EEGDatasetBuilder):
 
     def _resolve_file_name(self, file_path: str) -> dict[str, Any]:
         file_name = self._extract_file_name(file_path)
-        subject = int(file_name[1:3])
-        session_type = file_name[3]
-        session = int(file_name[-1])
-        session = session if session_type == 'T' else session + 10
+        match = re.fullmatch(r'A(\d{2})([TE])', file_name)
+        if match is None:
+            raise ValueError(f'Unexpected BCIC IV 2a recording name: {file_name}')
+        subject, session_type = match.groups()
 
         return {
-            'subject': subject,
-            'session': session,
+            'subject': int(subject),
+            'session': 1 if session_type == 'T' else 2,
+            'session_type': session_type,
         }
 
     def _resolve_exp_meta_info(self, file_path: str) -> dict[str, Any]:
@@ -113,26 +120,53 @@ class BCIC2ABuilder(EEGDatasetBuilder):
 
     def _resolve_exp_events(self, file_path: str, info: dict[str, Any]):
         with self._read_raw_data(file_path, preload=False, verbose=False) as raw:
-            anno = raw.annotations
-            onset_list = anno.onset
-            desc_list = anno.description
+            event_pairs = [
+                (onset, str(description))
+                for onset, description in zip(
+                    raw.annotations.onset,
+                    raw.annotations.description,
+                )
+            ]
 
-        assert len(onset_list) == len(desc_list)
-
-        annotations = []
-        for onset, desc in zip(onset_list, desc_list):
+        session_type = info.get('session_type') or self._resolve_file_name(file_path)['session_type']
+        if session_type == 'T':
+            cue_events = [
+                (onset, self._TRAIN_EVENT_LABELS[description])
+                for onset, description in event_pairs
+                if description in self._TRAIN_EVENT_LABELS
+            ]
+        else:
+            cue_onsets = [
+                onset for onset, description in event_pairs
+                if description == self._EVALUATION_EVENT
+            ]
             if self.config.is_finetune:
-                label = desc
+                label_path = os.path.join(
+                    self.config.raw_path,
+                    'true_labels',
+                    f'{self._extract_file_name(file_path)}.mat',
+                )
+                class_ids = loadmat(label_path)['classlabel'].reshape(-1)
+                if len(cue_onsets) != len(class_ids):
+                    raise ValueError(
+                        f'BCIC IV 2a evaluation cue/label count mismatch for {file_path}: '
+                        f'{len(cue_onsets)} cues, {len(class_ids)} labels'
+                    )
+                cue_events = [
+                    (onset, self.config.category[int(class_id) - 1])
+                    for onset, class_id in zip(cue_onsets, class_ids)
+                ]
             else:
-                label = 'default'
+                cue_events = [(onset, 'default') for onset in cue_onsets]
 
-            annotations.append((
-                label,
+        return [
+            (
+                label if self.config.is_finetune else 'default',
                 round(onset * 1000),
-                round((onset + self.config.wnd_div_sec) * 1000)
-            ))
-
-        return annotations
+                round((onset + self.config.wnd_div_sec) * 1000),
+            )
+            for onset, label in cue_events
+        ]
 
     def _divide_split(self, df: DataFrame) -> DataFrame:
 
@@ -165,7 +199,7 @@ class BCIC2ABuilder(EEGDatasetBuilder):
                 "ignore",
                 category=RuntimeWarning,
             )
-            raw = mne.io.read_raw_eeglab(file_path, preload=preload, verbose=verbose)
+            raw = mne.io.read_raw_gdf(file_path, preload=preload, verbose=verbose)
             return raw
 
 
