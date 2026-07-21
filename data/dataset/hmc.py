@@ -46,6 +46,7 @@ class HMCConfig(EEGConfig):
     dataset_name: Optional[str] = 'hmc'
     task_type: DatasetTaskType = DatasetTaskType.SLEEP_STAGE
     file_ext: str = 'edf'
+    position_montage: Optional[str] = 'standard_1020'  # to approximate positions
     montage: dict[str, list[str]] = field(default_factory=lambda: {
         'AASM_24_Minimal': [
             'EEG F4-M1',

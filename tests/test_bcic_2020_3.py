@@ -40,6 +40,10 @@ class BCIC2020ReaderTests(unittest.TestCase):
         y = np.zeros((5, trials), dtype=np.uint8)
         y[[0, 4][:trials], np.arange(trials)] = 1
         return SimpleNamespace(
+            mnt=SimpleNamespace(
+                clab=np.array([f'C{index}' for index in range(64)], dtype=object),
+                pos_3d=np.arange(64 * 3, dtype=np.float32).reshape(64, 3) + 1,
+            ),
             x=x,
             clab=np.array([f'C{index}' for index in range(64)], dtype=object),
             fs=256,
@@ -67,18 +71,19 @@ class BCIC2020ReaderTests(unittest.TestCase):
 
     def test_v5_reader_concatenates_epochs_and_annotations(self):
         record = self._record()
-        with patch('data.dataset.bcic.bcic_2020_3.loadmat', return_value={'epo_train': record}):
+        with patch('data.dataset.bcic.bcic_2020_3.loadmat', return_value={'epo_train': record, 'mnt': record.mnt}):
             raw = self._builder()._read_raw_data('/tmp/Training set/Data_Sample01.mat')
 
         np.testing.assert_allclose(raw.get_data()[0], np.arange(1, 9) * 1e-6)
         self.assertEqual(raw.info['sfreq'], 256.0)
         self.assertEqual(raw.annotations.description.tolist(), ['0', '4'])
         np.testing.assert_allclose(raw.annotations.onset, [0.0, 4 / 256])
+        np.testing.assert_allclose(raw.info['chs'][0]['loc'][:3], [1, 2, 3])
 
     def test_v5_reader_uses_the_source_sampling_rate(self):
         record = self._record()
         record.fs = 128
-        with patch('data.dataset.bcic.bcic_2020_3.loadmat', return_value={'epo_train': record}):
+        with patch('data.dataset.bcic.bcic_2020_3.loadmat', return_value={'epo_train': record, 'mnt': record.mnt}):
             raw = self._builder()._read_raw_data('/tmp/Training set/Data_Sample01.mat')
 
         self.assertEqual(raw.info['sfreq'], 128.0)
@@ -96,10 +101,16 @@ class BCIC2020ReaderTests(unittest.TestCase):
                 record.create_dataset('clab', data=np.array([f'C{index}'.encode() for index in range(64)]))
                 record.create_dataset('fs', data=256)
                 record.create_dataset('t', data=np.arange(4))
+                montage = mat_file.create_group('mnt')
+                montage.create_dataset('clab', data=np.array([f'C{index}'.encode() for index in range(64)]))
+                montage.create_dataset(
+                    'pos_3d', data=np.arange(64 * 3, dtype=np.float32).reshape(64, 3) + 1
+                )
 
             raw = self._builder()._read_raw_data(str(mat_path))
 
         self.assertEqual(raw.annotations.description.tolist(), ['0', '4', '2'])
+        np.testing.assert_allclose(raw.info['chs'][0]['loc'][:3], [1, 2, 3])
 
     def test_invalid_one_hot_labels_raise_clear_error(self):
         labels = np.zeros((5, 2), dtype=np.uint8)

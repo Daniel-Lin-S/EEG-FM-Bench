@@ -28,6 +28,7 @@ from common.log import setup_log
 from common.type import DatasetTaskType
 from common.utils import ElectrodeSet
 from common.summary import build_summary_path, migrate_legacy_summary_artifacts
+from data.processor.montage import extract_complete_xyz, resolve_electrode_positions
 from common.path import (
     CONF_ROOT,
     DATABASE_CACHE_ROOT,
@@ -167,6 +168,9 @@ class EEGConfig(BuilderConfig):
     s3_delete_worker: int = 4
 
     # default database root path
+    # Optional fallback used only when the selected recording has no complete
+    # source-provided 3D electrode coordinates.
+    position_montage: Optional[str] = None
     database_raw_root: str = DATABASE_RAW_ROOT
     database_proc_root: str = DATABASE_PROC_ROOT
     database_cache_root: str = DATABASE_CACHE_ROOT
@@ -334,6 +338,9 @@ class EEGDatasetBuilder(datasets.GeneratorBasedBuilder, ABC):
         feat_dict = {
             "data": datasets.Sequence(datasets.Sequence(datasets.Value("float32"))),
             "chs": datasets.Sequence(datasets.Value("int32")),
+            # Cartesian channel coordinates in the same order as ``chs`` and
+            # ``data``. Empty means no complete 3D source locations exist.
+            "pos": datasets.Sequence(datasets.Sequence(datasets.Value("float32"))),
             "task": datasets.Value("int32"),
             "montage": datasets.Value("string"),
             "subject": datasets.Value("string"),
@@ -627,9 +634,11 @@ class EEGDatasetBuilder(datasets.GeneratorBasedBuilder, ABC):
                 data = self._select_data_channels(data, path, montage)
                 data = self._resample_and_filter(data)
                 raw = self._fetch_signal_ndarray(data)
+                electrode_positions = self._resolve_electrode_positions(data, montage)
                 chs_idx = self._fetch_chs_index(montage)
 
-                examples = self._generate_window_sample(raw, montage, chs_idx, label, self.config.persist_drop_last)
+                examples = self._generate_window_sample(
+                    raw, montage, chs_idx, label, self.config.persist_drop_last, electrode_positions)
                 if len(examples) < 1:
                     return None
 
@@ -670,6 +679,7 @@ class EEGDatasetBuilder(datasets.GeneratorBasedBuilder, ABC):
             chs_idx: ndarray,
             labels:list[tuple[str, int, int]],
             drop_last: bool=True,
+            electrode_positions: Optional[ndarray] = None,
     ):
         """
         Generates windowed samples from raw EEG data using a sliding window approach. The function extracts windows
@@ -686,6 +696,17 @@ class EEGDatasetBuilder(datasets.GeneratorBasedBuilder, ABC):
             montage, task type). If the data length is insufficient for even a single window, None is returned.
         """
         wnds = []
+
+        if electrode_positions is None:
+            electrode_pos = []
+        else:
+            pos_arr = np.asarray(electrode_positions, dtype=np.float32)
+            if pos_arr.shape != (raw.shape[0], 3):
+                raise ValueError(
+                    "Electrode positions must have shape (n_channels, 3), "
+                    f"got {pos_arr.shape} for signal shape {raw.shape}."
+                )
+            electrode_pos = pos_arr.tolist()
 
         signal_len = raw.shape[1]
         if signal_len < self.config.wnd_len:
@@ -712,6 +733,7 @@ class EEGDatasetBuilder(datasets.GeneratorBasedBuilder, ABC):
 
             base_dict = {
                 'chs': chs_idx,
+                'pos': electrode_pos,
                 'montage': f'{self.config.dataset_name}/{montage}',
                 'task': self.config.task_type.value,
             }
@@ -728,15 +750,15 @@ class EEGDatasetBuilder(datasets.GeneratorBasedBuilder, ABC):
 
             if not drop_last and remain_pts > 0:
                 if end - self.config.wnd_len >= 0:
-                    pos = end - self.config.wnd_len
+                    window_start = end - self.config.wnd_len
                 elif start + self.config.wnd_len <= signal_len:
-                    pos = start
+                    window_start = start
                 else:
                     offset = self.config.wnd_len - (signal_len - end + remain_pts)
-                    pos = start - offset
-                    assert pos < 0
+                    window_start = start - offset
+                    assert window_start < 0
 
-                wnd_data = raw[:, pos: pos + self.config.wnd_len]
+                wnd_data = raw[:, window_start: window_start + self.config.wnd_len]
                 assert wnd_data.shape[1] == self.config.wnd_len
 
                 example_dict = base_dict.copy()
@@ -835,6 +857,9 @@ class EEGDatasetBuilder(datasets.GeneratorBasedBuilder, ABC):
         scan_path: str = os.path.join(self.config.raw_path, self.config.scan_sub_dir)
         raw_data_files = []
         for root, dirs, files in os.walk(scan_path):
+            # Dataset repositories may contain annex/git metadata alongside raw
+            # files. Never descend into hidden control directories.
+            dirs[:] = [directory for directory in dirs if not directory.startswith('.')]
             for file in files:
                 if file.endswith(self.config.file_ext):
                     file_path = os.path.join(root, file)
@@ -1062,6 +1087,17 @@ class EEGDatasetBuilder(datasets.GeneratorBasedBuilder, ABC):
 
     def _fetch_signal_ndarray(self, data: BaseRaw) -> ndarray:
         return data.get_data(units=self.config.unit).astype(np.float32).copy()
+
+    def _resolve_electrode_positions(self, data: BaseRaw, montage: str) -> Optional[ndarray]:
+        """Resolve native or configured fallback XYZ positions after selection."""
+        return resolve_electrode_positions(
+            data, self.config.position_montage,
+            self._get_chs_name_by_montage(montage, is_std=True))
+
+    @staticmethod
+    def _fetch_electrode_positions(data: BaseRaw) -> Optional[ndarray]:
+        """Compatibility wrapper returning complete native XYZ positions only."""
+        return extract_complete_xyz(data)
 
     def _fetch_chs_index(self, montage: str):
         if montage in self._std_chs_idx_cache.keys():

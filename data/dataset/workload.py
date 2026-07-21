@@ -46,6 +46,7 @@ class WorkloadConfig(EEGConfig):
     dataset_name: Optional[str] = 'workload'
     task_type: DatasetTaskType = DatasetTaskType.WORKLOAD
     file_ext: str = 'edf'
+    position_montage: Optional[str] = 'standard_1020'
     montage: dict[str, list[str]] = field(default_factory=lambda: {
         '10_20': [
             'EEG Fp1',

@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 try:
+    import numpy as np
     import pandas as pd
     import preproc as preproc_module
     from common.conf import BasePreprocArgs
@@ -282,6 +283,31 @@ class BuilderCacheStatusTests(unittest.TestCase):
             splits = builder._split_generators(None)
 
         self.assertEqual([str(split.name) for split in splits], ['train', 'validation'])
+
+    def test_retained_final_windows_keep_electrode_positions_nested(self):
+        builder = object.__new__(EEGDatasetBuilder)
+        builder.config = SimpleNamespace(
+            wnd_len=4,
+            is_finetune=True,
+            category=['normal'],
+            category_query_dict={'normal': 0},
+            dataset_name='test',
+            task_type=SimpleNamespace(value=1),
+        )
+        builder._milli_sec_to_pts = int
+        electrode_pos = np.array([[1., 2., 3.], [4., 5., 6.]])
+
+        examples = builder._generate_window_sample(
+            raw=np.zeros((2, 10), dtype=np.float32),
+            montage='test_montage',
+            chs_idx=np.array([1, 2]),
+            labels=[('normal', 0, 6), ('normal', 6, 10)],
+            drop_last=False,
+            electrode_positions=electrode_pos,
+        )
+
+        self.assertGreater(len(examples), 1)
+        self.assertTrue(all(example['pos'] == electrode_pos.tolist() for example in examples))
 
     def test_clearing_arrow_cache_resets_loaded_split_metadata(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -46,6 +46,7 @@ class MotorMoveImagineConfig(EEGConfig):
     dataset_name: Optional[str] = 'motor_mv_img'
     task_type: DatasetTaskType = DatasetTaskType.MOTOR_IMAGINARY
     file_ext: str = 'edf'
+    position_montage: Optional[str] = 'standard_1005'
     montage: dict[str, list[str]] = field(default_factory=lambda: {
         '10_10': [
                                             'Fp1.', 'Fpz.', 'Fp2.',
@@ -178,8 +179,10 @@ class MotorMoveImagineBuilder(EEGDatasetBuilder):
                 data = self._resample_and_filter(data)
                 raw = self._fetch_signal_ndarray(data)
                 chs_idx = self._fetch_chs_index(montage)
+                electrode_positions = self._resolve_electrode_positions(data, montage)
     
-                examples = self._generate_window_sample(raw, montage, chs_idx, label, self.config.persist_drop_last)
+                examples = self._generate_window_sample(
+                    raw, montage, chs_idx, label, self.config.persist_drop_last, electrode_positions)
                 if len(examples) < 1:
                     return None
     

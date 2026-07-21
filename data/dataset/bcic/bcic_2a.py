@@ -41,6 +41,7 @@ class BCIC2AConfig(EEGConfig):
     task_type: DatasetTaskType = DatasetTaskType.MOTOR_IMAGINARY
 
     file_ext: str = 'gdf'
+    position_montage: Optional[str] = 'standard_1005'
     montage: dict[str, list[str]] = field(default_factory=lambda: {
         '10_20': [
                                 'EEG-Fz',

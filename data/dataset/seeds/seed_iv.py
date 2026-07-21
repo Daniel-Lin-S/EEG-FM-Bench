@@ -118,8 +118,10 @@ class SeedIVBuilder(EEGDatasetBuilder):
                 data = self._resample_and_filter(data)
                 raw = self._fetch_signal_ndarray(data)
                 chs_idx = self._fetch_chs_index(montage)
+                electrode_positions = self._resolve_electrode_positions(data, montage)
 
-                examples = self._generate_window_sample(raw, montage, chs_idx, [label], self.config.persist_drop_last)
+                examples = self._generate_window_sample(
+                    raw, montage, chs_idx, [label], self.config.persist_drop_last, electrode_positions)
 
                 df = pd.DataFrame(data=examples)
                 df['subject'] = str(subject)

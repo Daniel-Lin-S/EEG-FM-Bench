@@ -48,6 +48,7 @@ class BCIC1AConfig(EEGConfig):
 
     dataset_name: Optional[str] = 'bcic_1a'
     task_type: DatasetTaskType = DatasetTaskType.MOTOR_IMAGINARY
+    position_montage: Optional[str] = 'standard_1005'
     file_ext: str = 'mat'
     montage: dict[str, list[str]] = field(default_factory=lambda: {
         'sensorimotor': [
@@ -84,7 +85,8 @@ class BCIC1ABuilder(EEGDatasetBuilder):
         super().__init__(config_name, **kwargs)
 
     def _walk_raw_data_files(self):
-        scan_path = [os.path.join(self.config.raw_path, self.config.scan_sub_dir)]
+        calibration_sub_dir = self.config.scan_sub_dir or 'BCICIV_1calib_1000Hz_mat'
+        scan_path = [os.path.join(self.config.raw_path, calibration_sub_dir)]
         eval_path = os.path.join(self.config.raw_path, self.config.scan_eval_sub_dir)
         scan_path.append(eval_path)
         raw_data_files = []

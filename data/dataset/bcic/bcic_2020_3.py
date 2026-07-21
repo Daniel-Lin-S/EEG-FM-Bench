@@ -42,6 +42,7 @@ class BCIC2020ImagineSpeechConfig(EEGConfig):
     task_type: DatasetTaskType = DatasetTaskType.LINGUAL
 
     file_ext: str = 'mat'
+    position_montage: Optional[str] = 'standard_1005'
     montage: dict[str, list[str]] = field(default_factory=lambda: {
         '10_20': [
                                 'Fp1',     'Fp2',
@@ -144,8 +145,10 @@ class BCIC2020ImagineBuilder(EEGDatasetBuilder):
                 data = self._select_data_channels(data, path, montage)
                 raw = self._fetch_signal_ndarray(data)
                 chs_idx = self._fetch_chs_index(montage)
+                electrode_positions = self._resolve_electrode_positions(data, montage)
 
-                examples = self._generate_window_sample(raw, montage, chs_idx, label, self.config.persist_drop_last)
+                examples = self._generate_window_sample(
+                    raw, montage, chs_idx, label, self.config.persist_drop_last, electrode_positions)
                 if len(examples) < 1:
                     return None
 
@@ -202,10 +205,10 @@ class BCIC2020ImagineBuilder(EEGDatasetBuilder):
 
     def _read_raw_data(self, file_path: str, preload: bool = False, verbose: bool = False) -> BaseRaw:
         if h5py.is_hdf5(file_path):
-            epochs, ch_names, fs, labels = self._read_v73_recording(file_path)
+            epochs, ch_names, fs, labels, electrode_positions = self._read_v73_recording(file_path)
         else:
-            epochs, ch_names, fs, labels = self._read_v5_recording(file_path)
-        return self._epochs_to_raw(epochs, ch_names, fs, labels, verbose)
+            epochs, ch_names, fs, labels, electrode_positions = self._read_v5_recording(file_path)
+        return self._epochs_to_raw(epochs, ch_names, fs, labels, verbose, electrode_positions)
 
     def _read_v5_recording(self, file_path: str):
         record_name = 'epo_train' if 'Training set' in file_path else 'epo_validation'
@@ -227,7 +230,9 @@ class BCIC2020ImagineBuilder(EEGDatasetBuilder):
                 f'Expected {len(self.config.category)} class names in {file_path}, found {len(class_names)}.'
             )
         labels = self._one_hot_labels(self._mat_field(record, 'y', file_path), epochs.shape[2], file_path)
-        return epochs, ch_names, fs, labels
+        electrode_positions = self._normalise_electrode_positions(
+            self._mat_field(contents, 'mnt', file_path), ch_names, file_path)
+        return epochs, ch_names, fs, labels, electrode_positions
 
     def _read_v73_recording(self, file_path: str):
         with h5py.File(file_path, 'r') as mat_file:
@@ -241,12 +246,34 @@ class BCIC2020ImagineBuilder(EEGDatasetBuilder):
                 self._hdf5_field(mat_file, record, 't', file_path),
                 file_path,
             )
+            electrode_positions = self._normalise_electrode_positions(
+                self._hdf5_value(mat_file, mat_file['mnt']), ch_names, file_path)
         labels = self._test_labels(file_path)
         if len(labels) != epochs.shape[2]:
             raise ValueError(
                 f'Test label count ({len(labels)}) does not match trial count ({epochs.shape[2]}) in {file_path}.'
             )
-        return epochs, ch_names, fs, labels
+        return epochs, ch_names, fs, labels, electrode_positions
+
+    def _normalise_electrode_positions(self, montage, ch_names: list[str], file_path: str) -> np.ndarray:
+        """Read Track 3 ``mnt.pos_3d`` coordinates in recording-channel order."""
+        montage_names = self._matlab_strings(self._mat_field(montage, 'clab', file_path))
+        if montage_names != ch_names:
+            raise ValueError(
+                f"Montage channel labels in {file_path} do not match the recording channel labels."
+            )
+
+        positions = np.asarray(self._mat_field(montage, 'pos_3d', file_path), dtype=np.float32)
+        if positions.shape == (3, len(ch_names)):
+            positions = positions.T
+        if positions.shape != (len(ch_names), 3):
+            raise ValueError(
+                f"Expected mnt.pos_3d shape ({len(ch_names)}, 3) or (3, {len(ch_names)}) "
+                f"in {file_path}, found {positions.shape}."
+            )
+        if not np.isfinite(positions).all() or np.any(np.all(positions == 0.0, axis=1)):
+            raise ValueError(f"mnt.pos_3d in {file_path} has missing or non-finite channel coordinates.")
+        return np.ascontiguousarray(positions)
 
     @staticmethod
     def _mat_field(record: Any, field_name: str, file_path: str):
@@ -431,13 +458,23 @@ class BCIC2020ImagineBuilder(EEGDatasetBuilder):
             chars.append(chr(ord('A') + remainder))
         return ''.join(reversed(chars))
 
-    def _epochs_to_raw(self, epochs: np.ndarray, ch_names: list[str], fs: float, labels: np.ndarray, verbose: bool):
+    def _epochs_to_raw(
+        self,
+        epochs: np.ndarray,
+        ch_names: list[str],
+        fs: float,
+        labels: np.ndarray,
+        verbose: bool,
+        electrode_positions: np.ndarray,
+    ):
         n_samples, n_channels, n_trials = epochs.shape
         if len(labels) != n_trials:
             raise ValueError(f'Label count ({len(labels)}) does not match trial count ({n_trials}).')
 
         signal = np.transpose(epochs, (1, 2, 0)).reshape(n_channels, n_trials * n_samples)
         info = mne.create_info(ch_names=ch_names, sfreq=fs, ch_types=['eeg'] * n_channels)
+        for channel, position in zip(info['chs'], electrode_positions):
+            channel['loc'][:3] = position
         raw = mne.io.RawArray(signal * 1e-6, info, verbose=verbose)
         raw.set_annotations(mne.Annotations(
             onset=np.arange(n_trials) * n_samples / fs,

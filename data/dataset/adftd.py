@@ -48,6 +48,7 @@ class AdftdConfig(EEGConfig):
     dataset_name: Optional[str] = 'adftd'
     task_type: DatasetTaskType = DatasetTaskType.CLINICAL
     file_ext: str = 'set'
+    position_montage: Optional[str] = 'standard_1020'
     montage: dict[str, list[str]] = field(default_factory=lambda: {
         '10_20': [
                     'Fp1', 'Fp2',

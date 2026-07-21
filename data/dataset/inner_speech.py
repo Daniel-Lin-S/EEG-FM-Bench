@@ -57,6 +57,7 @@ class InnerSpeechConfig(EEGConfig):
     url={https://doi.org/10.1038/s41597-022-01147-2}
     }
     """
+    position_montage: Optional[str] = 'biosemi128'
 
     filter_notch: float = 50.0
 

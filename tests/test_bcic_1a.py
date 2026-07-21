@@ -53,6 +53,31 @@ class BCIC1AEventsTests(unittest.TestCase):
 
         self.assertEqual(len(files), 2)
 
+    def test_configured_root_does_not_discover_true_label_mat_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            calibration = root / 'BCICIV_1calib_1000Hz_mat'
+            evaluation = root / 'BCICIV_1eval_1000Hz_mat'
+            labels = root / 'true_labels'
+            calibration.mkdir()
+            evaluation.mkdir()
+            labels.mkdir()
+            (calibration / 'BCICIV_calib_ds1a_1000Hz.mat').touch()
+            (evaluation / 'BCICIV_eval_ds1a_1000Hz.mat').touch()
+            (labels / 'BCICIV_eval_ds1a_1000Hz_true_y.mat').touch()
+
+            builder = self._builder(str(root))
+            builder.config.scan_sub_dir = ''
+            files = builder._walk_raw_data_files()
+
+        self.assertEqual(
+            files,
+            [
+                str(calibration / 'BCICIV_calib_ds1a_1000Hz.mat'),
+                str(evaluation / 'BCICIV_eval_ds1a_1000Hz.mat'),
+            ],
+        )
+
     def test_finetune_fails_when_eval_sidecar_is_absent(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
