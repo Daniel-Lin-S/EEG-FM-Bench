@@ -52,7 +52,9 @@ def test_catch22_concatenates_canonical_features(monkeypatch):
 
     fake_module.catch22_all = catch22_all
     monkeypatch.setitem(sys.modules, "pycatch22", fake_module)
-    trainer = Catch22Trainer(make_config())
+    trainer = Catch22Trainer(
+        make_config(model={"extractor": {"n_jobs": 1}})
+    )
     data = np.array([[[1.0, 2.0], [10.0, 20.0]]], dtype=np.float32)
 
     trainer.fit_extractor(data)

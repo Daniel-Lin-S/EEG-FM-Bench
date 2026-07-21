@@ -25,7 +25,7 @@ class Catch22Trainer(FeatureExtractorTrainer):
 
     def __init__(self, cfg: Catch22Config):
         pipeline = FeatureExtractionPipeline(
-            Catch22FeatureExtractor(),
+            Catch22FeatureExtractor(cfg.model.extractor.n_jobs),
             ValidationSelectedRidgeClassifier(cfg.model.classifier),
         )
         super().__init__(cfg, pipeline)

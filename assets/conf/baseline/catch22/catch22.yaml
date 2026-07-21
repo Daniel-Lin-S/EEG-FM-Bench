@@ -12,16 +12,20 @@ data:
   num_workers: 1
 
 model:
-  # grid-search for Ridge regression classifier
-  ridge_alphas:
-    - 0.001
-    - 0.01
-    - 0.1
-    - 1.0
-    - 10.0
-    - 100.0
-    - 1000.0
-  ridge_selection_metric: balanced_accuracy
+  extractor:
+    # CPU processes for independent trial-level feature extraction.
+    n_jobs: 8
+  classifier:
+    # Grid-search for Ridge regression classifier.
+    alphas:
+      - 0.001
+      - 0.01
+      - 0.1
+      - 1.0
+      - 10.0
+      - 100.0
+      - 1000.0
+    selection_metric: balanced_accuracy
 
 logging:
   experiment_name: catch22
