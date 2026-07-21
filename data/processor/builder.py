@@ -1,3 +1,4 @@
+import glob
 import hashlib
 import json
 import logging
@@ -12,6 +13,7 @@ from typing import Optional, Union, Any
 import mne
 import s3fs
 import datasets
+import pyarrow.ipc as pa_ipc
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
@@ -43,6 +45,9 @@ from common.path import (
 
 
 logger = logging.getLogger('preproc')
+
+_FIELD_MANIFEST_VERSION = 1
+_POSITION_FIELD_VERSION = 1
 
 
 @dataclass
@@ -408,11 +413,18 @@ class EEGDatasetBuilder(datasets.GeneratorBasedBuilder, ABC):
                 ) as f:
                     # disable internal multithread
                     table = pq.read_table(f, use_threads=False)
+                    pos = self._read_position_sidecar(file)
                     for idx in range(table.num_rows):
                         row = table.slice(idx, 1).to_pylist()[0]
 
                         row['chs'] = np.array(row['chs'], dtype=np.int32)
                         row['data'] = np.array(row['data'], dtype=np.float32).reshape(len(row['chs']), -1)
+                        if pos.shape != (len(row['chs']), 3):
+                            raise ValueError(
+                                f'Persisted pos for {file} has shape {pos.shape}; '
+                                f'expected ({len(row["chs"])}, 3).'
+                            )
+                        row['pos'] = pos.tolist()
                         key = file + f'_{idx}'
 
                         yield key, row
@@ -449,11 +461,176 @@ class EEGDatasetBuilder(datasets.GeneratorBasedBuilder, ABC):
             )
         split_df = self._divide_split(info_df)
         split_df.to_csv(self.info_csv_path, index=False)
-
-        # split_df = pd.read_csv(self.info_csv_path)
         self._generate_middle_files(split_df, n_proc)
-
         self._mark_preproc_done()
+
+    def _field_root(self) -> str:
+        return os.path.join(self.config.mid_path, self.config.name, 'fields')
+
+    def _position_sidecar_path(self, key: str) -> str:
+        return os.path.join(self._field_root(), 'pos', key)
+
+    def _field_manifest_path(self) -> str:
+        return os.path.join(
+            self.summary_path,
+            f'{self.config.dataset_name}_{self.config.name}_{self.config.get_fs_id()}_fields.json',
+        )
+
+    @staticmethod
+    def _atomic_write_json(path: str, value: dict) -> None:
+        temp_path = f'{path}.tmp'
+        with open(temp_path, 'w', encoding='utf-8') as handle:
+            json.dump(value, handle, indent=2, sort_keys=True)
+        os.replace(temp_path, path)
+
+    @staticmethod
+    def _atomic_write_parquet(df: DataFrame, path: str, compression: str) -> None:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        temp_path = f'{path}.tmp'
+        df.to_parquet(temp_path, compression=compression, engine='pyarrow', index=False)
+        os.replace(temp_path, path)
+
+    @staticmethod
+    def _validate_positions(value: Any, expected_channels: int) -> ndarray:
+        positions = np.asarray(value, dtype=np.float32)
+        if positions.shape != (expected_channels, 3):
+            raise ValueError(
+                f'Expected persisted positions with shape ({expected_channels}, 3), got {positions.shape}.'
+            )
+        if not np.isfinite(positions).all() or np.any(np.all(positions == 0.0, axis=1)):
+            raise ValueError('Persisted positions must be finite and non-zero for every channel.')
+        return np.ascontiguousarray(positions)
+
+    def _position_fingerprint(self, source_path: str, montage: str) -> str:
+        try:
+            stat = os.stat(source_path)
+            source_version: list[Any] = [stat.st_size, stat.st_mtime_ns]
+        except OSError:
+            source_version = ['unavailable']
+        payload = {
+            'version': _POSITION_FIELD_VERSION,
+            'source': os.path.abspath(source_path),
+            'source_version': source_version,
+            'montage': montage,
+            'position_montage': self.config.position_montage,
+            'channels': self._get_chs_name_by_montage(montage, is_std=True),
+        }
+        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+    def _read_position_sidecar(self, key: str) -> ndarray:
+        path = self._position_sidecar_path(key)
+        if not os.path.isfile(path):
+            raise ValueError(f'Missing required pos sidecar for intermediate artifact {key}.')
+        table = pq.read_table(path, columns=['pos'], use_threads=False)
+        if table.num_rows != 1:
+            raise ValueError(f'Expected one pos sidecar row for {key}, got {table.num_rows}.')
+        return np.asarray(table.column('pos').to_pylist()[0], dtype=np.float32)
+
+    def _embedded_positions(self, key: str, split: str) -> Optional[ndarray]:
+        table = pq.read_table(self._build_output_dir(split, key), use_threads=False)
+        if 'pos' not in table.column_names or table.num_rows == 0:
+            return None
+        first = table.column('pos').to_pylist()[0]
+        if first is None or len(first) == 0:
+            return None
+        expected_channels = len(table.column('chs').to_pylist()[0])
+        positions = self._validate_positions(first, expected_channels)
+        for value in table.column('pos').to_pylist()[1:]:
+            np.testing.assert_allclose(self._validate_positions(value, expected_channels), positions)
+        return positions
+
+    def _iter_position_artifacts(self, sample: dict):
+        """Yield ``(intermediate_key, xyz)`` without transforming signals."""
+        path, montage = str(sample['path']), str(sample['montage'])
+        data = self._read_raw_data(path, preload=False, verbose=False)
+        if not isinstance(data, BaseRaw):
+            raise TypeError(
+                f'{type(self).__name__} must override _iter_position_artifacts for non-Raw sources.'
+            )
+        try:
+            data = self._select_data_channels(data, path, montage)
+            positions = self._resolve_electrode_positions(data, montage)
+            if positions is None:
+                raise ValueError('No native or configured montage coordinates are available.')
+            yield f'{self._encode_path(path)}.parquet', positions
+        finally:
+            data.close()
+
+    def _legacy_position_map(self, info_df: DataFrame) -> dict[str, ndarray]:
+        positions: dict[str, ndarray] = {}
+        for sample in info_df.to_dict(orient='records'):
+            for key, value in self._iter_position_artifacts(sample):
+                positions[key] = np.ascontiguousarray(value)
+        return positions
+
+    def materialize_fields(self, refresh_fields: list[str] | tuple[str, ...] = ()) -> bool:
+        """Materialize field sidecars without filtering, resampling, or windowing."""
+        unsupported = set(refresh_fields).difference({'pos'})
+        if unsupported:
+            raise ValueError(f'Unsupported field refresh request: {sorted(unsupported)}.')
+        if self.config.is_remote_fs:
+            raise NotImplementedError('Independent field sidecars are not implemented for remote caches.')
+        force = 'pos' in refresh_fields
+        mid_df = pd.read_csv(self.mid_file_csv_path)
+        info_df = pd.read_csv(self.info_csv_path)
+        manifest = {'version': _FIELD_MANIFEST_VERSION, 'fields': {'pos': {'version': _POSITION_FIELD_VERSION, 'artifacts': {}}}}
+        if os.path.isfile(self._field_manifest_path()):
+            with open(self._field_manifest_path(), encoding='utf-8') as handle:
+                manifest = json.load(handle)
+            manifest.setdefault('fields', {}).setdefault('pos', {}).setdefault('artifacts', {})
+        legacy_positions: Optional[dict[str, ndarray]] = None
+        changed = False
+        for row in mid_df.to_dict(orient='records'):
+            key, split = str(row['key']), str(row['split'])
+            source_path = str(row.get('source_path', ''))
+            montage = str(row.get('montage', ''))
+            if not source_path or not montage:
+                matching = info_df[info_df['path'].map(lambda value: f'{self._encode_path(str(value))}.parquet') == key]
+                if len(matching) == 1:
+                    source_path, montage = str(matching.iloc[0]['path']), str(matching.iloc[0]['montage'])
+            fingerprint = self._position_fingerprint(source_path, montage) if source_path and montage else ''
+            old = manifest['fields']['pos']['artifacts'].get(key, {})
+            if not force and os.path.isfile(self._position_sidecar_path(key)) and old.get('fingerprint') == fingerprint:
+                continue
+            positions = self._embedded_positions(key, split)
+            if positions is None:
+                if legacy_positions is None:
+                    legacy_positions = self._legacy_position_map(info_df)
+                positions = legacy_positions.get(key)
+            if positions is None:
+                raise ValueError(
+                    f'Cannot backfill pos for {key}: no embedded positions and no source mapping. '
+                    'Rebuild the signal cache for this artifact.'
+                )
+            expected_channels = len(pq.read_table(self._build_output_dir(split, key), columns=['chs']).column('chs').to_pylist()[0])
+            positions = self._validate_positions(positions, expected_channels)
+            self._atomic_write_parquet(
+                pd.DataFrame([{'pos': positions.tolist(), 'fingerprint': fingerprint, 'source_path': source_path}]),
+                self._position_sidecar_path(key), self.config.mid_compress_algo,
+            )
+            manifest['fields']['pos']['artifacts'][key] = {
+                'fingerprint': fingerprint,
+                'channels': expected_channels,
+            }
+            changed = True
+        if changed or not os.path.isfile(self._field_manifest_path()):
+            self._atomic_write_json(self._field_manifest_path(), manifest)
+        return changed
+
+    def arrow_requires_refresh(self) -> bool:
+        """Return true when final Arrow is absent or lacks the required pos field."""
+        if self.config.is_remote_fs:
+            return False
+        root = os.path.join(self.config.data_path, self.config.dataset_name, self.config.name)
+        arrows = glob.glob(os.path.join(root, '**', '*.arrow'), recursive=True)
+        if not arrows:
+            return True
+        try:
+            with open(arrows[0], 'rb') as handle:
+                reader = pa_ipc.open_stream(handle)
+                return 'pos' not in reader.schema.names
+        except Exception:
+            return True
 
     # Custom Methods
     def _record_preproc_warning(self, message: str, count: int = 1) -> None:
@@ -634,11 +811,10 @@ class EEGDatasetBuilder(datasets.GeneratorBasedBuilder, ABC):
                 data = self._select_data_channels(data, path, montage)
                 data = self._resample_and_filter(data)
                 raw = self._fetch_signal_ndarray(data)
-                electrode_positions = self._resolve_electrode_positions(data, montage)
                 chs_idx = self._fetch_chs_index(montage)
 
                 examples = self._generate_window_sample(
-                    raw, montage, chs_idx, label, self.config.persist_drop_last, electrode_positions)
+                    raw, montage, chs_idx, label, self.config.persist_drop_last)
                 if len(examples) < 1:
                     return None
 
@@ -670,6 +846,9 @@ class EEGDatasetBuilder(datasets.GeneratorBasedBuilder, ABC):
             'key': [filename],
             'split': [split],
             'cnt': [len(examples)],})
+        mid_df['source_path'] = path
+        mid_df['montage'] = montage
+        mid_df['source_id'] = ''
         return mid_df
 
     def _generate_window_sample(
@@ -733,10 +912,11 @@ class EEGDatasetBuilder(datasets.GeneratorBasedBuilder, ABC):
 
             base_dict = {
                 'chs': chs_idx,
-                'pos': electrode_pos,
                 'montage': f'{self.config.dataset_name}/{montage}',
                 'task': self.config.task_type.value,
             }
+            if electrode_positions is not None:
+                base_dict['pos'] = electrode_pos
 
             example_dicts = []
             for wnd_data in wnd_data_batch:
