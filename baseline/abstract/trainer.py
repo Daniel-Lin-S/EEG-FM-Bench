@@ -4,10 +4,11 @@ Abstract trainer base class for baseline models.
 import datetime
 import os
 import logging
+import warnings
 from abc import ABC, abstractmethod
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import comet_ml
 import datasets
@@ -32,6 +33,31 @@ from common.distributed.env import get_is_master, get_global_rank, get_local_ran
 from common.distributed.loader import DistributedGroupBatchSampler
 
 logger = logging.getLogger("baseline")
+
+
+class ChainableSequentialLR(torch.optim.lr_scheduler.SequentialLR):
+    """A ``SequentialLR`` that never passes an epoch to child schedulers.
+
+    PyTorch's ``SequentialLR`` calls ``scheduler.step(0)`` at each milestone.
+    That deprecated epoch argument emits a warning on recent PyTorch releases.
+    Calling ``step()`` starts the next scheduler at its initial chainable state
+    and gives the same warmup-to-cosine transition used by this benchmark.
+    """
+
+    def step(self):
+        self.last_epoch += 1
+        # ``SequentialLR`` selects schedulers with ``bisect_right``. With the
+        # two schedulers used here, this crosses the warmup milestone without
+        # taking its deprecated ``step(0)`` path.
+        scheduler_index = 0 if self.last_epoch < self._milestones[0] else 1
+        scheduler = self._schedulers[scheduler_index]
+        if scheduler_index == 1 and self.last_epoch == self._milestones[0]:
+            # Match ``SequentialLR.step(0)`` by restoring the next scheduler
+            # base rates ourselves, then use its chainable ``step()`` call.
+            for param_group, base_lr in zip(self.optimizer.param_groups, scheduler.base_lrs):
+                param_group["lr"] = base_lr
+        scheduler.step()
+        self._last_lr = scheduler.get_last_lr()
 
 
 METRIC_PRECISION_DICT = {
@@ -641,7 +667,56 @@ class AbstractTrainer(ABC):
         sampler = sampler[0]
 
         return dataloader, sampler
-    
+
+    @staticmethod
+    def _label_sets_by_dataset(
+        dataloaders: Union[list[DataLoader], DataLoader],
+    ) -> Dict[str, set[int]]:
+        """Read each dataset label space without iterating worker processes."""
+        if isinstance(dataloaders, DataLoader):
+            dataloaders = [dataloaders]
+
+        label_sets: Dict[str, set[int]] = {}
+        for dataloader in dataloaders:
+            adapter = dataloader.dataset
+            dataset = getattr(adapter, "dataset", adapter)
+            if "label" not in dataset.column_names:
+                continue
+
+            for montage, label in zip(dataset["montage"], dataset["label"]):
+                dataset_name = str(montage).split("/", maxsplit=1)[0]
+                label_sets.setdefault(dataset_name, set()).add(int(label))
+
+        return label_sets
+
+    def warn_on_split_label_mismatch(
+        self,
+        train_loaders: Union[list[DataLoader], DataLoader],
+        validation_loaders: Union[list[DataLoader], DataLoader],
+        test_loaders: Union[list[DataLoader], DataLoader],
+    ) -> None:
+        """Warn before training when a dataset split has a different label space."""
+        train_labels = self._label_sets_by_dataset(train_loaders)
+        validation_labels = self._label_sets_by_dataset(validation_loaders)
+        test_labels = self._label_sets_by_dataset(test_loaders)
+
+        for dataset_name in sorted(train_labels | validation_labels | test_labels):
+            train_set = sorted(train_labels.get(dataset_name, set()))
+            validation_set = sorted(validation_labels.get(dataset_name, set()))
+            test_set = sorted(test_labels.get(dataset_name, set()))
+            if train_set == validation_set == test_set:
+                continue
+
+            warnings.warn(
+                "Label-space mismatch before baseline training: "
+                f"dataset={dataset_name}; fold=N/A (fixed dataset split); "
+                f"training labels={train_set}; validation labels={validation_set}; "
+                f"test labels={test_set}. This can cause evaluation predictions "
+                "to contain classes absent from a split",
+                UserWarning,
+                stacklevel=2,
+            )
+
     @abstractmethod
     def setup_model(self):
         """Setup model architecture."""
@@ -790,7 +865,7 @@ class AbstractTrainer(ABC):
                 T_max=total_steps - warmup_steps,
                 eta_min=self.cfg.training.min_lr
             )
-            scheduler = torch.optim.lr_scheduler.SequentialLR(
+            scheduler = ChainableSequentialLR(
                 optimizer,
                 schedulers=[warm_scheduler, cos_scheduler],
                 milestones=[warmup_steps]
@@ -1429,6 +1504,8 @@ class AbstractTrainer(ABC):
         valid_loaders, _ = self.create_dataloader(datasets.Split.VALIDATION)
         test_loaders, _ = self.create_dataloader(datasets.Split.TEST)
 
+        self.warn_on_split_label_mismatch(train_loader, valid_loaders, test_loaders)
+
         if not isinstance(train_loader, DataLoader) or not isinstance(train_sampler, DistributedGroupBatchSampler):
             raise TypeError('train_loader and train_sampler must be of type DataLoader')
 
@@ -1477,6 +1554,8 @@ class AbstractTrainer(ABC):
             train_loader, train_sampler = self.create_single_dataloader(ds_name, ds_config, datasets.Split.TRAIN)
             valid_loader, _ = self.create_single_dataloader(ds_name, ds_config, datasets.Split.VALIDATION)
             test_loader, _ = self.create_single_dataloader(ds_name, ds_config, datasets.Split.TEST)
+
+            self.warn_on_split_label_mismatch(train_loader, valid_loader, test_loader)
 
             if not isinstance(train_loader, DataLoader) or not isinstance(train_sampler, DistributedGroupBatchSampler):
                 raise TypeError('train_loader and train_sampler must be of type DataLoader')
