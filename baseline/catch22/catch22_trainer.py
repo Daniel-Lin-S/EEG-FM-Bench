@@ -9,6 +9,9 @@ import logging
 import numpy as np
 
 from baseline.catch22.catch22_config import Catch22Config
+from baseline.catch22.extractor import Catch22FeatureExtractor
+from baseline.feature_extractor.classifier import ValidationSelectedRidgeClassifier
+from baseline.feature_extractor.pipeline import FeatureExtractionPipeline
 from baseline.feature_extractor.trainer import FeatureExtractorTrainer
 
 
@@ -21,7 +24,11 @@ class Catch22Trainer(FeatureExtractorTrainer):
     """Extract canonical catch22 values independently from EEG channels."""
 
     def __init__(self, cfg: Catch22Config):
-        super().__init__(cfg)
+        pipeline = FeatureExtractionPipeline(
+            Catch22FeatureExtractor(),
+            ValidationSelectedRidgeClassifier(cfg.model.classifier),
+        )
+        super().__init__(cfg, pipeline)
 
     def fit_extractor(self, train_data: np.ndarray) -> None:
         """Validate deterministic catch22 training data without fitting state.

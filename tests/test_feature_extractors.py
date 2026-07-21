@@ -66,7 +66,7 @@ def test_catch22_concatenates_canonical_features(monkeypatch):
 def test_ridge_selection_uses_validation_and_scales_features():
     """Ridge candidates fit train data and select the smallest tied alpha."""
     trainer = MeanFeatureTrainer(
-        make_config(model={"ridge_alphas": [10.0, 1.0]})
+        make_config(model={"classifier": {"alphas": [10.0, 1.0]}})
     )
     train_features = np.array([[0.0], [1.0], [10.0], [11.0]])
     train_labels = np.array([0, 0, 1, 1])
@@ -106,9 +106,9 @@ def test_feature_extractor_config_rejects_multitask_and_bad_alphas():
     with pytest.raises(ValueError, match="multitask=false"):
         multitask_config.validate_config()
     with pytest.raises(ValueError, match="positive"):
-        make_config(model={"ridge_alphas": [1.0, 0.0]})
+        make_config(model={"classifier": {"alphas": [1.0, 0.0]}})
     with pytest.raises(ValueError, match="duplicates"):
-        make_config(model={"ridge_alphas": [1.0, 1.0]})
+        make_config(model={"classifier": {"alphas": [1.0, 1.0]}})
 
 
 def test_minirocket_loads_external_multivariate_source(tmp_path):
@@ -131,9 +131,11 @@ def test_minirocket_loads_external_multivariate_source(tmp_path):
     config = MiniRocketConfig(
         data={"datasets": {DATASET_NAME: DATASET_CONFIG}},
         model={
-            "minirocket_source_path": str(source_root),
-            "minirocket_num_features": 12,
-            "minirocket_max_dilations_per_kernel": 3,
+            "extractor": {
+                "source_path": str(source_root),
+                "num_features": 12,
+                "max_dilations_per_kernel": 3,
+            },
         },
     )
     trainer = MiniRocketTrainer(config)

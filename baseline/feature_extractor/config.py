@@ -113,9 +113,6 @@ class FeatureExtractorConfig(AbstractConfig):
 
     multitask: bool = False
     data: BaseDataArgs = Field(default_factory=BaseDataArgs)
-    model: FeatureExtractorModelArgs = Field(
-        default_factory=FeatureExtractorModelArgs
-    )
     training: FeatureExtractorTrainingArgs = Field(
         default_factory=FeatureExtractorTrainingArgs
     )
@@ -136,15 +133,3 @@ class FeatureExtractorConfig(AbstractConfig):
             )
         return True
 
-
-class Catch22Config(FeatureExtractorConfig):
-    """Configuration for the canonical per-channel catch22 baseline."""
-
-    model_type: str = "catch22"
-
-
-class MiniRocketConfig(FeatureExtractorConfig):
-    """Configuration for the external multivariate miniROCKET baseline."""
-
-    model_type: str = "minirocket"
-    model: MiniRocketModelArgs = Field(default_factory=MiniRocketModelArgs)

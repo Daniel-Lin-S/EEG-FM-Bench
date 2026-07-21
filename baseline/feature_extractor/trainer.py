@@ -13,7 +13,7 @@ import os
 import warnings
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import datasets
 import numpy as np
@@ -32,7 +32,9 @@ from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader
 
 from baseline.abstract.trainer import AbstractTrainer, format_console_log_dict
+from baseline.feature_extractor.classifier import FeatureClassifier
 from baseline.feature_extractor.config import FeatureExtractorConfig
+from baseline.feature_extractor.pipeline import FeatureExtractionPipeline
 from baseline.utils.common import seed_torch
 from baseline.utils.run_artifacts import get_config_hash, save_resolved_config
 from common.distributed.env import get_is_master, get_world_size
@@ -63,9 +65,14 @@ class FeatureExtractorTrainer(AbstractTrainer, ABC):
         Feature-extractor baseline configuration.
     """
 
-    def __init__(self, cfg: FeatureExtractorConfig):
+    def __init__(
+        self,
+        cfg: FeatureExtractorConfig,
+        pipeline: Optional[FeatureExtractionPipeline] = None,
+    ):
         super().__init__(cfg)
         self.cfg = cfg
+        self.pipeline = pipeline
         self.final_validation_metrics: Dict[str, Dict[str, float]] = {}
 
     def setup_model(self):
@@ -308,11 +315,11 @@ class FeatureExtractorTrainer(AbstractTrainer, ABC):
         validation_labels: np.ndarray,
     ) -> Tuple[Pipeline, float]:
         """Fit and select Ridge candidates with the configured validation metric."""
-        selection_metric = self.cfg.model.ridge_selection_metric
+        selection_metric = self.cfg.model.classifier.selection_metric
         best_classifier = None
         best_alpha = None
         best_score = -np.inf
-        for alpha in sorted(self.cfg.model.ridge_alphas):
+        for alpha in sorted(self.cfg.model.classifier.alphas):
             classifier = Pipeline(
                 [
                     ("scaler", StandardScaler()),
@@ -365,7 +372,7 @@ class FeatureExtractorTrainer(AbstractTrainer, ABC):
 
     def _evaluate(
         self,
-        classifier: Pipeline,
+        classifier: FeatureClassifier,
         features: np.ndarray,
         labels: np.ndarray,
         ds_name: str,
@@ -383,7 +390,7 @@ class FeatureExtractorTrainer(AbstractTrainer, ABC):
         n_class = self.ds_info[ds_name]["n_class"]
         if n_class == 2:
             scores = np.asarray(classifier.decision_function(features))
-            classes = classifier.named_steps["ridge"].classes_
+            classes = classifier.classes_
             positive_label = classes[1]
             binary_labels = labels == positive_label
             if np.unique(binary_labels).size < 2:
@@ -460,19 +467,15 @@ class FeatureExtractorTrainer(AbstractTrainer, ABC):
                 ds_name,
             )
 
-            self.fit_extractor(train_data)
-            train_features = self._extract_features(train_data, "training")
-            validation_features = self._extract_features(
-                validation_data,
-                "validation",
-            )
-            test_features = self._extract_features(test_data, "test")
-            classifier, selected_alpha = self._fit_classifier(
-                train_features,
+            self.pipeline.fit(
+                train_data,
                 train_labels,
-                validation_features,
+                validation_data,
                 validation_labels,
             )
+            validation_features = self.pipeline.transform(validation_data)
+            test_features = self.pipeline.transform(test_data)
+            classifier = self.pipeline.classifier
             validation_metrics = self._evaluate(
                 classifier,
                 validation_features,
@@ -487,8 +490,15 @@ class FeatureExtractorTrainer(AbstractTrainer, ABC):
                 ds_name,
                 "test",
             )
+            selected_alpha = getattr(classifier, "selected_alpha", None)
+            selection_metric = getattr(classifier.args, "selection_metric", None)
+            if selected_alpha is None or selection_metric is None:
+                raise RuntimeError(
+                    "Feature classifier must expose selected alpha and "
+                    "selection metric for benchmark logging."
+                )
             selected_metric_key = METRIC_NAME_TO_KEY[
-                self.cfg.model.ridge_selection_metric
+                selection_metric
             ]
             selection_metrics = {
                 f"{ds_name}/train/selected_alpha": selected_alpha,

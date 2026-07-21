@@ -12,10 +12,13 @@ from types import ModuleType
 
 import numpy as np
 
+from baseline.feature_extractor.classifier import ValidationSelectedRidgeClassifier
+from baseline.feature_extractor.pipeline import FeatureExtractionPipeline
 from baseline.feature_extractor.trainer import (
     MINIROCKET_MIN_TIMEPOINTS,
     FeatureExtractorTrainer,
 )
+from baseline.minirocket.extractor import MiniRocketFeatureExtractor
 from baseline.minirocket.minirocket_config import MiniRocketConfig
 
 
@@ -23,7 +26,14 @@ class MiniRocketTrainer(FeatureExtractorTrainer):
     """Fit the upstream multivariate miniROCKET transform on training EEG."""
 
     def __init__(self, cfg: MiniRocketConfig):
-        super().__init__(cfg)
+        pipeline = FeatureExtractionPipeline(
+            MiniRocketFeatureExtractor(
+                cfg.model.extractor,
+                cfg.seed,
+            ),
+            ValidationSelectedRidgeClassifier(cfg.model.classifier),
+        )
+        super().__init__(cfg, pipeline)
         self.cfg = cfg
         self.parameters = None
         self._minirocket_module: ModuleType | None = None
@@ -36,7 +46,7 @@ class MiniRocketTrainer(FeatureExtractorTrainer):
         types.ModuleType
             Loaded ``minirocket_multivariate`` module.
         """
-        source_path = self.cfg.model.minirocket_source_path
+        source_path = self.cfg.model.extractor.source_path
         if not source_path:
             raise ValueError(
                 "model.minirocket_source_path is required. Clone "
@@ -103,9 +113,9 @@ class MiniRocketTrainer(FeatureExtractorTrainer):
         self._minirocket_module = self._load_minirocket_module()
         self.parameters = self._minirocket_module.fit(
             train_data,
-            num_features=self.cfg.model.minirocket_num_features,
+            num_features=self.cfg.model.extractor.num_features,
             max_dilations_per_kernel=(
-                self.cfg.model.minirocket_max_dilations_per_kernel
+                self.cfg.model.extractor.max_dilations_per_kernel
             ),
         )
 
