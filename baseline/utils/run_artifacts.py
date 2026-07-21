@@ -91,6 +91,13 @@ def load_final_checkpoint(run_dir: str | Path, dataset_name: str) -> Path:
             f"at {completion_path}."
         )
     completion = json.loads(completion_path.read_text(encoding="utf-8"))
+    if completion.get("has_checkpoint") is False:
+        model_type = completion.get("model_type", "this baseline")
+        raise FileNotFoundError(
+            f"{model_type} completed {dataset_name} without a checkpoint; "
+            "this feature-extractor baseline does not support checkpoint "
+            "loading."
+        )
     checkpoint_path = completion.get("checkpoint_path")
     if not isinstance(checkpoint_path, str) or not checkpoint_path:
         raise ValueError(

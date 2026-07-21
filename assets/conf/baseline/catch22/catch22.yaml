@@ -1,0 +1,31 @@
+# Catch-22 features + Ridge regression
+
+seed: 42
+multitask: false
+model_type: catch22
+
+data:
+  datasets:
+    tuab: finetune
+    # ...
+  batch_size: 256
+  num_workers: 1
+
+model:
+  # grid-search for Ridge regression classifier
+  ridge_alphas:
+    - 0.001
+    - 0.01
+    - 0.1
+    - 1.0
+    - 10.0
+    - 100.0
+    - 1000.0
+  ridge_selection_metric: balanced_accuracy
+
+logging:
+  experiment_name: catch22
+  run_dir: assets/run
+  use_cloud: false
+  outputs:
+    - csv

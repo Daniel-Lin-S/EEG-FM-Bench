@@ -15,6 +15,18 @@ _MODEL_SPECS = {
     "conformer": ("baseline.conformer.conformer_config.ConformerConfig", None, "baseline.conformer.conformer_trainer.ConformerTrainer", "pip install -r requirements/supervised.txt"),
     "mantis": ("baseline.mantis.mantis_config.MantisConfig", "baseline.mantis.mantis_adapter.MantisDataLoaderFactory", "baseline.mantis.mantis_trainer.MantisTrainer", None),
     "moment": ("baseline.moment.moment_config.MomentConfig", "baseline.moment.moment_adapter.MomentDataLoaderFactory", "baseline.moment.moment_trainer.MomentTrainer", None),
+    "catch22": (
+        "baseline.catch22.catch22_config.Catch22Config",
+        None,
+        "baseline.catch22.catch22_trainer.Catch22Trainer",
+        "pip install -r requirements/feature_extractors.txt",
+    ),
+    "minirocket": (
+        "baseline.minirocket.minirocket_config.MiniRocketConfig",
+        None,
+        "baseline.minirocket.minirocket_trainer.MiniRocketTrainer",
+        "pip install -r requirements/feature_extractors.txt",
+    ),
 }
 
 

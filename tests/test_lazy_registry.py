@@ -7,8 +7,20 @@ from baseline.abstract.factory import ModelRegistry, OptionalModelDependencyErro
 
 
 def test_listing_models_does_not_import_model_trainers():
-    assert {"brainomni", "reve", "eegnet", "conformer"}.issubset(ModelRegistry.list_models())
-    assert not any(name.endswith("_trainer") for name in sys.modules if name.startswith("baseline."))
+    trainers_before = {
+        name
+        for name in sys.modules
+        if name.startswith("baseline.") and name.endswith("_trainer")
+    }
+    assert {"brainomni", "reve", "eegnet", "conformer"}.issubset(
+        ModelRegistry.list_models()
+    )
+    trainers_after = {
+        name
+        for name in sys.modules
+        if name.startswith("baseline.") and name.endswith("_trainer")
+    }
+    assert trainers_after == trainers_before
 
 
 def test_brainomni_resolution_does_not_import_unselected_models():
