@@ -4,8 +4,8 @@ Abstract configuration base class for baseline models.
 
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Dict, Optional, List
-from pydantic import BaseModel, Field
+from typing import Dict, List, Literal, Optional
+from pydantic import BaseModel, Field, field_validator
 
 
 class ClassifierHeadType(str, Enum):
@@ -263,6 +263,10 @@ class BaseLoggingArgs(BaseModel):
         event files in ``<run log directory>/tensorboard``. Default: False.
     ckpt_interval : int
         Number of completed epochs between checkpoint saves.
+    outputs : list[{'log', 'tensorboard', 'csv'}]
+        Local artifacts to persist. ``'csv'`` writes metric event traces,
+        ``'log'`` writes one console log file per invocation, and
+        ``'tensorboard'`` writes TensorBoard event files. Default: ``['csv']``.
     """
     experiment_name: str = "baseline"
     run_dir: str = "assets/run"
@@ -280,6 +284,22 @@ class BaseLoggingArgs(BaseModel):
     ckpt_interval: int = 1
     use_tensorboard: bool = False
 
+    outputs: List[Literal['log', 'tensorboard', 'csv']] = Field(
+        default_factory=lambda: ['csv']
+    )
+
+    @field_validator('outputs')
+    @classmethod
+    def validate_outputs(
+        cls,
+        outputs: List[Literal['log', 'tensorboard', 'csv']],
+    ) -> List[Literal['log', 'tensorboard', 'csv']]:
+        """Validate requested local artifact types."""
+        if not outputs:
+            raise ValueError('logging.outputs must contain at least one trace type.')
+        if len(outputs) != len(set(outputs)):
+            raise ValueError('logging.outputs must not contain duplicate trace types.')
+        return outputs
 
 class AbstractConfig(BaseModel, ABC):
     """Top-level configuration shared by all baseline trainers.

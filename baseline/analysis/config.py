@@ -64,6 +64,7 @@ class ModelType(str, Enum):
     CSBRAIN = "csbrain"
     MANTIS = "mantis"
     MOMENT = "moment"
+    BRAINOMNI = "brainomni"
 
 
 class GroupingStrategy(str, Enum):

@@ -62,6 +62,8 @@ from baseline.mantis.mantis_trainer import MantisTrainer
 from baseline.mantis.mantis_config import MantisConfig
 from baseline.moment.moment_trainer import MomentTrainer
 from baseline.moment.moment_config import MomentConfig
+from baseline.brainomni.brainomni_config import BrainOmniConfig
+from baseline.brainomni.brainomni_trainer import BrainOmniTrainer
 
 # Parameter groupers
 from baseline.utils.param_groupers import PARAM_GROUPER_REGISTRY

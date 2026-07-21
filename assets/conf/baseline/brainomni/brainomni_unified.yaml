@@ -21,7 +21,7 @@ data:
 # Model configuration
 model:
   # Directory containing model_cfg.json and BrainOmni.pt
-  pretrained_path: /data/lyh/model_weights/BrainOmni/tiny
+  pretrained_path: /path/to/brainomni/checkpoint
 
   normalize_input: true
   normalize_position: true
@@ -71,7 +71,7 @@ training:
 
 # Logging configuration
 logging:
-  experiment_name: brainomni
+  experiment_name: brainomni-base
 
   ckpt_interval: 10
 

@@ -50,6 +50,10 @@ from omegaconf import OmegaConf
 from baseline.abstract.config import AbstractConfig
 from baseline.abstract.factory import ModelRegistry
 from baseline.utils.common import seed_torch
+from baseline.utils.run_artifacts import (
+    load_final_checkpoint,
+    load_saved_run_config,
+)
 from common.log import setup_log
 from common.path import get_conf_file_path
 from common.utils import setup_yaml
@@ -92,22 +96,26 @@ def main():
     """Main visualization function."""
     parser = argparse.ArgumentParser(description="Traditional visualization for baseline models")
     parser.add_argument("vis_type", choices=["t_sne", "grad_cam", "integrated_gradients"])
-    parser.add_argument("model_config", help="Path to baseline model config yaml")
+    parser.add_argument("model_config", nargs="?",
+                        help="Path to baseline model config YAML")
+    parser.add_argument("--run-dir", default=None,
+                        help="Saved baseline run artifact directory")
     parser.add_argument("vis_config", help="Path to visualization config yaml")
     args = parser.parse_args()
+    if bool(args.model_config) == bool(args.run_dir):
+        parser.error('provide exactly one of model_config or --run-dir')
 
     setup_log()
     setup_yaml()
 
     logger.info(f"Starting {args.vis_type} visualization")
-    logger.info(f"Model config: {args.model_config}")
+    logger.info(f"Model config: {args.model_config or args.run_dir}")
     logger.info(f"Visualization config: {args.vis_config}")
 
     if not Path(args.vis_config).exists():
         raise FileNotFoundError(f"Visualization config file not found: {args.vis_config}")
 
-    model_config = load_model_config(args.model_config)
-    logger.info(f"Loaded {type(model_config).__name__} configuration")
+    model_config = None
 
     if args.vis_type == 't_sne':
         vis_config: TsneVisArgs = load_vis_conf_dict(args.vis_config, args.vis_type)
@@ -119,6 +127,20 @@ def main():
     else:
         vis_config: IntegratedGradientsVisArgs = load_vis_conf_dict(args.vis_config, args.vis_type)
 
+    if args.run_dir:
+        dataset_names = list(vis_config.datasets)
+        if len(dataset_names) != 1:
+            parser.error('--run-dir visualization requires exactly one dataset')
+        dataset_name = dataset_names[0]
+        model_config = load_saved_run_config(args.run_dir, dataset_name)
+        vis_config.ckpt_path = str(
+            load_final_checkpoint(args.run_dir, dataset_name)
+        )
+        model_config.data.batch_size = 1
+        if hasattr(model_config.model, 'pretrained_path'):
+            model_config.model.pretrained_path = None
+    else:
+        model_config = load_model_config(args.model_config)
     logger.info(f'visualization config {vis_config}')
     logger.info(f'target model config {model_config}')
 

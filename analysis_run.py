@@ -7,6 +7,7 @@ import argparse
 import logging
 
 from baseline.analysis.run import load_analysis_config, load_trainer_config, run_analysis
+from baseline.utils.run_artifacts import load_saved_run_config
 
 
 logger = logging.getLogger("analysis_run")
@@ -17,17 +18,25 @@ def main():
     parser = argparse.ArgumentParser(description="EEG-FM Gradient Analysis")
 
     parser.add_argument("--config", type=str, default=None, help="Path to analysis config YAML")
-    parser.add_argument("--trainer-config", type=str, default=None, help="Path to trainer config YAML")
+    parser.add_argument("--trainer-config", type=str, default=None,
+                        help="Path to trainer config YAML")
+    parser.add_argument("--run-dir", type=str, default=None,
+                        help="Saved baseline run artifact directory")
 
     args = parser.parse_args()
 
     # Load configs
     analysis_config = load_analysis_config(args.config)
-
-    trainer_config = load_trainer_config(
-        analysis_config.model_type,
-        args.trainer_config or analysis_config.trainer_config_path,
-    )
+    if args.run_dir and (args.trainer_config or analysis_config.trainer_config_path):
+        raise ValueError('--run-dir cannot be combined with a trainer config.')
+    if args.run_dir:
+        trainer_config = load_saved_run_config(args.run_dir)
+        analysis_config.model_type = trainer_config.model_type
+    else:
+        trainer_config = load_trainer_config(
+            analysis_config.model_type,
+            args.trainer_config or analysis_config.trainer_config_path,
+        )
 
     # Run analysis (handles multi-seed internally)
     results = run_analysis(analysis_config, trainer_config)

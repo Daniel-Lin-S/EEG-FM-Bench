@@ -1,6 +1,9 @@
 """
 Abstract trainer base class for baseline models.
 """
+import csv
+import json
+import shutil
 import datetime
 import os
 import logging
@@ -26,10 +29,11 @@ from baseline.utils.lora import (
     inject_lora, get_lora_state_dict, load_lora_state_dict, get_model_lora_targets
 )
 from baseline.utils.common import seed_torch
+from baseline.utils.run_artifacts import get_config_hash, save_resolved_config
 from common.log import setup_log
 from data.processor.wrapper import get_dataset_n_class, get_dataset_category, get_dataset_shape_info
 from common.distributed.env import get_is_master, get_global_rank, get_local_rank, get_world_size, get_master_addr, \
-    get_master_port, get_specific_dirname, clean_torch_distributed
+    get_master_port, clean_torch_distributed
 from common.distributed.loader import DistributedGroupBatchSampler
 
 logger = logging.getLogger("baseline")
@@ -138,6 +142,14 @@ class AbstractTrainer(ABC):
         
         self.ckpt_dir: str = ""
         self.log_dir: str = ""
+        self.execution_id: str = ""
+        self.tensorboard_writers: Dict[str, Any] = {}
+        self.csv_file: Optional[Any] = None
+        self.csv_writer: Optional[csv.DictWriter] = None
+        self.current_dataset: Optional[str] = None
+        self.final_checkpoint_paths: Dict[str, Path] = {}
+        self.final_test_metrics: Dict[str, Dict[str, float]] = {}
+
         
         # LoRA tracking
         self.lora_modules: List[str] = []
@@ -216,16 +228,139 @@ class AbstractTrainer(ABC):
         if not get_is_master():
             return '', ''
 
-        name = get_specific_dirname()
-        run_dir = args.run_dir
-        log_path = os.path.join(run_dir, 'log', 'baseline', self.model_type, name)
-        ckpt_path = os.path.join(run_dir, 'ckpt', 'baseline', self.model_type, name)
+        config = self.cfg.model_dump(mode='json')
+        config_hash = get_config_hash(config, self.multitask)
+        experiment_name = f'{args.experiment_name}-{config_hash}'
+        self.execution_id = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
+        self.execution_id = f'{self.execution_id}-{os.getpid()}'
+        if self.multitask:
+            experiment_name = f'{experiment_name}-{self.execution_id}'
+        run_dir = Path(args.run_dir)
+        log_path = run_dir / 'log' / 'baseline' / self.model_type
+        ckpt_path = run_dir / 'ckpt' / 'baseline' / self.model_type
+        log_path = log_path / experiment_name
+        ckpt_path = ckpt_path / experiment_name
+        log_path.mkdir(parents=True, exist_ok=True)
+        ckpt_path.mkdir(parents=True, exist_ok=True)
+        save_resolved_config(
+            config,
+            log_path / 'configs' / f'{self.execution_id}.yaml',
+        )
+        return str(log_path), str(ckpt_path)
 
-        os.makedirs(log_path, exist_ok=True)
-        os.makedirs(ckpt_path, exist_ok=True)
+    def _has_output(self, output_name: str) -> bool:
+        """Return whether one local trace type is enabled."""
+        return output_name in self.cfg.logging.outputs
 
-        return log_path, ckpt_path
-    
+    def _completion_path(self, ds_name: str) -> Path:
+        """Return completion metadata location for one dataset."""
+        return Path(self.log_dir, 'datasets', ds_name, 'completion.json')
+
+    def _dataset_is_complete(self, ds_name: str, ds_config: str) -> bool:
+        """Return whether a matching dataset has final artifacts."""
+        completion_path = self._completion_path(ds_name)
+        if not completion_path.is_file():
+            return False
+        try:
+            completion = json.loads(completion_path.read_text(encoding='utf-8'))
+        except json.JSONDecodeError:
+            logger.warning('Ignoring invalid completion metadata: %s',
+                           completion_path)
+            return False
+        checkpoint_path = completion.get('checkpoint_path')
+        return (
+            completion.get('dataset_config') == ds_config
+            and completion.get('status') == 'completed'
+            and isinstance(checkpoint_path, str)
+            and Path(checkpoint_path).is_file()
+        )
+
+    def _reset_dataset_outputs(self, ds_name: str) -> None:
+        """Remove stale traces before retrying a dataset."""
+        if not get_is_master():
+            return
+        if self._has_output('csv'):
+            csv_path = Path(self.log_dir, 'csv', f'{ds_name}.csv')
+            csv_path.parent.mkdir(parents=True, exist_ok=True)
+            csv_path.unlink(missing_ok=True)
+        if self._has_output('tensorboard'):
+            tensorboard_path = Path(self.log_dir, 'tensorboard', ds_name)
+            if tensorboard_path.exists():
+                shutil.rmtree(tensorboard_path)
+
+    def _open_csv_writer(self, ds_name: str) -> None:
+        """Open one overwriteable metric CSV trace."""
+        if not self._has_output('csv') or not get_is_master():
+            return
+        self._close_csv_writer()
+        csv_path = Path(self.log_dir, 'csv', f'{ds_name}.csv')
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        self.csv_file = csv_path.open('w', newline='', encoding='utf-8')
+        self.csv_writer = csv.DictWriter(
+            self.csv_file,
+            fieldnames=['timestamp', 'dataset', 'split', 'epoch', 'step',
+                        'metric', 'value'],
+        )
+        self.csv_writer.writeheader()
+
+    def _close_csv_writer(self) -> None:
+        """Flush and close the active metric CSV writer."""
+        if self.csv_file is not None:
+            self.csv_file.close()
+            self.csv_file = None
+            self.csv_writer = None
+
+    def _write_csv_metrics(self, log_data: dict, step: int) -> None:
+        """Write numeric metrics from one trainer event to CSV."""
+        if self.csv_writer is None:
+            return
+        for key, value in log_data.items():
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                continue
+            parts = key.split('/')
+            dataset = self.current_dataset or ''
+            if len(parts) >= 3 and parts[0] in self.ds_conf:
+                dataset, split = parts[:2]
+                metric = '/'.join(parts[2:])
+            elif len(parts) >= 2:
+                split, metric = parts[0], '/'.join(parts[1:])
+            else:
+                split, metric = '', key
+            self.csv_writer.writerow({
+                'timestamp': datetime.datetime.now().isoformat(),
+                'dataset': dataset,
+                'split': split,
+                'epoch': self.epoch,
+                'step': step,
+                'metric': metric,
+                'value': value,
+            })
+        self.csv_file.flush()
+
+    def _write_completion(self, ds_name: str, ds_config: str) -> None:
+        """Atomically persist final metadata after successful training."""
+        checkpoint_path = self.final_checkpoint_paths.get(ds_name)
+        metrics = self.final_test_metrics.get(ds_name)
+        if checkpoint_path is None or metrics is None:
+            raise RuntimeError(
+                f'Cannot mark {ds_name} complete without final checkpoint and '
+                'test metrics.'
+            )
+        completion_path = self._completion_path(ds_name)
+        completion_path.parent.mkdir(parents=True, exist_ok=True)
+        content = {
+            'status': 'completed',
+            'dataset_config': ds_config,
+            'execution_id': self.execution_id,
+            'checkpoint_path': str(checkpoint_path.resolve()),
+            'test_metrics': metrics,
+            'completed_at': datetime.datetime.now().isoformat(),
+        }
+        temporary_path = completion_path.with_suffix('.tmp')
+        temporary_path.write_text(json.dumps(content, indent=2),
+                                  encoding='utf-8')
+        temporary_path.replace(completion_path)
+
     def setup_logging(self):
         log_dir, ckpt_dir = self.get_train_io_path(self.cfg.logging)
         # Broadcast paths in distributed environment
@@ -236,10 +371,16 @@ class AbstractTrainer(ABC):
         self.ckpt_dir = ckpt_dir
         self.log_dir = log_dir
         
-        # Setup log file with unified path
         if get_is_master():
+            file_path = None
+            if self._has_output('log'):
+                file_path = os.path.join(
+                    log_dir,
+                    'logs',
+                    f'{self.execution_id}.log',
+                )
             setup_log(
-                file_path=os.path.join(log_dir, f"{self.model_type}_trainer.log"),
+                file_path=file_path,
                 start_time=self.start_time.timestamp(),
                 name="baseline",
                 level="INFO"
@@ -265,36 +406,65 @@ class AbstractTrainer(ABC):
                 self._init_comet()
 
     def init_tensorboard_logging(self):
-        """Initialize local TensorBoard logging on the primary process."""
-        if not self.cfg.logging.use_tensorboard or not get_is_master():
+        """Initialize TensorBoard writers selected by ``logging.outputs``."""
+        if not self._has_output('tensorboard') or not get_is_master():
             return
-
         try:
             from torch.utils.tensorboard import SummaryWriter
-
-            tensorboard_dir = os.path.join(self.log_dir, "tensorboard")
-            self.tensorboard_writer = SummaryWriter(log_dir=tensorboard_dir)
-            logger.info(f"TensorBoard logging enabled: {tensorboard_dir}")
         except ImportError as exc:
             raise ImportError(
                 "TensorBoard logging requires the 'tensorboard' package. "
-                "Install project requirements before setting logging.use_tensorboard=true."
+                "Install project requirements before selecting tensorboard."
             ) from exc
+        if self.multitask:
+            tensorboard_dir = Path(self.log_dir, 'tensorboard')
+            self.tensorboard_writer = SummaryWriter(log_dir=tensorboard_dir)
+            logger.info('TensorBoard logging enabled: %s', tensorboard_dir)
+
+    def _open_dataset_tensorboard(self, ds_name: str) -> None:
+        """Open an overwriteable TensorBoard writer for one dataset."""
+        if not self._has_output('tensorboard') or not get_is_master():
+            return
+        from torch.utils.tensorboard import SummaryWriter
+
+        if ds_name in self.tensorboard_writers:
+            return
+        tensorboard_dir = Path(self.log_dir, 'tensorboard', ds_name)
+        tensorboard_dir.mkdir(parents=True, exist_ok=True)
+        writer = SummaryWriter(log_dir=tensorboard_dir)
+        self.tensorboard_writers[ds_name] = writer
+        if not self.multitask:
+            self.tensorboard_writer = writer
+        logger.info('TensorBoard logging enabled: %s', tensorboard_dir)
 
     def finish_tensorboard_logging(self):
-        """Flush and close the local TensorBoard writer, if it was enabled."""
+        """Flush and close all local TensorBoard writers."""
+        writers = list(self.tensorboard_writers.values())
         if self.tensorboard_writer is not None:
-            self.tensorboard_writer.close()
-            self.tensorboard_writer = None
+            writers.append(self.tensorboard_writer)
+        seen_writers = set()
+        for writer in writers:
+            if id(writer) not in seen_writers:
+                writer.close()
+                seen_writers.add(id(writer))
+        self.tensorboard_writers = {}
+        self.tensorboard_writer = None
 
-    def _log_to_tensorboard(self, log_data: dict, step: int):
-        """Write numeric metric values to TensorBoard using their existing names."""
-        if self.tensorboard_writer is None:
+    def _log_to_tensorboard(
+        self,
+        log_data: dict,
+        step: int,
+        ds_name: Optional[str] = None,
+    ) -> None:
+        """Write numeric metrics to one TensorBoard trace."""
+        writer = self.tensorboard_writer
+        if ds_name is not None:
+            writer = self.tensorboard_writers.get(ds_name)
+        if writer is None:
             return
-
         for key, value in log_data.items():
             if isinstance(value, (int, float)) and not isinstance(value, bool):
-                self.tensorboard_writer.add_scalar(key, value, global_step=step)
+                writer.add_scalar(key, value, global_step=step)
 
     def _init_wandb(self):
         """Initialize wandb logging with unified naming."""
@@ -1286,6 +1456,7 @@ class AbstractTrainer(ABC):
                     if self.cfg.logging.use_cloud:
                         self._log_to_cloud(log_data)
                     self._log_to_tensorboard(log_data, self.current_step)
+                    self._write_csv_metrics(log_data, self.current_step)
 
                     logger.info(format_console_log_dict(log_data, prefix='train'))
 
@@ -1308,6 +1479,7 @@ class AbstractTrainer(ABC):
         self.model.eval()
 
         overall_metrics = {}
+        metric_results: Dict[str, Dict[str, float]] = {}
         for ds_name in self.ds_info.keys():
             n_class = self.ds_info[ds_name]['n_class']
             overall_metrics[ds_name] = {
@@ -1370,6 +1542,7 @@ class AbstractTrainer(ABC):
                     )
 
                     log_dict = log_dict | metrics
+                    metric_results[ds_name] = metrics
                     log_console = format_console_log_dict(metrics, prefix=f"{ds_name}/{prefix}")
                     logger.info(log_console)
 
@@ -1377,12 +1550,23 @@ class AbstractTrainer(ABC):
                 log_cloud = self._create_ft_cloud_log_data(log_dict, prefix, overall_metrics)
                 self._log_to_cloud(log_cloud)
             if get_is_master():
-                self._log_to_tensorboard(log_dict, self.current_step)
+                if self.multitask:
+                    for ds_name, metrics in metric_results.items():
+                        self._open_dataset_tensorboard(ds_name)
+                        self._log_to_tensorboard(
+                            metrics,
+                            self.current_step,
+                            ds_name=ds_name,
+                        )
+                        self._write_csv_metrics(metrics, self.current_step)
+                else:
+                    self._log_to_tensorboard(log_dict, self.current_step)
+                    self._write_csv_metrics(log_dict, self.current_step)
 
             if is_dist:
                 torch.distributed.barrier()
 
-            return overall_metrics
+            return metric_results
 
     @abstractmethod
     def load_checkpoint(self, checkpoint_path: str):
@@ -1447,6 +1631,7 @@ class AbstractTrainer(ABC):
         # Save LoRA weights separately if LoRA is enabled
         if self.cfg.training.lora.use_lora:
             self.save_lora_checkpoint(checkpoint_dir, ds_name, suffix)
+        return checkpoint_path
     
     def save_lora_checkpoint(self, checkpoint_dir: Path, ds_name: str, suffix: str):
         """
@@ -1497,6 +1682,7 @@ class AbstractTrainer(ABC):
         """Original unified training loop for multitask or single dataset training."""
         torch.distributed.barrier()
 
+        self._open_csv_writer('training')
         self.collect_dataset_info(mixed=True)
         model = self.setup_model()
 
@@ -1523,13 +1709,19 @@ class AbstractTrainer(ABC):
             self.train_epoch(train_loader, train_sampler)
 
             self.eval_epoch(valid_loaders, 'eval')
-            self.eval_epoch(test_loaders, 'test')
+            final_test_metrics = self.eval_epoch(test_loaders, 'test')
 
             # Save checkpoint
             if (epoch + 1) % self.cfg.logging.ckpt_interval == 0:
                 self.save_checkpoint()
 
-        self.save_checkpoint(is_milestone=True)
+        checkpoint_path = self.save_checkpoint(is_milestone=True)
+        if get_is_master():
+            for ds_name, ds_config in self.ds_conf.items():
+                self.final_checkpoint_paths[ds_name] = checkpoint_path
+                self.final_test_metrics[ds_name] = final_test_metrics[ds_name]
+                self._write_completion(ds_name, ds_config)
+        self._close_csv_writer()
 
         self.finish_cloud_logging()
         self.finish_tensorboard_logging()
@@ -1545,9 +1737,15 @@ class AbstractTrainer(ABC):
 
         # Train each dataset separately
         for i, (ds_name, ds_config) in enumerate(self.ds_conf.items()):
+            if self._dataset_is_complete(ds_name, ds_config):
+                logger.info('Skipping completed dataset: %s', ds_name)
+                continue
             if get_is_master():
                 logger.info(f"Training dataset {i + 1}/{self.num_ds}: {ds_name}")
-
+                self._reset_dataset_outputs(ds_name)
+                self._open_csv_writer(ds_name)
+                self._open_dataset_tensorboard(ds_name)
+            self.current_dataset = ds_name
             self.collect_dataset_info(mixed=False, ds_name=ds_name)
             model = self.setup_model()
 
@@ -1579,13 +1777,18 @@ class AbstractTrainer(ABC):
                 self.train_epoch(train_loader, train_sampler)
 
                 self.eval_epoch([valid_loader], 'eval')
-                self.eval_epoch([test_loader], 'test')
+                final_test_metrics = self.eval_epoch([test_loader], 'test')
 
                 # Save checkpoint
                 if (epoch + 1) % self.cfg.logging.ckpt_interval == 0:
                     self.save_checkpoint(ds_name=ds_name)
 
-            self.save_checkpoint(ds_name, is_milestone=True)
+            checkpoint_path = self.save_checkpoint(ds_name, is_milestone=True)
+            if get_is_master():
+                self.final_checkpoint_paths[ds_name] = checkpoint_path
+                self.final_test_metrics[ds_name] = final_test_metrics[ds_name]
+                self._write_completion(ds_name, ds_config)
+                self._close_csv_writer()
 
             logger.info(f"Training completed for {ds_name}!")
 
