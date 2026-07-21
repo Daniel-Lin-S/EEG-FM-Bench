@@ -118,10 +118,8 @@ class SeedIVBuilder(EEGDatasetBuilder):
                 data = self._resample_and_filter(data)
                 raw = self._fetch_signal_ndarray(data)
                 chs_idx = self._fetch_chs_index(montage)
-                electrode_positions = self._resolve_electrode_positions(data, montage)
-
                 examples = self._generate_window_sample(
-                    raw, montage, chs_idx, [label], self.config.persist_drop_last, electrode_positions)
+                    raw, montage, chs_idx, [label], self.config.persist_drop_last)
 
                 df = pd.DataFrame(data=examples)
                 df['subject'] = str(subject)
@@ -142,7 +140,11 @@ class SeedIVBuilder(EEGDatasetBuilder):
                 row = {
                     'key': filename,
                     'split': split,
-                    'cnt': len(examples)}
+                    'cnt': len(examples),
+                    'source_path': path,
+                    'montage': montage,
+                    'source_id': str(trial),
+                }
                 mid_df.loc[len(mid_df)] = row
         except Exception as e:
             logger.error(f"Error persisting example file {path}: {str(e)}")
@@ -217,6 +219,21 @@ class SeedIVBuilder(EEGDatasetBuilder):
                   'PO7','PO5','PO3','POZ','PO4','PO6','PO8',
                          'CB1','O1','OZ','O2','CB2'
         ]
+
+    def _iter_position_artifacts(self, sample: dict):
+        """Resolve one XYZ sidecar per trial without signal preprocessing."""
+        path, montage = str(sample['path']), str(sample['montage'])
+        data_list, trial_names = self._read_raw_data(path, preload=False, verbose=False)
+        for data, trial in zip(data_list, trial_names):
+            try:
+                data = self._select_data_channels(data, path, montage)
+                positions = self._resolve_electrode_positions(data, montage)
+                if positions is None:
+                    raise ValueError('No native or configured montage coordinates are available.')
+                key = f"{self._encode_path(f'{path}_trial_{trial}')}.parquet"
+                yield key, positions
+            finally:
+                data.close()
 
     def _read_raw_data(self, file_path: str, preload: bool = False, verbose: bool = False) -> BaseRaw:
         data = loadmat(file_path)

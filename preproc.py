@@ -13,6 +13,10 @@ clean_middle_cache : bool, optional, default=False
 clean_shared_info : bool, optional, default=False
     Also clears shared builder metadata during cache cleanup; ignored unless
     ``clean_middle_cache`` is true.
+refresh_fields : list[str], optional, default=[]
+    Field flows to force-refresh after signal-cache reuse. ``pos`` is currently supported.
+refresh_arrow : bool, optional, default=False
+    Rebuild final Arrow artifacts from valid intermediate and field caches only.
 num_preproc_arrow_writers : int, optional, default=4
     Worker processes used by ``download_and_prepare`` to materialize the final
     Arrow dataset.
@@ -37,6 +41,9 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Mapping
+
+os.environ.setdefault('HF_DATASETS_DISABLE_PROGRESS_BARS', '1')
+import datasets
 from dataclasses import dataclass
 from typing import Any, Literal, Type
 
@@ -127,6 +134,11 @@ def prepare_dataset(
         if conf.clean_middle_cache:
             builder.clean_all_cache(clean_shared_info=conf.clean_shared_info)
         builder.preproc(n_proc=conf.num_preproc_mid_workers)
+        materialize_fields = getattr(builder, 'materialize_fields', None)
+        fields_changed = materialize_fields(conf.refresh_fields) if materialize_fields else False
+        arrow_requires_refresh = getattr(builder, 'arrow_requires_refresh', None)
+        if fields_changed or conf.refresh_arrow or (arrow_requires_refresh and arrow_requires_refresh()):
+            builder.clean_arrow_set()
         builder.download_and_prepare(num_proc=conf.num_preproc_arrow_writers)
         dataset = builder.as_dataset()
         sample_count, output_dir = _validate_prepared_dataset(dataset, builder)
@@ -240,6 +252,8 @@ def _load_config() -> BasePreprocArgs:
 
 
 def main() -> int:
+    # Keep progress renderers out of stderr; structured warnings/errors still log there.
+    datasets.disable_progress_bars()
     setup_log(name='preproc')
     try:
         conf = _load_config()

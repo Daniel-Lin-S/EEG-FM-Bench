@@ -25,7 +25,6 @@ model:
 
   normalize_input: true
   normalize_position: true
-  allow_missing_positions: false  # set to true if allow missing positions to be filled with zeros
 
   freeze_tokenizer: false
 

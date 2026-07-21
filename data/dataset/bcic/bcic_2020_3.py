@@ -145,10 +145,8 @@ class BCIC2020ImagineBuilder(EEGDatasetBuilder):
                 data = self._select_data_channels(data, path, montage)
                 raw = self._fetch_signal_ndarray(data)
                 chs_idx = self._fetch_chs_index(montage)
-                electrode_positions = self._resolve_electrode_positions(data, montage)
-
                 examples = self._generate_window_sample(
-                    raw, montage, chs_idx, label, self.config.persist_drop_last, electrode_positions)
+                    raw, montage, chs_idx, label, self.config.persist_drop_last)
                 if len(examples) < 1:
                     return None
 
@@ -180,6 +178,9 @@ class BCIC2020ImagineBuilder(EEGDatasetBuilder):
             'key': [filename],
             'split': [split],
             'cnt': [len(examples)],})
+        mid_df['source_path'] = path
+        mid_df['montage'] = montage
+        mid_df['source_id'] = ''
         return mid_df
 
     def _divide_split(self, df: DataFrame) -> DataFrame:
