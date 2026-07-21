@@ -108,11 +108,27 @@ class FeatureExtractorLoggingArgs(BaseLoggingArgs):
     project: Optional[str] = "feature-extractor"
 
 
+class FeatureExtractorDataArgs(BaseDataArgs):
+    """Data-loading settings for non-neural feature extractors."""
+
+    load_batch_size: int = 32
+
+    @field_validator("load_batch_size")
+    @classmethod
+    def validate_load_batch_size(cls, value: int) -> int:
+        """Require a positive raw-data loading batch size."""
+        if value <= 0:
+            raise ValueError("data.load_batch_size must be positive.")
+        return value
+
+
 class FeatureExtractorConfig(AbstractConfig):
     """Base configuration for per-dataset feature-extractor evaluation."""
 
     multitask: bool = False
-    data: BaseDataArgs = Field(default_factory=BaseDataArgs)
+    data: FeatureExtractorDataArgs = Field(
+        default_factory=FeatureExtractorDataArgs
+    )
     training: FeatureExtractorTrainingArgs = Field(
         default_factory=FeatureExtractorTrainingArgs
     )

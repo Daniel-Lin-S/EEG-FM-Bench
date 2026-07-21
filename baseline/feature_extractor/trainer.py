@@ -224,7 +224,7 @@ class FeatureExtractorTrainer(AbstractTrainer, ABC):
 
         dataloader = DataLoader(
             dataset,
-            batch_size=self.cfg.data.batch_size,
+            batch_size=self.cfg.data.load_batch_size,
             shuffle=False,
             num_workers=self.cfg.data.num_workers,
         )
