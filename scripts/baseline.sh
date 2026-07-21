@@ -2,14 +2,15 @@
 
 # Run model training locally.
 # Example:
-#   scripts/baseline.sh --config assets/conf/baseline/example.yaml
+#   scripts/baseline.sh conf_file=assets/conf/baseline/example.yaml
 # to set a different device:
 # CUDA_DEVICE=4 scripts/baseline.sh ...
 
 set -Eeuo pipefail
-source "${ROOT_PATH}/scripts/common.sh"
 
 ROOT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "${ROOT_PATH}/scripts/common.sh"
+
 # ---- user parameters -----
 LOG_DIR="${LOG_DIR:-${ROOT_PATH}/logs}"
 PYTHON="${PYTHON:-python}"

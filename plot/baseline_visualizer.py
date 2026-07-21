@@ -8,6 +8,7 @@ from torch.utils.data import DataLoader
 from baseline.abstract.classifier import MultiHeadClassifier
 from baseline.abstract.config import AbstractConfig
 from baseline.abstract.factory import ModelRegistry
+from baseline.registry import register_builtin_models
 from plot.utils.base_visualizer import BaseVisualizer
 
 
@@ -20,6 +21,7 @@ class BaselineVisualizer(BaseVisualizer):
 
     def build_model(self):
         logger.info(f"Building {self.vis_args.model_type} model for visualization")
+        register_builtin_models()
 
         # Get trainer class
         trainer_class = ModelRegistry.get_trainer_class(self.vis_args.model_type)

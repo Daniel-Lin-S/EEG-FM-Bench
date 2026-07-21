@@ -23,10 +23,9 @@ model:
   # Directory containing model_cfg.json and BrainOmni.pt
   pretrained_path: /data/lyh/model_weights/BrainOmni/tiny
 
-  position_montage: auto
   normalize_input: true
   normalize_position: true
-  allow_missing_positions: true  # set to true if allow missing positions to be filled with zeros
+  allow_missing_positions: false  # set to true if allow missing positions to be filled with zeros
 
   freeze_tokenizer: false
 

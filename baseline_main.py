@@ -31,12 +31,14 @@ import sys
 from omegaconf import OmegaConf
 
 from baseline.abstract.factory import ModelRegistry
+from baseline.registry import register_builtin_models
 from common.path import get_conf_file_path
 from common.utils import setup_yaml
 
 
 def main():
     """Main training function that can handle any registered baseline model."""
+    register_builtin_models()
     setup_yaml()
     
     # Parse CLI arguments
@@ -85,6 +87,7 @@ def main():
 
 def list_available_models():
     """List all available model types."""
+    register_builtin_models()
     print("Available baseline models:")
     for model_type in ModelRegistry.list_models():
         print(f"  - {model_type}")

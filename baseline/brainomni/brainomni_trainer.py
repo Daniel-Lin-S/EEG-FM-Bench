@@ -84,10 +84,8 @@ class BrainOmniTrainer(AbstractTrainer):
 			batch_size=self.cfg.data.batch_size,
 			num_workers=self.cfg.data.num_workers,
 			seed=self.cfg.seed,
-			position_montage=self.cfg.model.position_montage,
 			normalize_input=self.cfg.model.normalize_input,
 			normalize_position=self.cfg.model.normalize_position,
-			allow_missing_positions=self.cfg.model.allow_missing_positions,
 			signal_normalize_eps=self.cfg.model.signal_normalize_eps,
 			position_normalize_eps=self.cfg.model.position_normalize_eps,
 		)

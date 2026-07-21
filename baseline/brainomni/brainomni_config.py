@@ -25,17 +25,11 @@ class BrainOmniModelArgs(BaseModelArgs):
 
 	Parameters
 	----------
-	position_montage : str
-		MNE standard montage used to derive six-dimensional sensor metadata;
-		``"auto"`` resolves it from each benchmark montage key.
 	normalize_input : bool
 		Whether to remove the per-timepoint channel mean and divide each sample
 		by its global population standard deviation before encoding.
 	normalize_position : bool
 		Whether to center and scale sensor xyz coordinates before encoding.
-	allow_missing_positions : bool
-		Whether channels absent from the resolved montage may use zero position
-		and orientation vectors.
 	signal_normalize_eps, position_normalize_eps : float
 		Positive numerical floors used by signal and position normalization.
 	freeze_tokenizer : bool
@@ -51,10 +45,8 @@ class BrainOmniModelArgs(BaseModelArgs):
 	"""
 
 	# Adapter behavior
-	position_montage: str = "auto"
 	normalize_input: bool = True
 	normalize_position: bool = True
-	allow_missing_positions: bool = False
 	signal_normalize_eps: float = 1e-5
 	position_normalize_eps: float = 1e-8
 
@@ -184,8 +176,6 @@ class BrainOmniConfig(AbstractConfig):
 		bool
 			``True`` if configuration is valid.
 		"""
-		if not self.model.position_montage:
-			return False
 		if self.model.signal_normalize_eps <= 0.0:
 			return False
 		if self.model.position_normalize_eps <= 0.0:
