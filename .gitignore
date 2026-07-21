@@ -2,15 +2,18 @@
 .cache/
 .vscode/
 __pycache__/
-wandb
 
+# training logs
+assets/run
+wandb
+logs
+
+# virtual enviroments
 .venv/
 .conda/
 env/
 venv/
 ENV/
-
-logs
 
 *.lock
 *.pyc

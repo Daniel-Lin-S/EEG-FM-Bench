@@ -258,6 +258,9 @@ class BaseLoggingArgs(BaseModel):
     log_step_interval : int
         Number of optimizer steps between training-metric log events.
         Default: 1
+    use_tensorboard : bool
+        Whether to write scalar training and evaluation metrics to TensorBoard
+        event files in ``<run log directory>/tensorboard``. Default: False.
     ckpt_interval : int
         Number of completed epochs between checkpoint saves.
     """
@@ -275,6 +278,7 @@ class BaseLoggingArgs(BaseModel):
 
     log_step_interval: int = 1
     ckpt_interval: int = 1
+    use_tensorboard: bool = False
 
 
 class AbstractConfig(BaseModel, ABC):

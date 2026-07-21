@@ -23,6 +23,7 @@ pytz
 einops
 timm
 transformers
+tensorboard
 safetensors
 huggingface_hub
 linear_attention_transformer

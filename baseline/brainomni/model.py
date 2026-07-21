@@ -12,7 +12,7 @@ import logging
 import sys
 import types
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 import torch
 from torch import nn
@@ -241,9 +241,34 @@ def load_brainomni_weights(
     checkpoint_obj = torch.load(checkpoint_path, map_location=map_location, weights_only=False)
     state_dict = _extract_state_dict(checkpoint_obj)
     state_dict = _strip_module_prefix(state_dict)
+    state_dict = _migrate_legacy_weight_norm_state_dict(model, state_dict)
 
     incompatible = model.load_state_dict(state_dict, strict=strict)
     return list(incompatible.missing_keys), list(incompatible.unexpected_keys)
+
+
+def _migrate_legacy_weight_norm_state_dict(
+    model: nn.Module, state_dict: Dict[str, torch.Tensor]
+) -> Dict[str, torch.Tensor]:
+    """Map legacy weight-norm checkpoint keys to PyTorch parametrization keys.
+
+    BrainOmni's public checkpoints were created with the deprecated
+    ``torch.nn.utils.weight_norm`` API. The vendored layers now use its
+    parametrization replacement, whose state-dict names differ.
+    """
+    target_keys = set(model.state_dict().keys())
+    migrated = dict(state_dict)
+    for suffix, replacement in (
+        (".weight_g", ".parametrizations.weight.original0"),
+        (".weight_v", ".parametrizations.weight.original1"),
+    ):
+        for key in list(migrated):
+            if not key.endswith(suffix):
+                continue
+            new_key = f"{key[:-len(suffix)]}{replacement}"
+            if new_key in target_keys and new_key not in migrated:
+                migrated[new_key] = migrated.pop(key)
+    return migrated
 
 
 def load_brainomni_from_pretrained(
@@ -373,7 +398,7 @@ def _ensure_deepspeed_comm_fallback() -> None:
     sys.modules["deepspeed.comm"] = comm_module
 
     if not _DEEPSPEED_FALLBACK_ENABLED:
-        logger.warning(
+        logger.info(
             "deepspeed.comm is not installed; using single-process fallback "
             "for BrainOmni import and checkpoint loading."
         )

@@ -7,7 +7,7 @@ import logging
 from abc import ABC, abstractmethod
 from copy import deepcopy
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import comet_ml
 import datasets
@@ -108,6 +108,7 @@ class AbstractTrainer(ABC):
 
         self.start_time = datetime.datetime.now()
         self.comet_experiment = None
+        self.tensorboard_writer: Optional[Any] = None
         
         self.ckpt_dir: str = ""
         self.log_dir: str = ""
@@ -236,6 +237,38 @@ class AbstractTrainer(ABC):
 
             if backend in ['comet', 'both']:
                 self._init_comet()
+
+    def init_tensorboard_logging(self):
+        """Initialize local TensorBoard logging on the primary process."""
+        if not self.cfg.logging.use_tensorboard or not get_is_master():
+            return
+
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+
+            tensorboard_dir = os.path.join(self.log_dir, "tensorboard")
+            self.tensorboard_writer = SummaryWriter(log_dir=tensorboard_dir)
+            logger.info(f"TensorBoard logging enabled: {tensorboard_dir}")
+        except ImportError as exc:
+            raise ImportError(
+                "TensorBoard logging requires the 'tensorboard' package. "
+                "Install project requirements before setting logging.use_tensorboard=true."
+            ) from exc
+
+    def finish_tensorboard_logging(self):
+        """Flush and close the local TensorBoard writer, if it was enabled."""
+        if self.tensorboard_writer is not None:
+            self.tensorboard_writer.close()
+            self.tensorboard_writer = None
+
+    def _log_to_tensorboard(self, log_data: dict, step: int):
+        """Write numeric metric values to TensorBoard using their existing names."""
+        if self.tensorboard_writer is None:
+            return
+
+        for key, value in log_data.items():
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                self.tensorboard_writer.add_scalar(key, value, global_step=step)
 
     def _init_wandb(self):
         """Initialize wandb logging with unified naming."""
@@ -1177,6 +1210,7 @@ class AbstractTrainer(ABC):
                     # Log to cloud services
                     if self.cfg.logging.use_cloud:
                         self._log_to_cloud(log_data)
+                    self._log_to_tensorboard(log_data, self.current_step)
 
                     logger.info(format_console_log_dict(log_data, prefix='train'))
 
@@ -1267,6 +1301,8 @@ class AbstractTrainer(ABC):
             if get_is_master() and self.cfg.logging.use_cloud:
                 log_cloud = self._create_ft_cloud_log_data(log_dict, prefix, overall_metrics)
                 self._log_to_cloud(log_cloud)
+            if get_is_master():
+                self._log_to_tensorboard(log_dict, self.current_step)
 
             if is_dist:
                 torch.distributed.barrier()
@@ -1365,6 +1401,7 @@ class AbstractTrainer(ABC):
         seed_torch(self.cfg.seed)
         self.setup_distributed()
         self.setup_logging()
+        self.init_tensorboard_logging()
         self.init_cloud_logging()
 
         logger.info(f"Starting {self.cfg.model_type} training with configuration:")
@@ -1418,6 +1455,7 @@ class AbstractTrainer(ABC):
         self.save_checkpoint(is_milestone=True)
 
         self.finish_cloud_logging()
+        self.finish_tensorboard_logging()
         clean_torch_distributed(self.local_rank)
 
         logger.info("Training completed successfully!")
@@ -1476,6 +1514,7 @@ class AbstractTrainer(ABC):
             self.current_step = 0
 
         self.finish_cloud_logging()
+        self.finish_tensorboard_logging()
         clean_torch_distributed(self.local_rank)
         logger.info("Separate models training completed for all datasets!")
 
