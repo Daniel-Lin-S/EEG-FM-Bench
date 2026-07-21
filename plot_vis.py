@@ -1,10 +1,44 @@
 #!/usr/bin/env python3
-"""Traditional visualization entry for baseline models only.
+"""Traditional visualisation entry for models.
+
+This entry point runs one of three visualisation workflows selected by
+``vis_type``:
+
+``"t_sne"``
+    Extracts classifier features, optionally standardizes them and applies
+    PCA, then embeds them in two dimensions with t-SNE. The output is one
+    plot per dataset.
+``"grad_cam"``
+    Computes Grad-CAM values from model activations and gradients. Depending
+    on ``GradCamVisArgs.grad_cam_target``, it produces a channel topomap (or
+    bar plot fallback) or a temporal heatmap, together with optional
+    per-sample and correctly-predicted class-average plots.
+``"integrated_gradients"``
+    Computes Captum Integrated Gradients wrapped in a Noise Tunnel. Depending
+    on ``IntegratedGradientsVisArgs.ig_target``, attributions are reduced over
+    time for a channel topomap (or bar plot fallback) or over channels for a
+    temporal heatmap, together with the same optional plot groups.
+
+The ``model_config`` YAML is selected by its ``model_type`` field and merged
+with the concrete configuration class registered in
+``baseline.abstract.factory.ModelRegistry``. See
+``baseline.abstract.config.AbstractConfig``, ``ModelRegistry`` and the
+model-specific ``*Config`` classes in ``baseline/*/*_config.py`` to determine
+which model fields can be set. ``plot_vis.load_model_config`` also forces
+``data.batch_size`` to ``1`` and clears ``model.pretrained_path``; use
+``VisArgs.ckpt_path`` in the visualisation YAML to load a checkpoint.
+
+The ``vis_config`` YAML is parsed into one of
+``plot.utils.conf.TsneVisArgs``, ``plot.utils.conf.GradCamVisArgs`` or
+``plot.utils.conf.IntegratedGradientsVisArgs``. See those classes for the
+fields and defaults accepted for each ``vis_type``. The runtime behavior of
+those fields is implemented by ``plot.utils.base_visualizer.BaseVisualizer``.
 
 Usage:
-    python visualize.py t_sne assets/conf/baseline/eegpt/eegpt_unified.yaml plot/configs/eegpt/tsne_config_eegpt.yaml
-    python visualize.py grad_cam assets/conf/baseline/csbrain/csbrain_unified.yaml plot/configs/csbrain/gradcam_config_csbrain.yaml
-    python visualize.py integrated_gradients assets/conf/baseline/reve/reve_unified.yaml plot/configs/reve/integrated_gradients_config_reve.yaml
+    python plot_vis.py t_sne <model_config.yaml> <vis_config.yaml>
+    python plot_vis.py grad_cam <model_config.yaml> <vis_config.yaml>
+    python plot_vis.py integrated_gradients <model_config.yaml> \
+        <vis_config.yaml>
 """
 
 import argparse
