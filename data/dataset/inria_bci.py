@@ -47,6 +47,7 @@ class InriaBciConfig(EEGConfig):
     dataset_name: Optional[str] = 'inria_bci'
     task_type: DatasetTaskType = DatasetTaskType.ERP
     file_ext: str = 'csv'
+    position_montage: str = "standard_1005"
     montage: dict[str, list[str]] = field(default_factory=lambda: {
         '10_10': [
                                     'Fp1', 'Fp2',

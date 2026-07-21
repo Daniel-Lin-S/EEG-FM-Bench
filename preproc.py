@@ -42,8 +42,6 @@ import logging
 import os
 from collections.abc import Mapping
 
-os.environ.setdefault('HF_DATASETS_DISABLE_PROGRESS_BARS', '1')
-import datasets
 from dataclasses import dataclass
 from typing import Any, Literal, Type
 
@@ -252,8 +250,6 @@ def _load_config() -> BasePreprocArgs:
 
 
 def main() -> int:
-    # Keep progress renderers out of stderr; structured warnings/errors still log there.
-    datasets.disable_progress_bars()
     setup_log(name='preproc')
     try:
         conf = _load_config()

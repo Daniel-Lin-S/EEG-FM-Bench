@@ -249,8 +249,16 @@ class BuilderCacheStatusTests(unittest.TestCase):
             cached = builder._is_preproc_cached()
 
         self.assertTrue(cached)
-        self.assertEqual(builder.preproc_warning_count, 2)
-        self.assertEqual(builder.preproc_warning_messages, ['2 recording(s) skipped'])
+        self.assertEqual(builder.preproc_warning_count, 0)
+        self.assertEqual(builder.preproc_warning_messages, [])
+
+    def test_summary_ignores_cached_warning_status(self):
+        result = preproc_module.DatasetPreparationResult('cached', 'finetune', 'success')
+        output = io.StringIO()
+        with redirect_stdout(output):
+            preproc_module.print_preprocessing_summary([result])
+
+        self.assertIn('SUCCESS: cached/finetune', output.getvalue())
 
     def test_stale_done_marker_with_missing_middle_file_is_rejected(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -316,7 +324,8 @@ class BuilderCacheStatusTests(unittest.TestCase):
             arrow_path.mkdir(parents=True)
             (arrow_path / 'dataset_info.json').touch()
             builder = object.__new__(EEGDatasetBuilder)
-            builder.info = SimpleNamespace(splits={'test': 'stale'})
+            builder.info = SimpleNamespace(splits={'test': 'stale'}, features='stale')
+            builder._info = lambda: SimpleNamespace(features='fresh')
             builder.config = SimpleNamespace(
                 data_path=str(root),
                 dataset_name='dataset',
@@ -327,7 +336,79 @@ class BuilderCacheStatusTests(unittest.TestCase):
             builder.clean_arrow_set()
 
         self.assertFalse(arrow_path.exists())
+        self.assertEqual(builder.info.features, 'fresh')
         self.assertIsNone(builder.info.splits)
+
+
+@unittest.skipIf(EEGDatasetBuilder is None, f'Builder dependencies unavailable: {DEPENDENCY_ERROR}')
+class IndependentFieldFlowTests(unittest.TestCase):
+    def _builder(self, temp_dir, *, embedded_pos):
+        root = Path(temp_dir)
+        middle = root / 'middle'
+        summary = root / 'summary'
+        summary.mkdir()
+        key = 'record.parquet'
+        signal_path = middle / 'finetune' / 'train' / key
+        signal_path.parent.mkdir(parents=True)
+        rows = [{
+            'chs': [1, 2],
+            'data': [0.0] * 8,
+            'montage': 'demo/10_20',
+            'task': 1,
+            'subject': 'subject',
+        }]
+        if embedded_pos is not None:
+            rows[0]['pos'] = embedded_pos
+        pd.DataFrame(rows).to_parquet(signal_path, engine='pyarrow', index=False)
+
+        builder = object.__new__(EEGDatasetBuilder)
+        builder.summary_path = str(summary)
+        builder.info_csv_path = str(summary / 'demo_finetune_info.csv')
+        builder.mid_file_csv_path = str(summary / 'demo_finetune_fs_256_cache_files.csv')
+        pd.DataFrame([{'path': '/raw/record', 'montage': '10_20'}]).to_csv(builder.info_csv_path, index=False)
+        pd.DataFrame([{
+            'key': key, 'split': 'train', 'cnt': 1,
+            'source_path': '/raw/record', 'montage': '10_20', 'source_id': '',
+        }]).to_csv(builder.mid_file_csv_path, index=False)
+        builder.config = SimpleNamespace(
+            is_remote_fs=False, mid_path=str(middle), name='finetune',
+            dataset_name='demo', get_fs_id=lambda: 'fs_256',
+            mid_compress_algo='zstd', position_montage='standard_1020',
+        )
+        builder._get_chs_name_by_montage = lambda montage, is_std=False: ['FP1', 'FP2']
+        return builder, key
+
+    def test_embedded_positions_become_sidecars_without_opening_raw_or_processing_signal(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            builder, key = self._builder(temp_dir, embedded_pos=[[1., 2., 3.], [4., 5., 6.]])
+            builder._iter_position_artifacts = lambda sample: (_ for _ in ()).throw(AssertionError('raw opened'))
+            builder._resample_and_filter = lambda data: (_ for _ in ()).throw(AssertionError('signal transformed'))
+            self.assertTrue(builder.materialize_fields())
+            self.assertTrue(Path(builder._position_sidecar_path(key)).is_file())
+            self.assertFalse(builder.materialize_fields())
+
+    def test_missing_position_uses_field_extractor_without_signal_processing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            builder, key = self._builder(temp_dir, embedded_pos=None)
+            calls = []
+            def extract(sample):
+                calls.append(sample['path'])
+                yield key, np.array([[1., 2., 3.], [4., 5., 6.]])
+            builder._iter_position_artifacts = extract
+            builder._resample_and_filter = lambda data: (_ for _ in ()).throw(AssertionError('signal transformed'))
+            self.assertTrue(builder.materialize_fields(['pos']))
+            self.assertEqual(calls, ['/raw/record'])
+            self.assertEqual(builder._read_position_sidecar(key).shape, (2, 3))
+
+    def test_arrow_materialization_uses_sidecar_positions(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            builder, key = self._builder(temp_dir, embedded_pos=[[1., 2., 3.], [4., 5., 6.]])
+            builder.materialize_fields()
+            examples = list(builder._generate_examples(key=[key], split=['train']))
+            self.assertEqual(len(examples), 1)
+            np.testing.assert_allclose(
+                examples[0][1]['pos'], np.array([[1., 2., 3.], [4., 5., 6.]]),
+            )
 
 
 class LoggingAndShellStatusTests(unittest.TestCase):
@@ -380,6 +461,56 @@ class LoggingAndShellStatusTests(unittest.TestCase):
         self.assertTrue(completed.stdout.rstrip().endswith(
             'OVERALL: FAILED — 0 succeeded, 1 failed, 0 with warnings'
         ))
+
+
+    def test_preproc_wrapper_always_creates_empty_error_log(self):
+        project_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            environment = os.environ.copy()
+            environment.update({'PYTHON': '/bin/true', 'LOG_DIR': str(root / 'logs')})
+            completed = subprocess.run(
+                ['bash', 'scripts/preproc.sh'], cwd=project_root, env=environment,
+                capture_output=True, text=True, check=False,
+            )
+            err_file = next((root / 'logs').glob('*.err'))
+
+            self.assertEqual(completed.returncode, 0)
+            self.assertTrue(err_file.is_file())
+            self.assertEqual(err_file.read_text(), '')
+
+
+    def test_preproc_wrapper_keeps_carriage_return_progress_out_of_saved_logs(self):
+        project_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            fake_python = root / 'fake-python'
+            fake_python.write_text(
+                '#!/usr/bin/env bash\n'
+                'printf "\rGenerating train split: 6 examples\n"\n'
+                'printf "\rCasting the dataset: 100%%0:WARNING real warning after progress\n" >&2\n'
+                'printf "ordinary output\n"\n'
+                'printf "0:ERROR real error\n" >&2\n'
+            )
+            fake_python.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update({'PYTHON': str(fake_python), 'LOG_DIR': str(root / 'logs')})
+            completed = subprocess.run(
+                ['bash', 'scripts/preproc.sh'], cwd=project_root, env=environment,
+                capture_output=True, text=True, check=False,
+            )
+            log_file = next((root / 'logs').glob('*.log'))
+            err_file = next((root / 'logs').glob('*.err'))
+            log_text = log_file.read_text()
+            err_text = err_file.read_text()
+            saved = log_text + err_text
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertIn('ordinary output', log_text)
+        self.assertIn('0:WARNING real warning after progress', err_text)
+        self.assertIn('0:ERROR real error', err_text)
+        self.assertNotIn('Generating train split', saved)
+        self.assertNotIn('Casting the dataset', saved)
 
 
 if __name__ == '__main__':

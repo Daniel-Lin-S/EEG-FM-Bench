@@ -27,7 +27,6 @@ for how to set these parameters.
 """
 
 import sys
-
 from omegaconf import OmegaConf
 
 from baseline.abstract.factory import ModelRegistry

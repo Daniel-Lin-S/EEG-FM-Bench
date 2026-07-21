@@ -1,5 +1,25 @@
 #!/usr/bin/env bash
 
+# Mirror a stream to the terminal via ``tee`` while omitting tqdm-style refreshes
+# (records containing carriage returns) from its saved log file. Normal messages,
+# warnings, and tracebacks do not contain carriage returns and remain intact.
+write_log_without_progress() {
+  local destination="$1"
+  awk -v destination="${destination}" '
+    index($0, "\r") == 0 {
+      print >> destination
+      fflush(destination)
+      next
+    }
+    # A logging record can follow a tqdm redraw without an intervening newline.
+    # Preserve that warning/error suffix while dropping only the redraw itself.
+    match($0, /[[:digit:]]+:(WARNING|ERROR|CRITICAL)[[:space:]]/) {
+      print substr($0, RSTART) >> destination
+      fflush(destination)
+    }
+  '
+}
+
 # Print a consistent, human-readable result for every local wrapper.
 report_exit_status() {
   local exit_code="$1"

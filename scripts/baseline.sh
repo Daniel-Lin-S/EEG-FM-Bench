@@ -21,7 +21,10 @@ LOG_FILE="${LOG_DIR}/baseline_${TIMESTAMP}_$$.log"
 ERR_FILE="${LOG_DIR}/baseline_${TIMESTAMP}_$$.err"
 
 mkdir -p "${LOG_DIR}"
-exec > >(tee -a "${LOG_FILE}") 2> >(tee -a "${ERR_FILE}" >&2)
+# Always create both run artifacts, including when the process emits no stderr.
+: > "${LOG_FILE}"
+: > "${ERR_FILE}"
+exec > >(tee >(write_log_without_progress "${LOG_FILE}")) 2> >(tee >(write_log_without_progress "${ERR_FILE}") >&2)
 
 cd "${ROOT_PATH}"
 echo "======= LOCAL ENVIRONMENT ======="

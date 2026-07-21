@@ -626,9 +626,12 @@ class EEGDatasetBuilder(datasets.GeneratorBasedBuilder, ABC):
         if not arrows:
             return True
         try:
-            with open(arrows[0], 'rb') as handle:
-                reader = pa_ipc.open_stream(handle)
-                return 'pos' not in reader.schema.names
+            for arrow_path in arrows:
+                with open(arrow_path, 'rb') as handle:
+                    reader = pa_ipc.open_stream(handle)
+                    if 'pos' not in reader.schema.names:
+                        return True
+            return False
         except Exception:
             return True
 
@@ -698,7 +701,10 @@ class EEGDatasetBuilder(datasets.GeneratorBasedBuilder, ABC):
             if not self.config.database_proc_root.startswith('s3://'):
                 shutil.rmtree(arrow_path, ignore_errors=True)
                 # The builder may have loaded dataset_info.json before cleanup.
-                # Do not validate regenerated split sizes against that stale info.
+                # Its features can be stale too (for example, before ``pos`` was
+                # added). Regenerate both schema and split metadata before the
+                # next ``download_and_prepare`` call.
+                self.info.features = self._info().features
                 self.info.splits = None
             else:
                 pass
@@ -1027,8 +1033,9 @@ class EEGDatasetBuilder(datasets.GeneratorBasedBuilder, ABC):
             except (TypeError, ValueError) as error:
                 logger.warning(f'Ignoring invalid preprocessing marker: {error}')
                 return False
-            self.preproc_warning_count = warning_count
-            self.preproc_warning_messages = warning_messages
+            # Completion markers describe the original signal-cache build, not
+            # this invocation. Do not replay those historical warnings as
+            # current-run diagnostics or include them in the run summary.
         return True
 
     def _walk_raw_data_files(self):

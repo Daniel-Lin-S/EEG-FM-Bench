@@ -18,10 +18,13 @@ LOG_FILE="${LOG_DIR}/preproc_${TIMESTAMP}_$$.log"
 ERR_FILE="${LOG_DIR}/preproc_${TIMESTAMP}_$$.err"
 
 mkdir -p "${LOG_DIR}"
+# Always create both run artifacts, including when the process emits no stderr.
+: > "${LOG_FILE}"
+: > "${ERR_FILE}"
 
 # Keep output visible in the terminal while also writing separate stdout and
 # stderr files, matching the Slurm wrapper's logging convention.
-exec > >(tee -a "${LOG_FILE}") 2> >(tee -a "${ERR_FILE}" >&2)
+exec > >(tee >(write_log_without_progress "${LOG_FILE}")) 2> >(tee >(write_log_without_progress "${ERR_FILE}") >&2)
 
 cd "${ROOT_PATH}"
 
