@@ -8,14 +8,18 @@ from baseline.feature_extractor.classifier import RidgeClassifierArgs
 from baseline.feature_extractor.config import FeatureExtractorConfig
 
 
+DEFAULT_MINIROCKET_THREADS = 8
+
+
 class MiniRocketExtractorArgs(BaseModel):
     """Configuration for an external multivariate miniROCKET clone."""
 
     source_path: Optional[str] = None
     num_features: int = 10_000
     max_dilations_per_kernel: int = 32
+    n_jobs: int = Field(default=DEFAULT_MINIROCKET_THREADS, ge=1)
 
-    @field_validator("num_features", "max_dilations_per_kernel")
+    @field_validator("num_features", "max_dilations_per_kernel", "n_jobs")
     @classmethod
     def validate_positive_integer(cls, value: int) -> int:
         """Require positive miniROCKET integer settings."""

@@ -6,6 +6,7 @@ splits. Extractors receive raw ``float32`` arrays shaped
 standardized extracted features and are selected by validation performance.
 """
 
+import csv
 import datetime
 import json
 import logging
@@ -140,7 +141,9 @@ class FeatureExtractorTrainer(AbstractTrainer, ABC):
         if get_is_master():
             file_path = None
             if self._has_output("log"):
-                file_path = str(Path(log_dir, "logs", f"{self.execution_id}.log"))
+                file_path = str(
+                    Path(log_dir, "logs", f"{self.execution_id}.log")
+                )
             setup_log(
                 file_path=file_path,
                 start_time=self.start_time.timestamp(),
@@ -148,6 +151,49 @@ class FeatureExtractorTrainer(AbstractTrainer, ABC):
                 level="INFO",
             )
             logger.info("log dir: %s", self.log_dir)
+
+    def _open_csv_writer(self, ds_name: str) -> None:
+        """Open a CSV trace without neural-training coordinates."""
+        if not self._has_output("csv") or not get_is_master():
+            return
+        self._close_csv_writer()
+        csv_path = Path(self.log_dir, "csv", f"{ds_name}.csv")
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        self.csv_file = csv_path.open("w", newline="", encoding="utf-8")
+        self.csv_writer = csv.DictWriter(
+            self.csv_file,
+            fieldnames=["timestamp", "dataset", "split", "metric", "value"],
+        )
+        self.csv_writer.writeheader()
+
+    def _write_csv_metrics(self, log_data: dict) -> None:
+        """Write final extractor metrics without epochs or optimizer steps."""
+        if self.csv_writer is None:
+            return
+        for key, value in log_data.items():
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                continue
+            dataset, split, metric = self._parse_csv_metric_key(key)
+            self.csv_writer.writerow(
+                {
+                    "timestamp": datetime.datetime.now().isoformat(),
+                    "dataset": dataset,
+                    "split": split,
+                    "metric": metric,
+                    "value": value,
+                }
+            )
+        self.csv_file.flush()
+
+    def _parse_csv_metric_key(self, key: str) -> tuple[str, str, str]:
+        """Split one metric key into extractor CSV dimensions."""
+        parts = key.split("/")
+        dataset = self.current_dataset or ""
+        if len(parts) >= 3 and parts[0] in self.ds_conf:
+            return parts[0], parts[1], "/".join(parts[2:])
+        if len(parts) >= 2:
+            return dataset, parts[0], "/".join(parts[1:])
+        return dataset, "", key
 
     def _dataset_is_complete(self, ds_name: str, ds_config: str) -> bool:
         """Return whether matching no-checkpoint metadata marks completion."""
@@ -157,7 +203,10 @@ class FeatureExtractorTrainer(AbstractTrainer, ABC):
         try:
             completion = json.loads(completion_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
-            logger.warning("Ignoring invalid completion metadata: %s", completion_path)
+            logger.warning(
+                "Ignoring invalid completion metadata: %s",
+                completion_path,
+            )
             return False
         return (
             completion.get("status") == "completed"
@@ -201,7 +250,8 @@ class FeatureExtractorTrainer(AbstractTrainer, ABC):
         montages = get_dataset_montage(ds_name, ds_config)
         if len(montages) != 1:
             raise ValueError(
-                f"{self.model_type} requires exactly one montage for {ds_name}, "
+                f"{self.model_type} requires exactly one montage for "
+                f"{ds_name}, "
                 f"but found {len(montages)} montages."
             )
 
@@ -245,14 +295,18 @@ class FeatureExtractorTrainer(AbstractTrainer, ABC):
                     f"{labels.shape[0]} labels in one batch."
                 )
             if not torch.isfinite(data).all():
-                raise ValueError(f"{ds_name} {split} EEG data contains NaN or inf.")
+                raise ValueError(
+                    f"{ds_name} {split} EEG data contains NaN or inf."
+                )
             data_batches.append(data.numpy())
             label_batches.append(labels.numpy())
 
         data_all = np.concatenate(data_batches, axis=0)
         labels_all = np.concatenate(label_batches, axis=0)
         if data_all.shape[0] == 0:
-            raise ValueError(f"{ds_name} {split} split contains no usable trials.")
+            raise ValueError(
+                f"{ds_name} {split} split contains no usable trials."
+            )
         return data_all, labels_all
 
     @staticmethod
@@ -286,11 +340,16 @@ class FeatureExtractorTrainer(AbstractTrainer, ABC):
         expected_classes = np.arange(n_class)
         if not np.array_equal(train_classes, expected_classes):
             raise ValueError(
-                f"Expected {ds_name} training labels {expected_classes.tolist()}, "
+                f"Expected {ds_name} training labels "
+                f"{expected_classes.tolist()}, "
                 f"but got {train_classes.tolist()}."
             )
 
-    def _extract_features(self, data: np.ndarray, split_name: str) -> np.ndarray:
+    def _extract_features(
+        self,
+        data: np.ndarray,
+        split_name: str,
+    ) -> np.ndarray:
         """Transform EEG data and validate the resulting finite matrix."""
         features = np.asarray(self.transform_features(data), dtype=np.float64)
         if features.ndim != 2:
@@ -304,7 +363,9 @@ class FeatureExtractorTrainer(AbstractTrainer, ABC):
                 f"({data.shape[0]}, n_features > 0), but got {features.shape}."
             )
         if not np.isfinite(features).all():
-            raise ValueError(f"{split_name} extracted features contain NaN or inf.")
+            raise ValueError(
+                f"{split_name} extracted features contain NaN or inf."
+            )
         return features
 
     def _fit_classifier(
@@ -314,7 +375,7 @@ class FeatureExtractorTrainer(AbstractTrainer, ABC):
         validation_features: np.ndarray,
         validation_labels: np.ndarray,
     ) -> Tuple[Pipeline, float]:
-        """Fit and select Ridge candidates with the configured validation metric."""
+        """Fit and select Ridge candidates with the configured metric."""
         selection_metric = self.cfg.model.classifier.selection_metric
         best_classifier = None
         best_alpha = None
@@ -366,9 +427,16 @@ class FeatureExtractorTrainer(AbstractTrainer, ABC):
             return float(accuracy_score(labels, predictions))
         if selection_metric == "f1_weighted":
             return float(
-                f1_score(labels, predictions, average="weighted", zero_division=0)
+                f1_score(
+                    labels,
+                    predictions,
+                    average="weighted",
+                    zero_division=0,
+                )
             )
-        raise ValueError(f"Unsupported Ridge selection metric: {selection_metric}.")
+        raise ValueError(
+            f"Unsupported Ridge selection metric: {selection_metric}."
+        )
 
     def _evaluate(
         self,
@@ -381,8 +449,9 @@ class FeatureExtractorTrainer(AbstractTrainer, ABC):
         """Calculate benchmark classification metrics without neural loss."""
         predictions = classifier.predict(features)
         metrics = {
-            f"{ds_name}/{prefix}/epoch": 0,
-            f"{ds_name}/{prefix}/acc": float(accuracy_score(labels, predictions)),
+            f"{ds_name}/{prefix}/acc": float(
+                accuracy_score(labels, predictions)
+            ),
             f"{ds_name}/{prefix}/balanced_acc": float(
                 balanced_accuracy_score(labels, predictions)
             ),
@@ -412,7 +481,12 @@ class FeatureExtractorTrainer(AbstractTrainer, ABC):
                 cohen_kappa_score(labels, predictions)
             )
             metrics[f"{ds_name}/{prefix}/f1"] = float(
-                f1_score(labels, predictions, average="weighted", zero_division=0)
+                f1_score(
+                    labels,
+                    predictions,
+                    average="weighted",
+                    zero_division=0,
+                )
             )
         return metrics
 
@@ -420,7 +494,8 @@ class FeatureExtractorTrainer(AbstractTrainer, ABC):
         """Run fixed-split feature extraction and validation-selected Ridge."""
         if get_world_size() != 1:
             raise RuntimeError(
-                f"{self.model_type} supports one CPU process, but WORLD_SIZE is "
+                f"{self.model_type} supports one CPU process, but "
+                "WORLD_SIZE is "
                 f"{get_world_size()}."
             )
         seed_torch(self.cfg.seed)
@@ -491,7 +566,11 @@ class FeatureExtractorTrainer(AbstractTrainer, ABC):
                 "test",
             )
             selected_alpha = getattr(classifier, "selected_alpha", None)
-            selection_metric = getattr(classifier.args, "selection_metric", None)
+            selection_metric = getattr(
+                classifier.args,
+                "selection_metric",
+                None,
+            )
             if selected_alpha is None or selection_metric is None:
                 raise RuntimeError(
                     "Feature classifier must expose selected alpha and "
@@ -501,15 +580,19 @@ class FeatureExtractorTrainer(AbstractTrainer, ABC):
                 selection_metric
             ]
             selection_metrics = {
-                f"{ds_name}/train/selected_alpha": selected_alpha,
-                f"{ds_name}/train/selection_{selected_metric_key}": (
+                f"{ds_name}/selection/selected_alpha": selected_alpha,
+                f"{ds_name}/selection/{selected_metric_key}": (
                     validation_metrics[f"{ds_name}/eval/{selected_metric_key}"]
                 ),
             }
-            for metrics in (selection_metrics, validation_metrics, test_metrics):
+            for metrics in (
+                selection_metrics,
+                validation_metrics,
+                test_metrics,
+            ):
                 logger.info(format_console_log_dict(metrics, prefix=ds_name))
                 self._log_to_tensorboard(metrics, self.current_step)
-                self._write_csv_metrics(metrics, self.current_step)
+                self._write_csv_metrics(metrics)
                 if self.cfg.logging.use_cloud:
                     self._log_to_cloud(metrics)
 

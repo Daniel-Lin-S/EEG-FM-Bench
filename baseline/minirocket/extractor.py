@@ -41,12 +41,37 @@ class MiniRocketFeatureExtractor(EEGFeatureExtractor):
         )
 
     def _transform(self, data: np.ndarray) -> np.ndarray:
-        """Transform validated EEG with fitted upstream parameters."""
+        """Transform validated EEG with native parallel miniROCKET.
+
+        The upstream transform uses Numba ``prange`` across trials. This
+        method bounds that native worker pool instead of spawning Python
+        workers, which would duplicate fitted parameters and oversubscribe
+        CPU resources.
+        """
         if self.parameters is None or self._module is None:
             raise RuntimeError(
                 "miniROCKET must be fitted on training data before transform."
             )
-        return self._module.transform(data, self.parameters)
+        try:
+            from numba import config, get_num_threads, set_num_threads
+        except ModuleNotFoundError as exc:
+            raise ImportError(
+                "miniROCKET requires numba. Install it with: pip install "
+                "-r requirements/feature_extractors.txt"
+            ) from exc
+
+        max_threads = config.NUMBA_NUM_THREADS
+        if self.args.n_jobs > max_threads:
+            raise ValueError(
+                "model.extractor.n_jobs must not exceed Numba's configured "
+                f"maximum of {max_threads}, but got {self.args.n_jobs}."
+            )
+        previous_threads = get_num_threads()
+        set_num_threads(self.args.n_jobs)
+        try:
+            return self._module.transform(data, self.parameters)
+        finally:
+            set_num_threads(previous_threads)
 
     def _load_module(self) -> ModuleType:
         """Load upstream ``minirocket_multivariate`` from its clone path."""

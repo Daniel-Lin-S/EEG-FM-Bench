@@ -10,18 +10,23 @@ data:
   num_workers: 2
 
 model:
-  ridge_alphas:
-    - 0.001
-    - 0.01
-    - 0.1
-    - 1.0
-    - 10.0
-    - 100.0
-    - 1000.0
-  ridge_selection_metric: balanced_accuracy
-  minirocket_source_path: /path/to/minirocket/repo
-  minirocket_num_features: 10000
-  minirocket_max_dilations_per_kernel: 32
+  extractor:
+    # Set source_path in a user-owned .local.yaml file.
+    source_path: /path/to/minirocket/source/codes
+    num_features: 10000
+    max_dilations_per_kernel: 32
+    # Numba threads used by upstream trial-parallel transform.
+    n_jobs: 8
+  classifier:
+    alphas:
+      - 0.001
+      - 0.01
+      - 0.1
+      - 1.0
+      - 10.0
+      - 100.0
+      - 1000.0
+    selection_metric: balanced_accuracy
 
 logging:
   experiment_name: minirocket

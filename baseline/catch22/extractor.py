@@ -1,6 +1,6 @@
 """Canonical per-channel catch22 feature extraction for EEG trials."""
 
-import logging
+import sys
 from concurrent.futures import ProcessPoolExecutor
 from multiprocessing import get_context
 from typing import Iterable
@@ -13,7 +13,6 @@ from baseline.feature_extractor.extractor import EEGFeatureExtractor
 CATCH22_FEATURE_COUNT = 22
 CATCH22_PROGRESS_INTERVAL = 100
 
-logger = logging.getLogger("baseline")
 
 
 def _extract_catch22_trial(
@@ -116,8 +115,24 @@ class Catch22FeatureExtractor(EEGFeatureExtractor):
         ):
             features[trial_index] = trial_features
             if completed_trials % CATCH22_PROGRESS_INTERVAL == 0:
-                logger.info(
-                    "catch22 extracted %d/%d trials.",
-                    completed_trials,
-                    features.shape[0],
-                )
+                _write_terminal_progress(completed_trials, features.shape[0])
+        _write_terminal_progress(
+            features.shape[0],
+            features.shape[0],
+            final=True,
+        )
+
+
+def _write_terminal_progress(
+    completed_trials: int,
+    total_trials: int,
+    final: bool = False,
+) -> None:
+    """Display extraction progress only for an interactive stderr terminal."""
+    if not sys.stderr.isatty():
+        return
+    suffix = "\n" if final else ""
+    sys.stderr.write(
+        f"\rcatch22 extracted {completed_trials}/{total_trials} trials.{suffix}"
+    )
+    sys.stderr.flush()

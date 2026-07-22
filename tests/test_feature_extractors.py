@@ -8,6 +8,7 @@ import pytest
 
 from baseline.catch22.catch22_config import Catch22Config
 from baseline.catch22.catch22_trainer import Catch22Trainer
+from baseline.catch22.extractor import _write_terminal_progress
 from baseline.feature_extractor.trainer import FeatureExtractorTrainer
 from baseline.minirocket.minirocket_config import MiniRocketConfig
 from baseline.minirocket.minirocket_trainer import MiniRocketTrainer
@@ -127,7 +128,8 @@ def test_minirocket_loads_external_multivariate_source(tmp_path):
         "    seen['shape'] = X.shape\n"
         "    return (num_features, max_dilations_per_kernel)\n"
         "def transform(X, parameters):\n"
-        "    return np.full((X.shape[0], 2), parameters[0], dtype=np.float32)\n",
+        "    return np.full((X.shape[0], 2), parameters[0], "
+        "dtype=np.float32)\n",
         encoding="utf-8",
     )
     config = MiniRocketConfig(
@@ -146,8 +148,8 @@ def test_minirocket_loads_external_multivariate_source(tmp_path):
     trainer.fit_extractor(data)
     features = trainer.transform_features(data)
 
-    assert trainer._minirocket_module.seen["dtype"] == np.dtype("float32")
-    assert trainer._minirocket_module.seen["shape"] == (3, 2, 9)
+    assert trainer.extractor._module.seen["dtype"] == np.dtype("float32")
+    assert trainer.extractor._module.seen["shape"] == (3, 2, 9)
     assert features.shape == (3, 2)
     assert np.all(features == 12)
 
@@ -159,9 +161,37 @@ def test_minirocket_requires_source_path():
     )
     trainer = MiniRocketTrainer(config)
 
-    with pytest.raises(ValueError, match="minirocket_source_path"):
+    with pytest.raises(ValueError, match="model.extractor.source_path"):
         trainer.fit_extractor(np.ones((2, 1, 9), dtype=np.float32))
 
+
+
+def test_catch22_progress_is_silent_without_a_terminal(monkeypatch, capsys):
+    """catch22 progress must not enter captured logs or redirected stderr."""
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: False)
+
+    _write_terminal_progress(100, 200)
+
+    assert capsys.readouterr().err == ""
+
+
+def test_feature_extractor_csv_omits_neural_training_coordinates(tmp_path):
+    """Feature-extractor CSV metrics have no epoch or optimizer-step fields."""
+    trainer = MeanFeatureTrainer(make_config())
+    trainer.log_dir = str(tmp_path)
+    trainer.current_dataset = DATASET_NAME
+    trainer._open_csv_writer(DATASET_NAME)
+    trainer._write_csv_metrics(
+        {f"{DATASET_NAME}/eval/balanced_acc": 0.5}
+    )
+    trainer._close_csv_writer()
+
+    csv_content = (tmp_path / "csv" / f"{DATASET_NAME}.csv").read_text(
+        encoding="utf-8"
+    )
+    assert csv_content.splitlines()[0] == "timestamp,dataset,split,metric,value"
+    assert "epoch" not in csv_content
+    assert "step" not in csv_content
 
 def test_no_checkpoint_completion_skips_and_reports_clear_error(tmp_path):
     """Feature completion metadata supports rerun skipping without a model."""
@@ -181,7 +211,7 @@ def test_no_checkpoint_completion_skips_and_reports_clear_error(tmp_path):
 
 
 def test_feature_matrix_validation_rejects_nan():
-    """Feature extraction fails instead of passing non-finite values to Ridge."""
+    """Feature extraction rejects non-finite values before Ridge fitting."""
     trainer = MeanFeatureTrainer(make_config())
     data = np.ones((2, 1, 2), dtype=np.float32)
     trainer.transform_features = lambda _: np.array([[np.nan], [1.0]])
