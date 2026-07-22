@@ -2,7 +2,7 @@
 # Train a single shared model on multiple datasets
 
 # Training pattern flags
-seed: 42
+seeds: [42]
 master_port: 51104
 multitask: true
 model_type: 'reve'

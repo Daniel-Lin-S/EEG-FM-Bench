@@ -174,6 +174,30 @@ class BaseLoRAArgs(BaseModel):
     lora_lr_scale: float = 1.0  # Learning rate scale for LoRA parameters relative to head_lr
 
 
+class EarlyStoppingArgs(BaseModel):
+    """Validation-based stopping used by ordinary training runs.
+
+    Parameters
+    ----------
+    enabled : bool, optional, default=False
+        Whether to stop after validation performance stops improving.
+    metric : str, optional, default="loss"
+        Metric suffix emitted by validation.
+    direction : {"minimize", "maximize"}, optional, default="minimize"
+        Whether smaller or larger metric values are improvements.
+    patience : int, optional, default=5
+        Consecutive non-improving epochs allowed before stopping.
+    min_delta : float, optional, default=0.0
+        Minimum absolute change required to count as an improvement.
+    """
+
+    enabled: bool = False
+    metric: str = "loss"
+    direction: Literal["minimize", "maximize"] = "minimize"
+    patience: int = Field(default=5, ge=1)
+    min_delta: float = Field(default=0.0, ge=0.0)
+
+
 class BaseTrainingArgs(BaseModel):
     """Shared optimizer, schedule, precision, and adaptation settings.
 
@@ -208,6 +232,8 @@ class BaseTrainingArgs(BaseModel):
         Whether non-classifier encoder parameters are excluded from updates.
     lora : BaseLoRAArgs
         LoRA targeting and optimization settings.
+    early_stopping : EarlyStoppingArgs
+        Validation-based stopping settings for ordinary training runs.
     """
     max_epochs: int = 100
     weight_decay: float = 0.01
@@ -226,6 +252,9 @@ class BaseTrainingArgs(BaseModel):
 
     # LoRA configuration
     lora: BaseLoRAArgs = Field(default_factory=BaseLoRAArgs)
+    early_stopping: EarlyStoppingArgs = Field(
+        default_factory=EarlyStoppingArgs
+    )
 
 
 class BaseLoggingArgs(BaseModel):
@@ -306,8 +335,8 @@ class AbstractConfig(BaseModel, ABC):
 
     Parameters
     ----------
-    seed : int
-        Random seed supplied to shared training and data-loading setup.
+    seeds : list[int]
+        Random seeds used for independent repeated training runs.
     master_port : int
         Preferred port used when initializing distributed training workers.
     multitask : bool
@@ -329,7 +358,7 @@ class AbstractConfig(BaseModel, ABC):
         Run-artifact, cloud-tracking, and checkpoint settings.
     """
     
-    seed: int = 42
+    seeds: List[int] = Field(default_factory=lambda: [42])
     master_port: int = 41216
     multitask: bool = False
     model_type: str = "base"  # To identify which model is being used
@@ -340,6 +369,39 @@ class AbstractConfig(BaseModel, ABC):
     model: BaseModelArgs = Field(default_factory=BaseModelArgs)
     training: BaseTrainingArgs = Field(default_factory=BaseTrainingArgs)
     logging: BaseLoggingArgs = Field(default_factory=BaseLoggingArgs)
+
+    @field_validator("seeds", mode="before")
+    @classmethod
+    def validate_seeds(cls, seeds: object) -> List[int]:
+        """Require a nonempty ordered collection of unique seeds."""
+        if not isinstance(seeds, list):
+            raise ValueError(
+                f"seeds must be a list of integers, but got {seeds!r}."
+            )
+        if not seeds:
+            raise ValueError("seeds must contain at least one integer.")
+        if any(
+            not isinstance(seed, int) or isinstance(seed, bool)
+            for seed in seeds
+        ):
+            raise ValueError("seeds must contain only integers.")
+        if len(seeds) != len(set(seeds)):
+            raise ValueError("seeds must not contain duplicate values.")
+        if any(seed < 0 for seed in seeds):
+            raise ValueError(
+                "seeds must contain only non-negative integers."
+            )
+        return seeds
+
+    @property
+    def seed(self) -> int:
+        """Return the effective seed for one internally scoped run."""
+        if len(self.seeds) != 1:
+            raise RuntimeError(
+                "A trainer requires exactly one effective seed, but got "
+                f"{self.seeds}. Scope the campaign configuration first."
+            )
+        return self.seeds[0]
 
     @abstractmethod
     def validate_config(self) -> bool:

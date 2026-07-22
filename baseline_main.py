@@ -1,91 +1,151 @@
 #!/usr/bin/env python3
-"""Unified baseline training entry point and YAML reference.
+"""Unified baseline training, HPO, and multi-seed campaign entry point.
 
-Usage:
-    python baseline_main.py conf_file=assets/conf/baseline/eegpt/eegpt_unified.yaml
-    python baseline_main.py conf_file=assets/conf/baseline/eegnet/eegnet.yaml model_type=eegnet
+Usage
+-----
+Run a fixed configuration for every top-level seed::
 
-``conf_file`` (``str``, CLI only) identifies the YAML to load.
-``model_type`` (``str``) must be supplied in that YAML or on the command line;
-it selects the registered config model and trainer (a CLI value takes precedence)
+    python baseline_main.py conf_file=assets/conf/baseline/example.yaml
 
-Top-level fields (all optional)
-----------------
-* ``seed`` (``int``): initializes the trainer's reproducibility and loader
-  seeds.
-* ``master_port`` (``int``): TCP port used to initialize distributed training.
-* ``multitask`` (``bool``): true creates one mixed training loader and shared
-  model for all datasets; false trains each dataset separately. Classical
-  baselines do not support the mixed mode.
-* ``fs`` (``int``): sampling rate expected by shape discovery and the loaders;
-  it must equal the rate used when the datasets were preprocessed.
+Override campaign or HPO fields without changing YAML::
 
+    python baseline_main.py conf_file=example.yaml seeds=[42,43,44]
+    python baseline_main.py conf_file=example.yaml hpo.n_trials=100
 
-Four sections are required: data, model, training, logging.
-Please see the docstring of model-specific classes under `baseline` module
-for how to set these parameters.
+Input
+-----
+The selected YAML is a model-specific baseline configuration. Public
+reproducibility uses seeds (default [42]). An optional top-level hpo mapping
+configures validation-only Optuna search with its own independent hpo.seed.
+Legacy scalar seed is converted with a warning.
+
+Output
+------
+Campaign artifacts are written below the configured absolute run_dir. Each
+seed retains the existing configs/CSV/TensorBoard/log/dataset layout under
+logs/seed_<seed>. HPO trials and aggregate test summaries are stored under
+the same campaign root.
 """
 
 import sys
-from omegaconf import OmegaConf
+import warnings
+from typing import Any
+
+from omegaconf import DictConfig, OmegaConf
 
 from baseline.abstract.factory import ModelRegistry
+from baseline.hpo.config import HpoConfig
+from baseline.hpo.orchestrator import CampaignRunner
 from baseline.registry import register_builtin_models
 from common.path import get_conf_file_path
 from common.utils import setup_yaml
 
 
-def main():
-    """Main training function that can handle any registered baseline model."""
-    register_builtin_models()
-    setup_yaml()
-    
-    # Parse CLI arguments
+def _normalize_legacy_seed(
+    config: DictConfig,
+    source_name: str,
+) -> None:
+    """Convert one legacy scalar seed mapping to the public seeds list."""
+    if "seed" not in config:
+        return
+    if "seeds" in config:
+        raise ValueError(
+            f"{source_name} provides both deprecated 'seed' and 'seeds'. "
+            "Remove 'seed' and keep only the ordered seeds list."
+        )
+    seed = config.pop("seed")
+    if not isinstance(seed, int) or isinstance(seed, bool) or seed < 0:
+        raise ValueError(
+            f"{source_name} seed must be a non-negative integer, but got "
+            f"{seed!r}."
+        )
+    config["seeds"] = [seed]
+    warnings.warn(
+        f"{source_name} uses deprecated scalar 'seed'; converting it to "
+        f"'seeds: [{seed}]'.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+
+
+def _load_configs() -> tuple[type[Any], Any, HpoConfig]:
+    """Load CLI/YAML, separate workflow settings, and validate the model."""
     cli_args = OmegaConf.from_cli()
+    if "conf_file" not in cli_args:
+        raise ValueError(
+            "Please provide a config file: conf_file=path/to/config.yaml"
+        )
 
-    if 'conf_file' not in cli_args:
-        raise ValueError("Please provide a config file: conf_file=path/to/config.yaml")
-    
-    # Get model type from CLI args or config
-    model_type: str = cli_args.get('model_type', None)
-
-    # Load config file
     conf_file_path = get_conf_file_path(cli_args.conf_file)
     file_cfg = OmegaConf.load(conf_file_path)
+    _normalize_legacy_seed(file_cfg, "Configuration file")
+    _normalize_legacy_seed(cli_args, "Command line")
 
+    model_type = cli_args.get("model_type")
     if model_type is None:
-        model_type = file_cfg.get('model_type')
-
-    # Validate model type
+        model_type = file_cfg.get("model_type")
     available_models = ModelRegistry.list_models()
     if model_type not in available_models:
-        raise ValueError(f"Unknown model type: {model_type}. Available: {available_models}")
-    
-    # Create base config for the specified model type
+        raise ValueError(
+            f"Unknown model type: {model_type}. Available: "
+            f"{available_models}"
+        )
+
+    workflow_defaults = OmegaConf.create({
+        "hpo": HpoConfig().model_dump(mode="json"),
+    })
+    workflow_merged = OmegaConf.merge(
+        workflow_defaults,
+        {"hpo": file_cfg.get("hpo", {})},
+        {"hpo": cli_args.get("hpo", {})},
+    )
+    hpo_dict = OmegaConf.to_container(
+        workflow_merged.hpo,
+        resolve=True,
+        throw_on_missing=True,
+    )
+    hpo_config = HpoConfig.model_validate(hpo_dict)
+
+    file_model_cfg = OmegaConf.create(
+        OmegaConf.to_container(file_cfg, resolve=False)
+    )
+    cli_model_cfg = OmegaConf.create(
+        OmegaConf.to_container(cli_args, resolve=False)
+    )
+    file_model_cfg.pop("hpo", None)
+    cli_model_cfg.pop("hpo", None)
+
     config_class = ModelRegistry.get_config_class(model_type)
     code_cfg = OmegaConf.create(config_class().model_dump())
-    
-    # Merge configurations: code defaults < file config < CLI args
-    merged_config = OmegaConf.merge(code_cfg, file_cfg, cli_args)
-    
-    # Ensure model_type is set correctly
+    merged_config = OmegaConf.merge(
+        code_cfg,
+        file_model_cfg,
+        cli_model_cfg,
+    )
     merged_config.model_type = model_type
-    
-    # Convert to config object
-    cfg_dict = OmegaConf.to_container(merged_config, resolve=True, throw_on_missing=True)
+    cfg_dict = OmegaConf.to_container(
+        merged_config,
+        resolve=True,
+        throw_on_missing=True,
+    )
     cfg = config_class.model_validate(cfg_dict)
-    
-    # Validate configuration
     if not cfg.validate_config():
-        raise ValueError(f"Invalid configuration for model type: {model_type}")
+        raise ValueError(
+            f"Invalid configuration for model type: {model_type}"
+        )
+    return config_class, cfg, hpo_config
 
-    # Create and run trainer
-    trainer = ModelRegistry.create_trainer(cfg)
-    trainer.run()
+
+def main() -> None:
+    """Run one validated baseline campaign."""
+    register_builtin_models()
+    setup_yaml()
+    config_class, config, hpo_config = _load_configs()
+    CampaignRunner(config, hpo_config, config_class).run()
 
 
-def list_available_models():
-    """List all available model types."""
+def list_available_models() -> None:
+    """Print all registered baseline model identifiers."""
     register_builtin_models()
     print("Available baseline models:")
     for model_type in ModelRegistry.list_models():
@@ -96,4 +156,4 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "list-models":
         list_available_models()
     else:
-        main() 
+        main()

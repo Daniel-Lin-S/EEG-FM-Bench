@@ -29,3 +29,4 @@ huggingface_hub
 linear_attention_transformer
 wandb
 comet_ml
+optuna

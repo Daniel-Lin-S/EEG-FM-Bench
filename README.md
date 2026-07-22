@@ -278,6 +278,122 @@ python baseline_main.py conf_file=baseline/eegpt/eegpt_unified.yaml model_type=e
 python baseline_main.py list-models
 ```
 
+##### Hyperparameter optimization
+
+Hyperparameter optimization uses validation performance to select values from `hpo.search_space`. It uses `hpo.seed` for trial training and `hpo.sampler.seed` for TPE sampling. For `multitask: false`, every dataset gets its own study and winner. For `multitask: true`, one joint study selects a shared winner.
+
+```yaml
+hpo:
+  enabled: true
+  seed: 0
+  n_trials: 50
+
+  objective:
+    metric: loss
+    direction: minimize
+    # Options: macro_mean, log_train_size_weighted
+    multitask_reduction: macro_mean
+
+  sampler:
+    type: tpe
+    seed: 0
+    n_startup_trials: 10
+
+  pruner:
+    type: median
+    n_startup_trials: 5
+    n_warmup_epochs: 3
+    interval_epochs: 1
+
+  search_space:
+    training.max_lr:
+      distribution: float
+      low: 2.0e-4
+      high: 1.0e-3
+      log: true
+    training.min_lr:
+      distribution: float
+      low: 1.0e-6
+      high: 1.0e-4
+      log: true
+    training.encoder_lr_scale:
+      distribution: float
+      low: 0.05
+      high: 1.0
+      log: false
+    model.classifier_head.hidden_dims:
+      distribution: categorical
+      choices:
+        - [64]
+        - [128]
+        - [256]
+        - [256, 128]
+```
+
+Float, integer, and categorical distributions are supported at dotted configuration paths. Categorical choices may be lists. A parameter not present in `search_space` is unchanged. The total study budget can be overridden from either the local or SLURM command interface:
+
+```bash
+python baseline_main.py conf_file=baseline/brainomni/brainomni_unified.local.yaml model_type=brainomni hpo.n_trials=100
+```
+
+Optuna studies use SQLite and resume automatically. `n_trials` is the total attempted-trial target, so increasing it adds trials instead of repeating the previous budget. HPO creates validation loaders only, reports its objective each epoch, and allows the median pruner to stop weak trials. MiniROCKET and catch22 ignore HPO with a warning.
+
+The HPO identity excludes `hpo.n_trials`, allowing a later invocation to extend an existing study. HPO artifacts are local and organized by study scope:
+
+```text
+<campaign>/
+└── hpo/
+    ├── datasets/<dataset>/
+    │   ├── study.sqlite3
+    │   ├── best.json
+    │   └── trials/trial_<number>/
+    └── multitask/
+        ├── study.sqlite3
+        ├── best.json
+        └── trials/trial_<number>/
+```
+
+Each trial directory contains its resolved configuration, decoded parameters, objective history, status, and epoch-level validation CSV.
+
+##### Multi-seed training and aggregation
+
+Multi-seed execution independently repeats ordinary training for the configured top-level seeds. Seeds run in the configured order, and every seed receives fresh model, optimizer, scheduler, scaler, data loaders, and random state.
+
+```yaml
+seeds: [42, 43, 44]
+```
+
+The seed list can also be overridden from either the local or SLURM command interface:
+
+```bash
+python baseline_main.py conf_file=baseline/brainomni/brainomni_unified.local.yaml model_type=brainomni seeds=[42,43,44]
+```
+
+The default is `seeds: [42]` (single-seed).
+
+Checkpoints for each repeated run are stored below the matching `seed_<seed>` directory in the campaign checkpoint root.
+
+The campaign identity excludes the seed list, so later invocations can add compatible seeds to the same result collection:
+
+```text
+<campaign>/
+├── campaign.yaml
+├── logs/
+│   ├── seed_42/
+│   │   ├── configs/
+│   │   ├── csv/
+│   │   ├── tensorboard/
+│   │   ├── logs/
+│   │   └── datasets/<dataset>/completion.json
+│   └── seed_43/
+└── summary/
+    ├── test_runs.csv
+    ├── test_summary.csv
+    └── summary.json
+```
+
+Summaries aggregate all fully completed compatible seed directories from current and earlier invocations. They contain every numeric test metric, individual values, count, mean, median, and sample standard deviation when at least two seeds are available.
+
 #### Step 3: Analysis & Visualization
 ```bash
 # Generate t-SNE embeddings
@@ -473,7 +589,7 @@ All experiments use YAML configuration files that must match the Pydantic struct
 
 ```yaml
 # Training pattern flags
-seed: 42
+seeds: [42]
 master_port: 51001
 multitask: true
 model_type: 'eegpt'

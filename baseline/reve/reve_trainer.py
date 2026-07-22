@@ -1,6 +1,7 @@
 import logging
+import math
 import os
-from typing import Tuple
+from typing import Mapping, Tuple
 
 import safetensors.torch
 import torch
@@ -399,24 +400,56 @@ class ReveTrainer(AbstractTrainer):
             self.on_train_step_end()
 
 
-    def _compute_eval_loss(self, overall_metrics: dict) -> float:
-        """Compute average evaluation loss across all datasets.
+    def _compute_eval_loss(
+        self,
+        metrics_by_dataset: Mapping[str, Mapping[str, float]],
+        example_counts: Mapping[str, int],
+    ) -> float:
+        """Return example-count-weighted validation loss.
 
-        Args:
-            overall_metrics: Dictionary containing metrics for each dataset
+        Parameters
+        ----------
+        metrics_by_dataset : mapping[str, mapping[str, float]]
+            Validation metrics keyed first by dataset name and then by the
+            emitted ``<dataset>/eval/<metric>`` key.
+        example_counts : mapping[str, int]
+            Positive aggregated validation-example count for every dataset.
 
-        Returns:
-            Average loss across all datasets
+        Returns
+        -------
+        float
+            Validation loss weighted by the number of evaluated examples,
+            matching REVE's original scheduler signal.
         """
-        total_loss = torch.tensor(0.0, device=self.device)
-        total_cnt = torch.tensor(0, device=self.device)
-
-        for ds_name in self.ds_info.keys():
-            total_loss += overall_metrics[ds_name]['loss_sum'].reshape([])
-            total_cnt += overall_metrics[ds_name]['cnt'].reshape([])
-
-        avg_loss = (total_loss / total_cnt.float()).cpu().item() if total_cnt > 0 else 0.0
-        return avg_loss
+        weighted_loss = 0.0
+        total_count = 0
+        for dataset_name, metrics in metrics_by_dataset.items():
+            key = f"{dataset_name}/eval/loss"
+            if key not in metrics:
+                raise ValueError(
+                    f"Expected REVE validation metric {key}."
+                )
+            loss = float(metrics[key])
+            if not math.isfinite(loss):
+                raise ValueError(
+                    f"REVE validation loss is not finite: {loss}."
+                )
+            count = example_counts.get(dataset_name)
+            if count is None or count <= 0:
+                raise ValueError(
+                    f"Expected a positive REVE validation count for "
+                    f"{dataset_name}, but got {count}."
+                )
+            weighted_loss += loss * count
+            total_count += count
+        if total_count == 0:
+            raise ValueError("REVE validation produced no loss metrics.")
+        result = weighted_loss / total_count
+        if not math.isfinite(result):
+            raise ValueError(
+                f"REVE weighted validation loss is not finite: {result}."
+            )
+        return result
 
     def on_eval_epoch_end(self, eval_loss: float):
         """Called after evaluation to step ReduceLROnPlateau scheduler.
@@ -434,13 +467,29 @@ class ReveTrainer(AbstractTrainer):
                 logger.info(f"Learning rate reduced: {old_lrs} -> {new_lrs}")
 
     def eval_epoch(self, dataloaders: list[DataLoader], prefix: str):
-        """Override to return average loss for scheduler."""
-        # Call parent eval_epoch (which doesn't return anything)
+        """Return metrics and update REVE's scheduler after validation."""
         overall_metrics = super().eval_epoch(dataloaders, prefix)
 
         if prefix == 'eval':
-            avg_val_loss = self._compute_eval_loss(overall_metrics)
+            avg_val_loss = 0.0
+            if get_is_master():
+                avg_val_loss = self._compute_eval_loss(
+                    overall_metrics,
+                    self.latest_eval_counts,
+                )
+            if (
+                torch.distributed.is_available()
+                and torch.distributed.is_initialized()
+            ):
+                loss_tensor = torch.tensor(
+                    [avg_val_loss],
+                    dtype=torch.float64,
+                    device=self.device,
+                )
+                torch.distributed.broadcast(loss_tensor, src=0)
+                avg_val_loss = float(loss_tensor.item())
             self.on_eval_epoch_end(avg_val_loss)
+        return overall_metrics
 
     def pretrain_step_for_analysis(
         self,

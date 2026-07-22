@@ -11,7 +11,7 @@ import warnings
 from abc import ABC, abstractmethod
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import comet_ml
 import datasets
@@ -149,6 +149,16 @@ class AbstractTrainer(ABC):
         self.current_dataset: Optional[str] = None
         self.final_checkpoint_paths: Dict[str, Path] = {}
         self.final_test_metrics: Dict[str, Dict[str, float]] = {}
+        self.final_validation_metrics: Dict[str, Dict[str, float]] = {}
+        self.latest_eval_counts: Dict[str, int] = {}
+        self.run_mode = "legacy"
+        self.campaign_hash: Optional[str] = None
+        self.log_dir_override: Optional[Path] = None
+        self.ckpt_dir_override: Optional[Path] = None
+        self.validation_callback: Optional[Callable[..., bool]] = None
+        self.external_distributed = False
+        self.external_cloud = False
+        self.training_result: Dict[str, Any] = {}
 
         
         # LoRA tracking
@@ -160,6 +170,16 @@ class AbstractTrainer(ABC):
     def setup_distributed(self):
         """Setup distributed training environment."""
         rank = get_global_rank()
+        if (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        ):
+            self.rank = rank
+            self.local_rank = get_local_rank()
+            self.world_size = get_world_size()
+            self.device = torch.device(f"cuda:{self.local_rank}")
+            return
+
         local_rank = get_local_rank()
         world_size = get_world_size()
         master_addr = get_master_addr()
@@ -224,29 +244,68 @@ class AbstractTrainer(ABC):
         string = bytes_list.split(b'\0')[0].decode()
         return string
 
-    def get_train_io_path(self, args: BaseLoggingArgs) -> tuple[str, str]:
-        if not get_is_master():
-            return '', ''
+    def configure_managed_run(
+        self,
+        log_dir: Path,
+        checkpoint_dir: Path,
+        campaign_hash: str,
+        run_mode: str,
+        validation_callback: Optional[Callable[..., bool]] = None,
+        external_distributed: bool = False,
+        external_cloud: bool = False,
+    ) -> None:
+        """Configure one campaign-controlled trainer execution."""
+        if run_mode not in {"hpo", "final"}:
+            raise ValueError(f"Unsupported managed run mode: {run_mode}.")
+        self.log_dir_override = log_dir.resolve()
+        self.ckpt_dir_override = checkpoint_dir.resolve()
+        self.campaign_hash = campaign_hash
+        self.run_mode = run_mode
+        self.validation_callback = validation_callback
+        self.external_distributed = external_distributed
+        self.external_cloud = external_cloud
 
-        config = self.cfg.model_dump(mode='json')
-        config_hash = get_config_hash(config, self.multitask)
-        experiment_name = f'{args.experiment_name}-{config_hash}'
-        self.execution_id = datetime.datetime.now().strftime('%Y%m%d%H%M%S')
-        self.execution_id = f'{self.execution_id}-{os.getpid()}'
-        if self.multitask:
-            experiment_name = f'{experiment_name}-{self.execution_id}'
-        run_dir = Path(args.run_dir)
-        log_path = run_dir / 'log' / 'baseline' / self.model_type
-        ckpt_path = run_dir / 'ckpt' / 'baseline' / self.model_type
-        log_path = log_path / experiment_name
-        ckpt_path = ckpt_path / experiment_name
+    def get_train_io_path(
+        self,
+        args: BaseLoggingArgs,
+    ) -> tuple[str, str]:
+        """Create or select log and checkpoint roots for this execution."""
+        if not get_is_master():
+            return "", ""
+
+        config = self.cfg.model_dump(mode="json")
+        self.execution_id = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        self.execution_id = f"{self.execution_id}-{os.getpid()}"
+        if self.log_dir_override is not None:
+            if self.ckpt_dir_override is None:
+                raise RuntimeError(
+                    "Managed log override requires a checkpoint override."
+                )
+            log_path = self.log_dir_override
+            ckpt_path = self.ckpt_dir_override
+        else:
+            config_hash = get_config_hash(config, self.multitask)
+            experiment_name = f"{args.experiment_name}-{config_hash}"
+            if self.multitask:
+                experiment_name = (
+                    f"{experiment_name}-{self.execution_id}"
+                )
+            run_dir = Path(args.run_dir)
+            log_path = (
+                run_dir / "log" / "baseline" / self.model_type
+                / experiment_name
+            )
+            ckpt_path = (
+                run_dir / "ckpt" / "baseline" / self.model_type
+                / experiment_name
+            )
         log_path.mkdir(parents=True, exist_ok=True)
         ckpt_path.mkdir(parents=True, exist_ok=True)
         save_resolved_config(
             config,
-            log_path / 'configs' / f'{self.execution_id}.yaml',
+            log_path / "configs" / f"{self.execution_id}.yaml",
         )
-        return str(log_path), str(ckpt_path)
+        return str(log_path.resolve()), str(ckpt_path.resolve())
 
     def _has_output(self, output_name: str) -> bool:
         """Return whether one local trace type is enabled."""
@@ -256,23 +315,45 @@ class AbstractTrainer(ABC):
         """Return completion metadata location for one dataset."""
         return Path(self.log_dir, 'datasets', ds_name, 'completion.json')
 
-    def _dataset_is_complete(self, ds_name: str, ds_config: str) -> bool:
-        """Return whether a matching dataset has final artifacts."""
+    def _resolved_config_hash(self) -> str:
+        """Return the identity of this seed-scoped resolved config."""
+        config = self.cfg.model_dump(mode="json")
+        return get_config_hash(config, self.multitask)
+
+    def _dataset_is_complete(
+        self,
+        ds_name: str,
+        ds_config: str,
+    ) -> bool:
+        """Return whether matching final artifacts already exist."""
         completion_path = self._completion_path(ds_name)
         if not completion_path.is_file():
             return False
         try:
-            completion = json.loads(completion_path.read_text(encoding='utf-8'))
+            completion = json.loads(
+                completion_path.read_text(encoding="utf-8")
+            )
         except json.JSONDecodeError:
-            logger.warning('Ignoring invalid completion metadata: %s',
-                           completion_path)
+            logger.warning(
+                "Ignoring invalid completion metadata: %s",
+                completion_path,
+            )
             return False
-        checkpoint_path = completion.get('checkpoint_path')
-        return (
-            completion.get('dataset_config') == ds_config
-            and completion.get('status') == 'completed'
+        checkpoint_path = completion.get("checkpoint_path")
+        compatible = (
+            completion.get("dataset_config") == ds_config
+            and completion.get("status") == "completed"
             and isinstance(checkpoint_path, str)
             and Path(checkpoint_path).is_file()
+        )
+        if self.campaign_hash is None:
+            return compatible
+        return (
+            compatible
+            and completion.get("campaign_hash") == self.campaign_hash
+            and completion.get("seed") == self.cfg.seed
+            and completion.get("config_hash")
+            == self._resolved_config_hash()
         )
 
     def _reset_dataset_outputs(self, ds_name: str) -> None:
@@ -341,18 +422,27 @@ class AbstractTrainer(ABC):
         """Atomically persist final metadata after successful training."""
         checkpoint_path = self.final_checkpoint_paths.get(ds_name)
         metrics = self.final_test_metrics.get(ds_name)
-        if checkpoint_path is None or metrics is None:
+        validation_metrics = self.final_validation_metrics.get(ds_name)
+        if (
+            checkpoint_path is None
+            or metrics is None
+            or validation_metrics is None
+        ):
             raise RuntimeError(
                 f'Cannot mark {ds_name} complete without final checkpoint and '
-                'test metrics.'
+                "test and validation metrics."
             )
         completion_path = self._completion_path(ds_name)
         completion_path.parent.mkdir(parents=True, exist_ok=True)
         content = {
             'status': 'completed',
+            'campaign_hash': self.campaign_hash,
+            'config_hash': self._resolved_config_hash(),
+            'seed': self.cfg.seed,
             'dataset_config': ds_config,
             'execution_id': self.execution_id,
             'checkpoint_path': str(checkpoint_path.resolve()),
+            'validation_metrics': validation_metrics,
             'test_metrics': metrics,
             'completed_at': datetime.datetime.now().isoformat(),
         }
@@ -392,6 +482,8 @@ class AbstractTrainer(ABC):
 
     def init_cloud_logging(self):
         """Initialize cloud logging (wandb, comet, etc.)."""
+        if self.external_cloud:
+            return
         if not self.cfg.logging.use_cloud:
             return
 
@@ -562,6 +654,8 @@ class AbstractTrainer(ABC):
 
     def finish_cloud_logging(self):
         """Finish cloud logging."""
+        if self.external_cloud:
+            return
         if not get_is_master():
             return
 
@@ -1480,6 +1574,7 @@ class AbstractTrainer(ABC):
 
         overall_metrics = {}
         metric_results: Dict[str, Dict[str, float]] = {}
+        self.latest_eval_counts = {}
         for ds_name in self.ds_info.keys():
             n_class = self.ds_info[ds_name]['n_class']
             overall_metrics[ds_name] = {
@@ -1525,6 +1620,13 @@ class AbstractTrainer(ABC):
                     torch.distributed.all_reduce(overall_metrics[ds_name]['cnt'], op=torch.distributed.ReduceOp.SUM)
                     torch.distributed.all_reduce(overall_metrics[ds_name]['cm'], op=torch.distributed.ReduceOp.SUM)
 
+                count = int(overall_metrics[ds_name]['cnt'].item())
+                if count <= 0:
+                    raise ValueError(
+                        f"Expected evaluation examples for {ds_name}, but "
+                        f"got {count}."
+                    )
+                self.latest_eval_counts[ds_name] = count
                 overall_metrics[ds_name]['loss'] = overall_metrics[ds_name]['loss_sum'] / overall_metrics[ds_name][
                     'cnt'].float()
 
@@ -1622,7 +1724,11 @@ class AbstractTrainer(ABC):
         }
 
         # Save checkpoint
-        suffix = 'last' if is_milestone else f'epoch_{self.epoch}'
+        suffix = kwargs.get('suffix')
+        if suffix is None:
+            suffix = (
+                'last' if is_milestone else f'epoch_{self.epoch}'
+            )
         checkpoint_path = checkpoint_dir / f'{self.model_type}_{ds_name}_{suffix}.pt'
         torch.save(checkpoint, checkpoint_path)
 
@@ -1657,146 +1763,485 @@ class AbstractTrainer(ABC):
         lora_param_count = sum(v.numel() for v in lora_state_dict.values())
         logger.info(f"LoRA checkpoint saved: {lora_checkpoint_path} ({lora_param_count:,} params)")
 
-    def run(self):
+
+    def _training_checkpoint_path(
+        self,
+        ds_name: Optional[str],
+        suffix: str,
+    ) -> Path:
+        """Return a repository-generated fine-tuning checkpoint path."""
+        checkpoint_name = "unified" if ds_name is None else ds_name
+        if ds_name is None:
+            checkpoint_dir = Path(self.ckpt_dir, checkpoint_name)
+        else:
+            checkpoint_dir = Path(
+                self.ckpt_dir,
+                "seperated",
+                checkpoint_name,
+            )
+        filename = (
+            f"{self.model_type}_{checkpoint_name}_{suffix}.pt"
+        )
+        return checkpoint_dir / filename
+
+    def load_training_checkpoint(self, checkpoint_path: Path) -> None:
+        """Load a checkpoint produced by save_checkpoint into this model."""
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(
+                f"Training checkpoint does not exist: "
+                f"{checkpoint_path.resolve()}."
+            )
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location=self.device,
+            weights_only=False,
+        )
+        state_dict = checkpoint.get("model_state_dict")
+        if not isinstance(state_dict, dict):
+            raise ValueError(
+                f"Checkpoint at {checkpoint_path.resolve()} has no "
+                "model_state_dict mapping."
+            )
+        self.model.load_state_dict(state_dict)
+
+    def _broadcast_bool(self, value: bool) -> bool:
+        """Broadcast one master-process decision to every training rank."""
+        if not (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        ):
+            return value
+        tensor = torch.tensor(
+            [int(value) if get_is_master() else 0],
+            dtype=torch.uint8,
+            device=self.device,
+        )
+        torch.distributed.broadcast(tensor, src=0)
+        return bool(tensor.item())
+
+    @staticmethod
+    def _training_sizes(
+        train_loader: DataLoader,
+    ) -> Dict[str, int]:
+        """Count unsharded training examples by dataset."""
+        adapter = train_loader.dataset
+        dataset = getattr(adapter, "dataset", adapter)
+        if "montage" not in dataset.column_names:
+            raise ValueError(
+                "Training dataset has no montage column for dataset counts."
+            )
+        sizes: Dict[str, int] = {}
+        for montage in dataset["montage"]:
+            dataset_name = str(montage).split("/", maxsplit=1)[0]
+            sizes[dataset_name] = sizes.get(dataset_name, 0) + 1
+        if not sizes:
+            raise ValueError("Training dataset contains no examples.")
+        return sizes
+
+    def _validation_score(
+        self,
+        metrics_by_dataset: Dict[str, Dict[str, float]],
+    ) -> float:
+        """Return the macro validation score used for final early stopping."""
+        metric_name = self.cfg.training.early_stopping.metric
+        values: List[float] = []
+        for dataset_name, metrics in metrics_by_dataset.items():
+            key = f"{dataset_name}/eval/{metric_name}"
+            if key not in metrics:
+                raise ValueError(
+                    f"Expected early-stopping metric '{key}', but it was "
+                    "not emitted."
+                )
+            value = float(metrics[key])
+            if not torch.isfinite(torch.tensor(value)):
+                raise ValueError(
+                    f"Early-stopping metric '{key}' is not finite: {value}."
+                )
+            values.append(value)
+        if not values:
+            raise ValueError("Validation produced no early-stopping metrics.")
+        return sum(values) / len(values)
+
+    def _is_improvement(
+        self,
+        score: float,
+        best_score: Optional[float],
+    ) -> bool:
+        """Return whether score improves by the configured minimum delta."""
+        if best_score is None:
+            return True
+        args = self.cfg.training.early_stopping
+        if args.direction == "minimize":
+            return score < best_score - args.min_delta
+        return score > best_score + args.min_delta
+
+    def _callback_requests_stop(
+        self,
+        metrics: Dict[str, Dict[str, float]],
+        train_sizes: Dict[str, int],
+    ) -> bool:
+        """Run a master-only validation callback and synchronize its result."""
+        payload: Optional[Dict[str, Any]] = None
+        if get_is_master():
+            try:
+                should_stop = False
+                if self.validation_callback is not None:
+                    should_stop = bool(
+                        self.validation_callback(
+                            self.epoch,
+                            metrics,
+                            train_sizes,
+                        )
+                    )
+                payload = {
+                    "should_stop": should_stop,
+                    "error": None,
+                }
+            except Exception as exc:
+                payload = {
+                    "should_stop": False,
+                    "error": (
+                        f"{type(exc).__module__}."
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                }
+
+        if (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        ):
+            objects = [payload]
+            torch.distributed.broadcast_object_list(objects, src=0)
+            payload = objects[0]
+        if payload is None:
+            raise RuntimeError(
+                "Validation callback did not produce a synchronized result."
+            )
+        if payload["error"] is not None:
+            raise ValueError(
+                "Validation callback failed: "
+                f"{payload['error']}."
+            )
+        return bool(payload["should_stop"])
+
+    def _managed_epoch_loop(
+        self,
+        train_loader: DataLoader,
+        train_sampler: DistributedGroupBatchSampler,
+        valid_loaders: list[DataLoader],
+        checkpoint_dataset: Optional[str],
+    ) -> tuple[
+        Dict[str, Dict[str, float]],
+        Optional[Path],
+        bool,
+    ]:
+        """Train one model and return best validation state."""
+        train_sizes = self._training_sizes(train_loader)
+        best_score: Optional[float] = None
+        best_metrics: Dict[str, Dict[str, float]] = {}
+        best_checkpoint: Optional[Path] = None
+        epochs_without_improvement = 0
+        stopped_by_callback = False
+
+        for epoch in range(self.cfg.training.max_epochs):
+            self.epoch = epoch
+            if (
+                torch.distributed.is_available()
+                and torch.distributed.is_initialized()
+            ):
+                torch.distributed.barrier()
+
+            self.train_epoch(train_loader, train_sampler)
+            validation_metrics = self.eval_epoch(valid_loaders, "eval")
+            if get_is_master() and not validation_metrics:
+                raise RuntimeError(
+                    "Validation returned no metrics on the master process."
+                )
+
+            if self.run_mode == "hpo":
+                if self._callback_requests_stop(
+                    validation_metrics,
+                    train_sizes,
+                ):
+                    stopped_by_callback = True
+                    break
+                best_metrics = validation_metrics
+                continue
+
+            score = (
+                self._validation_score(validation_metrics)
+                if get_is_master()
+                else 0.0
+            )
+            improved = self._broadcast_bool(
+                get_is_master()
+                and self._is_improvement(score, best_score)
+            )
+            if improved:
+                if get_is_master():
+                    best_score = score
+                    best_metrics = validation_metrics
+                    self.save_checkpoint(
+                        ds_name=checkpoint_dataset,
+                        suffix="best",
+                    )
+                best_checkpoint = self._training_checkpoint_path(
+                    checkpoint_dataset,
+                    "best",
+                )
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+
+            if (
+                (epoch + 1) % self.cfg.logging.ckpt_interval == 0
+                and self.run_mode == "legacy"
+            ):
+                self.save_checkpoint(ds_name=checkpoint_dataset)
+
+            stopping = self.cfg.training.early_stopping
+            should_stop = (
+                stopping.enabled
+                and epochs_without_improvement >= stopping.patience
+            )
+            if self._broadcast_bool(should_stop):
+                logger.info(
+                    "Early stopping at epoch %d after %d epochs without "
+                    "improvement.",
+                    epoch,
+                    epochs_without_improvement,
+                )
+                break
+
+        if self.run_mode != "hpo":
+            if best_checkpoint is None:
+                raise RuntimeError(
+                    "Training finished without a validation-best checkpoint."
+                )
+            if (
+                torch.distributed.is_available()
+                and torch.distributed.is_initialized()
+            ):
+                torch.distributed.barrier()
+            self.load_training_checkpoint(best_checkpoint)
+        return best_metrics, best_checkpoint, stopped_by_callback
+
+    def run(self) -> Dict[str, Any]:
+        """Execute one seed-scoped neural training run."""
         seed_torch(self.cfg.seed)
         self.setup_distributed()
         self.setup_logging()
         self.init_tensorboard_logging()
         self.init_cloud_logging()
 
-        logger.info(f"Starting {self.cfg.model_type} training with configuration:")
-        logger.info(f"  - Datasets: {self.num_ds} {list(self.cfg.data.datasets.keys())}")
-        logger.info(f"  - Multitask: {self.cfg.multitask}")
-        logger.info(f"  - Max epochs: {self.cfg.training.max_epochs}")
-        logger.info(f"  - Output directory: {self.log_dir} -- {self.ckpt_dir}")
+        logger.info(
+            "Starting %s training for seed %d with %d dataset(s): %s",
+            self.cfg.model_type,
+            self.cfg.seed,
+            self.num_ds,
+            list(self.cfg.data.datasets),
+        )
 
-        """Main training loop - supports both multitask and separate models patterns."""
-        if self.cfg.multitask:
-            logger.info("Using separate models training pattern - one model per dataset")
-            self.run_unified_training()
-        else:
-            logger.info("Using unified/multitask training pattern - single shared model")
-            self.run_separate_training()
+        try:
+            if self.cfg.multitask:
+                result = self.run_unified_training()
+            else:
+                result = self.run_separate_training()
+            self.training_result = result
+            return result
+        finally:
+            self._close_csv_writer()
+            self.finish_cloud_logging()
+            self.finish_tensorboard_logging()
+            if not self.external_distributed:
+                clean_torch_distributed(self.local_rank)
 
-    def run_unified_training(self):
-        """Original unified training loop for multitask or single dataset training."""
-        torch.distributed.barrier()
+    def run_unified_training(self) -> Dict[str, Any]:
+        """Train one shared model for all configured datasets."""
+        if (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        ):
+            torch.distributed.barrier()
 
-        self._open_csv_writer('training')
+        self._open_csv_writer("training")
         self.collect_dataset_info(mixed=True)
         model = self.setup_model()
 
-        train_loader, train_sampler = self.create_dataloader(datasets.Split.TRAIN)
-        valid_loaders, _ = self.create_dataloader(datasets.Split.VALIDATION)
-        test_loaders, _ = self.create_dataloader(datasets.Split.TEST)
+        train_loader, train_sampler = self.create_dataloader(
+            datasets.Split.TRAIN
+        )
+        valid_loaders, _ = self.create_dataloader(
+            datasets.Split.VALIDATION
+        )
+        test_loaders = None
+        if self.run_mode != "hpo":
+            test_loaders, _ = self.create_dataloader(datasets.Split.TEST)
+            self.warn_on_split_label_mismatch(
+                train_loader,
+                valid_loaders,
+                test_loaders,
+            )
 
-        self.warn_on_split_label_mismatch(train_loader, valid_loaders, test_loaders)
+        if not isinstance(train_loader, DataLoader):
+            raise TypeError("train_loader must be a DataLoader.")
+        if not isinstance(
+            train_sampler,
+            DistributedGroupBatchSampler,
+        ):
+            raise TypeError(
+                "train_sampler must be a DistributedGroupBatchSampler."
+            )
 
-        if not isinstance(train_loader, DataLoader) or not isinstance(train_sampler, DistributedGroupBatchSampler):
-            raise TypeError('train_loader and train_sampler must be of type DataLoader')
-
-        # Setup optimizer and scheduler
         self.setup_optimizer_and_scheduler(model, train_loader)
+        validation_metrics, checkpoint_path, pruned = (
+            self._managed_epoch_loop(
+                train_loader,
+                train_sampler,
+                valid_loaders,
+                None,
+            )
+        )
+        result: Dict[str, Any] = {
+            "validation_metrics": validation_metrics,
+            "pruned": pruned,
+        }
+        if self.run_mode == "hpo":
+            return result
 
-        logger.info(f"Training setup complete. Starting {self.cfg.training.max_epochs} epochs...")
+        if test_loaders is None or checkpoint_path is None:
+            raise RuntimeError("Final evaluation loaders were not created.")
+        test_metrics = self.eval_epoch(test_loaders, "test")
+        if get_is_master():
+            for dataset_name, dataset_config in self.ds_conf.items():
+                self.final_validation_metrics[dataset_name] = (
+                    validation_metrics[dataset_name]
+                )
+                self.final_test_metrics[dataset_name] = (
+                    test_metrics[dataset_name]
+                )
+                self.final_checkpoint_paths[dataset_name] = checkpoint_path
+                self._write_completion(dataset_name, dataset_config)
+        result.update({
+            "test_metrics": test_metrics,
+            "checkpoint_path": str(checkpoint_path.resolve()),
+        })
+        return result
 
-        # Training loop
-        for epoch in range(self.cfg.training.max_epochs):
-            self.epoch = epoch
-
+    def run_separate_training(self) -> Dict[str, Any]:
+        """Train one independently configured model per dataset."""
+        if (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        ):
             torch.distributed.barrier()
 
-            self.train_epoch(train_loader, train_sampler)
-
-            self.eval_epoch(valid_loaders, 'eval')
-            final_test_metrics = self.eval_epoch(test_loaders, 'test')
-
-            # Save checkpoint
-            if (epoch + 1) % self.cfg.logging.ckpt_interval == 0:
-                self.save_checkpoint()
-
-        checkpoint_path = self.save_checkpoint(is_milestone=True)
-        if get_is_master():
-            for ds_name, ds_config in self.ds_conf.items():
-                self.final_checkpoint_paths[ds_name] = checkpoint_path
-                self.final_test_metrics[ds_name] = final_test_metrics[ds_name]
-                self._write_completion(ds_name, ds_config)
-        self._close_csv_writer()
-
-        self.finish_cloud_logging()
-        self.finish_tensorboard_logging()
-        clean_torch_distributed(self.local_rank)
-
-        logger.info("Training completed successfully!")
-
-    def run_separate_training(self):
-        """Main training loop for separate models pattern - train one model per dataset."""
-        torch.distributed.barrier()
-
-        logger.info(f"Starting separate models training for {self.num_ds} datasets")
-
-        # Train each dataset separately
-        for i, (ds_name, ds_config) in enumerate(self.ds_conf.items()):
-            if self._dataset_is_complete(ds_name, ds_config):
-                logger.info('Skipping completed dataset: %s', ds_name)
+        all_validation: Dict[str, Dict[str, float]] = {}
+        all_test: Dict[str, Dict[str, float]] = {}
+        pruned = False
+        for dataset_name, dataset_config in self.ds_conf.items():
+            if (
+                self.run_mode != "hpo"
+                and self._dataset_is_complete(
+                    dataset_name,
+                    dataset_config,
+                )
+            ):
+                logger.info(
+                    "Skipping completed dataset: %s",
+                    dataset_name,
+                )
                 continue
+
             if get_is_master():
-                logger.info(f"Training dataset {i + 1}/{self.num_ds}: {ds_name}")
-                self._reset_dataset_outputs(ds_name)
-                self._open_csv_writer(ds_name)
-                self._open_dataset_tensorboard(ds_name)
-            self.current_dataset = ds_name
-            self.collect_dataset_info(mixed=False, ds_name=ds_name)
+                self._reset_dataset_outputs(dataset_name)
+                self._open_csv_writer(dataset_name)
+                self._open_dataset_tensorboard(dataset_name)
+            self.current_dataset = dataset_name
+            self.collect_dataset_info(
+                mixed=False,
+                ds_name=dataset_name,
+            )
             model = self.setup_model()
 
-            train_loader, train_sampler = self.create_single_dataloader(ds_name, ds_config, datasets.Split.TRAIN)
-            valid_loader, _ = self.create_single_dataloader(ds_name, ds_config, datasets.Split.VALIDATION)
-            test_loader, _ = self.create_single_dataloader(ds_name, ds_config, datasets.Split.TEST)
+            train_loader, train_sampler = self.create_single_dataloader(
+                dataset_name,
+                dataset_config,
+                datasets.Split.TRAIN,
+            )
+            valid_loader, _ = self.create_single_dataloader(
+                dataset_name,
+                dataset_config,
+                datasets.Split.VALIDATION,
+            )
+            test_loader = None
+            if self.run_mode != "hpo":
+                test_loader, _ = self.create_single_dataloader(
+                    dataset_name,
+                    dataset_config,
+                    datasets.Split.TEST,
+                )
+                self.warn_on_split_label_mismatch(
+                    train_loader,
+                    valid_loader,
+                    test_loader,
+                )
 
-            self.warn_on_split_label_mismatch(train_loader, valid_loader, test_loader)
-
-            if not isinstance(train_loader, DataLoader) or not isinstance(train_sampler, DistributedGroupBatchSampler):
-                raise TypeError('train_loader and train_sampler must be of type DataLoader')
+            if not isinstance(train_loader, DataLoader):
+                raise TypeError("train_loader must be a DataLoader.")
+            if not isinstance(
+                train_sampler,
+                DistributedGroupBatchSampler,
+            ):
+                raise TypeError(
+                    "train_sampler must be a "
+                    "DistributedGroupBatchSampler."
+                )
             if not isinstance(valid_loader, DataLoader):
-                raise TypeError('valid_loader must be of type DataLoader')
-            if not isinstance(test_loader, DataLoader):
-                raise TypeError('test_loader must be of type DataLoader')
+                raise TypeError("valid_loader must be a DataLoader.")
 
-            # Setup optimizer and scheduler
             self.setup_optimizer_and_scheduler(model, train_loader)
+            validation_metrics, checkpoint_path, dataset_pruned = (
+                self._managed_epoch_loop(
+                    train_loader,
+                    train_sampler,
+                    [valid_loader],
+                    dataset_name,
+                )
+            )
+            all_validation.update(validation_metrics)
+            pruned = pruned or dataset_pruned
+            if self.run_mode == "hpo":
+                if dataset_pruned:
+                    break
+                continue
 
-            logger.info(f"Per dataset training setup complete for {ds_name}. ")
-            logger.info(f"Starting {self.cfg.training.max_epochs} epochs...")
-
-            # Training loop for this dataset
-            for epoch in range(self.cfg.training.max_epochs):
-                self.epoch = epoch
-
-                torch.distributed.barrier()
-
-                self.train_epoch(train_loader, train_sampler)
-
-                self.eval_epoch([valid_loader], 'eval')
-                final_test_metrics = self.eval_epoch([test_loader], 'test')
-
-                # Save checkpoint
-                if (epoch + 1) % self.cfg.logging.ckpt_interval == 0:
-                    self.save_checkpoint(ds_name=ds_name)
-
-            checkpoint_path = self.save_checkpoint(ds_name, is_milestone=True)
+            if test_loader is None or checkpoint_path is None:
+                raise RuntimeError(
+                    f"Final evaluation loader for {dataset_name} was "
+                    "not created."
+                )
+            test_metrics = self.eval_epoch([test_loader], "test")
+            all_test.update(test_metrics)
             if get_is_master():
-                self.final_checkpoint_paths[ds_name] = checkpoint_path
-                self.final_test_metrics[ds_name] = final_test_metrics[ds_name]
-                self._write_completion(ds_name, ds_config)
+                self.final_validation_metrics[dataset_name] = (
+                    validation_metrics[dataset_name]
+                )
+                self.final_test_metrics[dataset_name] = (
+                    test_metrics[dataset_name]
+                )
+                self.final_checkpoint_paths[dataset_name] = checkpoint_path
+                self._write_completion(
+                    dataset_name,
+                    dataset_config,
+                )
                 self._close_csv_writer()
-
-            logger.info(f"Training completed for {ds_name}!")
 
             self.epoch = 0
             self.current_step = 0
 
-        self.finish_cloud_logging()
-        self.finish_tensorboard_logging()
-        clean_torch_distributed(self.local_rank)
-        logger.info("Separate models training completed for all datasets!")
-
+        return {
+            "validation_metrics": all_validation,
+            "test_metrics": all_test,
+            "pruned": pruned,
+        }

@@ -2,7 +2,7 @@
 # This config demonstrates training separate models for each dataset
 
 # Training pattern flags
-seed: 42
+seeds: [42]
 master_port: 51103
 multitask: true
 model_type: 'eegpt'

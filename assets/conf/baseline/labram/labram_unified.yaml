@@ -2,7 +2,7 @@
 # This configuration demonstrates multitask training with LABRAM model
 
 # Basic configuration
-seed: 42
+seeds: [42]
 master_port: 51301
 multitask: true
 model_type: 'labram'

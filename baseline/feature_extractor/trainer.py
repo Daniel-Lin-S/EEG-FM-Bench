@@ -116,23 +116,31 @@ class FeatureExtractorTrainer(AbstractTrainer, ABC):
         """
 
     def get_train_io_path(self, args) -> Tuple[str, str]:
-        """Create a log directory without creating an empty checkpoint tree."""
+        """Create a seed log root without an empty checkpoint tree."""
         if not get_is_master():
             return "", ""
 
         config = self.cfg.model_dump(mode="json")
-        config_hash = get_config_hash(config, multitask=False)
-        experiment_name = f"{args.experiment_name}-{config_hash}"
         self.execution_id = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
         self.execution_id = f"{self.execution_id}-{os.getpid()}"
-        log_path = Path(args.run_dir, "log", "baseline", self.model_type)
-        log_path = log_path / experiment_name
+        if self.log_dir_override is not None:
+            log_path = self.log_dir_override
+        else:
+            config_hash = get_config_hash(config, multitask=False)
+            experiment_name = f"{args.experiment_name}-{config_hash}"
+            log_path = Path(
+                args.run_dir,
+                "log",
+                "baseline",
+                self.model_type,
+                experiment_name,
+            )
         log_path.mkdir(parents=True, exist_ok=True)
         save_resolved_config(
             config,
             log_path / "configs" / f"{self.execution_id}.yaml",
         )
-        return str(log_path), ""
+        return str(log_path.resolve()), ""
 
     def setup_logging(self):
         """Initialize local logging without checkpoint-directory reporting."""
@@ -196,25 +204,40 @@ class FeatureExtractorTrainer(AbstractTrainer, ABC):
             return dataset, parts[0], "/".join(parts[1:])
         return dataset, "", key
 
-    def _dataset_is_complete(self, ds_name: str, ds_config: str) -> bool:
-        """Return whether matching no-checkpoint metadata marks completion."""
+    def _dataset_is_complete(
+        self,
+        ds_name: str,
+        ds_config: str,
+    ) -> bool:
+        """Return whether matching no-checkpoint metadata exists."""
         completion_path = self._completion_path(ds_name)
         if not completion_path.is_file():
             return False
         try:
-            completion = json.loads(completion_path.read_text(encoding="utf-8"))
+            completion = json.loads(
+                completion_path.read_text(encoding="utf-8")
+            )
         except json.JSONDecodeError:
             logger.warning(
                 "Ignoring invalid completion metadata: %s",
                 completion_path,
             )
             return False
-        return (
+        compatible = (
             completion.get("status") == "completed"
             and completion.get("dataset_config") == ds_config
             and completion.get("model_type") == self.model_type
             and completion.get("checkpoint_path") is None
             and completion.get("has_checkpoint") is False
+        )
+        if self.campaign_hash is None:
+            return compatible
+        return (
+            compatible
+            and completion.get("campaign_hash") == self.campaign_hash
+            and completion.get("seed") == self.cfg.seed
+            and completion.get("config_hash")
+            == self._resolved_config_hash()
         )
 
     def _write_completion(self, ds_name: str, ds_config: str) -> None:
@@ -230,6 +253,9 @@ class FeatureExtractorTrainer(AbstractTrainer, ABC):
         completion_path.parent.mkdir(parents=True, exist_ok=True)
         completion = {
             "status": "completed",
+            "campaign_hash": self.campaign_hash,
+            "config_hash": self._resolved_config_hash(),
+            "seed": self.cfg.seed,
             "dataset_config": ds_config,
             "execution_id": self.execution_id,
             "model_type": self.model_type,

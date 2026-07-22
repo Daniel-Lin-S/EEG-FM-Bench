@@ -1,6 +1,6 @@
 # Catch-22 features + Ridge regression
 
-seed: 42
+seeds: [42]
 multitask: false
 model_type: catch22
 
