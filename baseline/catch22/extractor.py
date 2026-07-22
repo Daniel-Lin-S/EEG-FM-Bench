@@ -12,7 +12,7 @@ from baseline.feature_extractor.extractor import EEGFeatureExtractor
 
 CATCH22_FEATURE_COUNT = 22
 CATCH22_PROGRESS_INTERVAL = 100
-
+CATCH22_TRIAL_CHUNKSIZE = 8
 
 
 def _extract_catch22_trial(
@@ -98,7 +98,7 @@ class Catch22FeatureExtractor(EEGFeatureExtractor):
             extracted_trials = executor.map(
                 _extract_catch22_trial,
                 indexed_trials,
-                chunksize=1,
+                chunksize=CATCH22_TRIAL_CHUNKSIZE,
             )
             self._collect_features(extracted_trials, features)
         return features

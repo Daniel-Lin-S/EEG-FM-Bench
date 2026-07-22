@@ -8,7 +8,19 @@ import pytest
 
 from baseline.catch22.catch22_config import Catch22Config
 from baseline.catch22.catch22_trainer import Catch22Trainer
-from baseline.catch22.extractor import _write_terminal_progress
+import baseline.catch22.extractor as catch22_extractor_module
+import baseline.feature_extractor.classifier as classifier_module
+from baseline.catch22.extractor import (
+    CATCH22_TRIAL_CHUNKSIZE,
+    Catch22FeatureExtractor,
+    _write_terminal_progress,
+)
+from baseline.feature_extractor.classifier import (
+    RidgeClassifierArgs,
+    ValidationSelectedRidgeClassifier,
+)
+from baseline.feature_extractor.extractor import EEGFeatureExtractor
+from baseline.feature_extractor.pipeline import FeatureExtractionPipeline
 from baseline.feature_extractor.trainer import FeatureExtractorTrainer
 from baseline.minirocket.minirocket_config import MiniRocketConfig
 from baseline.minirocket.minirocket_trainer import MiniRocketTrainer
@@ -64,6 +76,138 @@ def test_catch22_concatenates_canonical_features(monkeypatch):
     assert features.shape == (1, 44)
     np.testing.assert_array_equal(features[0, :22], np.arange(1.0, 23.0))
     np.testing.assert_array_equal(features[0, 22:], np.arange(10.0, 32.0))
+
+
+class CountingFloat32Extractor(EEGFeatureExtractor):
+    """Count feature-extraction calls while preserving float32 output."""
+
+    def __init__(self):
+        self.fit_calls = 0
+        self.transform_calls = 0
+
+    def _fit(self, train_data: np.ndarray) -> None:
+        self.fit_calls += 1
+
+    def _transform(self, data: np.ndarray) -> np.ndarray:
+        self.transform_calls += 1
+        return data.mean(axis=-1, dtype=np.float32)
+
+
+def test_pipeline_caches_validation_features_and_preserves_dtype():
+    """Pipeline fitting transforms validation EEG once without widening.
+
+    The returned matrix retains the extractor output dtype.
+    """
+    extractor = CountingFloat32Extractor()
+    classifier = ValidationSelectedRidgeClassifier(
+        RidgeClassifierArgs(alphas=[0.1, 1.0])
+    )
+    pipeline = FeatureExtractionPipeline(extractor, classifier)
+    train_data = np.array(
+        [[[0.0]], [[1.0]], [[10.0]], [[11.0]]],
+        dtype=np.float32,
+    )
+    validation_data = np.array([[[0.5]], [[10.5]]], dtype=np.float32)
+    fit_result = pipeline.fit(
+        train_data,
+        np.array([0, 0, 1, 1]),
+        validation_data,
+        np.array([0, 1]),
+    )
+
+    assert extractor.fit_calls == 1
+    assert extractor.transform_calls == 2
+    assert fit_result.validation_features.dtype == np.float32
+    np.testing.assert_array_equal(
+        fit_result.validation_features,
+        np.array([[0.5], [10.5]], dtype=np.float32),
+    )
+
+
+def test_ridge_alpha_search_fits_scaler_once(monkeypatch):
+    """Ridge candidates share one fitted scaler and fit independently."""
+    original_scaler = classifier_module.StandardScaler
+    original_ridge = classifier_module.RidgeClassifier
+
+    class CountingScaler(original_scaler):
+        fit_calls = 0
+
+        def fit(self, features, labels=None, sample_weight=None):
+            type(self).fit_calls += 1
+            return super().fit(features, labels, sample_weight)
+
+    class CountingRidge(original_ridge):
+        fit_calls = 0
+
+        def fit(self, features, labels, sample_weight=None):
+            type(self).fit_calls += 1
+            return super().fit(features, labels, sample_weight)
+
+    monkeypatch.setattr(classifier_module, "StandardScaler", CountingScaler)
+    monkeypatch.setattr(classifier_module, "RidgeClassifier", CountingRidge)
+    classifier = classifier_module.ValidationSelectedRidgeClassifier(
+        RidgeClassifierArgs(alphas=[0.01, 0.1, 1.0])
+    )
+    classifier.fit(
+        np.array([[0.0], [1.0], [10.0], [11.0]]),
+        np.array([0, 0, 1, 1]),
+        np.array([[0.5], [10.5]]),
+        np.array([0, 1]),
+    )
+
+    assert CountingScaler.fit_calls == 1
+    assert CountingRidge.fit_calls == 3
+
+
+def test_catch22_parallel_dispatch_uses_trial_chunks(monkeypatch):
+    """Parallel catch22 extraction batches independent trial tasks."""
+    fake_module = types.ModuleType("pycatch22")
+
+    def catch22_all(values, catch24):
+        assert not catch24
+        return {"values": [values[0] + index for index in range(22)]}
+
+    fake_module.catch22_all = catch22_all
+
+    class ImmediateExecutor:
+        chunksize = None
+
+        def __init__(self, max_workers, mp_context):
+            self.max_workers = max_workers
+            self.mp_context = mp_context
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exception_type, exception, traceback):
+            return False
+
+        def map(self, function, items, chunksize):
+            type(self).chunksize = chunksize
+            return map(function, items)
+
+    monkeypatch.setitem(sys.modules, "pycatch22", fake_module)
+    monkeypatch.setattr(
+        catch22_extractor_module,
+        "ProcessPoolExecutor",
+        ImmediateExecutor,
+    )
+    monkeypatch.setattr(
+        catch22_extractor_module,
+        "get_context",
+        lambda _: object(),
+    )
+    data = np.array([[[1.0]], [[2.0]]], dtype=np.float32)
+    serial_extractor = Catch22FeatureExtractor(n_jobs=1)
+    parallel_extractor = Catch22FeatureExtractor(n_jobs=2)
+
+    serial_extractor.fit(data)
+    parallel_extractor.fit(data)
+    serial_features = serial_extractor.transform(data)
+    parallel_features = parallel_extractor.transform(data)
+
+    np.testing.assert_array_equal(serial_features, parallel_features)
+    assert ImmediateExecutor.chunksize == CATCH22_TRIAL_CHUNKSIZE
 
 
 def test_ridge_selection_uses_validation_and_scales_features():
@@ -122,12 +266,14 @@ def test_minirocket_loads_external_multivariate_source(tmp_path):
     module_path = source_dir / "minirocket_multivariate.py"
     module_path.write_text(
         "import numpy as np\n"
-        "seen = {}\n"
+        "seen = {'fit_calls': 0, 'transform_calls': 0}\n"
         "def fit(X, num_features, max_dilations_per_kernel):\n"
+        "    seen['fit_calls'] += 1\n"
         "    seen['dtype'] = X.dtype\n"
         "    seen['shape'] = X.shape\n"
         "    return (num_features, max_dilations_per_kernel)\n"
         "def transform(X, parameters):\n"
+        "    seen['transform_calls'] += 1\n"
         "    return np.full((X.shape[0], 2), parameters[0], "
         "dtype=np.float32)\n",
         encoding="utf-8",
@@ -145,11 +291,19 @@ def test_minirocket_loads_external_multivariate_source(tmp_path):
     trainer = MiniRocketTrainer(config)
     data = np.ones((3, 2, 9), dtype=np.float32)
 
-    trainer.fit_extractor(data)
+    fit_result = trainer.pipeline.fit(
+        data,
+        np.array([0, 1, 0]),
+        data[:2],
+        np.array([0, 1]),
+    )
     features = trainer.transform_features(data)
 
     assert trainer.extractor._module.seen["dtype"] == np.dtype("float32")
     assert trainer.extractor._module.seen["shape"] == (3, 2, 9)
+    assert trainer.extractor._module.seen["fit_calls"] == 1
+    assert trainer.extractor._module.seen["transform_calls"] == 3
+    assert fit_result.validation_features.dtype == np.float32
     assert features.shape == (3, 2)
     assert np.all(features == 12)
 

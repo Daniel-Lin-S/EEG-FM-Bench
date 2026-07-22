@@ -26,7 +26,10 @@ def get_default_ridge_alphas() -> list[float]:
 
 
 class RidgeClassifierArgs(BaseModel):
-    """Configuration for validation-selected standardized Ridge classification."""
+    """Configuration for validation-selected standardized Ridge.
+
+    One fitted scaler is shared by all candidate Ridge classifiers.
+    """
 
     alphas: list[float] = Field(default_factory=get_default_ridge_alphas)
     selection_metric: Literal[
@@ -40,7 +43,9 @@ class RidgeClassifierArgs(BaseModel):
     def validate_alphas(cls, alphas: list[float]) -> list[float]:
         """Require a non-empty, finite, unique positive alpha grid."""
         if not alphas:
-            raise ValueError("classifier.alphas must contain at least one value.")
+            raise ValueError(
+                "classifier.alphas must contain at least one value."
+            )
         if any(not np.isfinite(alpha) or alpha <= 0 for alpha in alphas):
             raise ValueError(
                 "classifier.alphas must contain finite positive values."
@@ -92,19 +97,18 @@ class ValidationSelectedRidgeClassifier(FeatureClassifier):
         validation_features: np.ndarray,
         validation_labels: np.ndarray,
     ) -> "ValidationSelectedRidgeClassifier":
-        """Fit all candidate pipelines and retain the best validation score."""
+        """Fit one scaler and select a Ridge alpha on scaled features."""
+        scaler = StandardScaler()
+        scaled_train_features = scaler.fit_transform(train_features)
+        scaled_validation_features = scaler.transform(validation_features)
+        best_ridge = None
         best_score = -np.inf
         for alpha in sorted(self.args.alphas):
-            pipeline = Pipeline(
-                [
-                    ("scaler", StandardScaler()),
-                    ("ridge", RidgeClassifier(alpha=alpha)),
-                ]
-            )
-            pipeline.fit(train_features, train_labels)
+            ridge = RidgeClassifier(alpha=alpha)
+            ridge.fit(scaled_train_features, train_labels)
             score = self._selection_score(
                 validation_labels,
-                pipeline.predict(validation_features),
+                ridge.predict(scaled_validation_features),
             )
             if not np.isfinite(score):
                 raise ValueError(
@@ -112,11 +116,14 @@ class ValidationSelectedRidgeClassifier(FeatureClassifier):
                     f"Ridge alpha {alpha}."
                 )
             if score > best_score:
-                self.pipeline = pipeline
+                best_ridge = ridge
                 self.selected_alpha = float(alpha)
                 best_score = score
-        if self.pipeline is None or self.selected_alpha is None:
+        if best_ridge is None or self.selected_alpha is None:
             raise RuntimeError("No Ridge classifier candidate was fitted.")
+        self.pipeline = Pipeline(
+            [("scaler", scaler), ("ridge", best_ridge)]
+        )
         return self
 
     def predict(self, features: np.ndarray) -> np.ndarray:
@@ -143,11 +150,18 @@ class ValidationSelectedRidgeClassifier(FeatureClassifier):
         if self.args.selection_metric == "accuracy":
             return float(accuracy_score(labels, predictions))
         return float(
-            f1_score(labels, predictions, average="weighted", zero_division=0)
+            f1_score(
+                labels,
+                predictions,
+                average="weighted",
+                zero_division=0,
+            )
         )
 
     def _require_pipeline(self) -> Pipeline:
         """Return the fitted sklearn pipeline or raise a clear error."""
         if self.pipeline is None:
-            raise RuntimeError("Ridge classifier must be fitted before prediction.")
+            raise RuntimeError(
+                "Ridge classifier must be fitted before prediction."
+            )
         return self.pipeline

@@ -19,7 +19,6 @@ from typing import Dict, Optional, Tuple
 import datasets
 import numpy as np
 import torch
-from sklearn.linear_model import RidgeClassifier
 from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
@@ -29,11 +28,13 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader
 
 from baseline.abstract.trainer import AbstractTrainer, format_console_log_dict
-from baseline.feature_extractor.classifier import FeatureClassifier
+from baseline.feature_extractor.classifier import (
+    FeatureClassifier,
+    ValidationSelectedRidgeClassifier,
+)
 from baseline.feature_extractor.config import FeatureExtractorConfig
 from baseline.feature_extractor.pipeline import FeatureExtractionPipeline
 from baseline.utils.common import seed_torch
@@ -375,44 +376,25 @@ class FeatureExtractorTrainer(AbstractTrainer, ABC):
         validation_features: np.ndarray,
         validation_labels: np.ndarray,
     ) -> Tuple[Pipeline, float]:
-        """Fit and select Ridge candidates with the configured metric."""
-        selection_metric = self.cfg.model.classifier.selection_metric
-        best_classifier = None
-        best_alpha = None
-        best_score = -np.inf
-        for alpha in sorted(self.cfg.model.classifier.alphas):
-            classifier = Pipeline(
-                [
-                    ("scaler", StandardScaler()),
-                    ("ridge", RidgeClassifier(alpha=alpha)),
-                ]
-            )
-            classifier.fit(train_features, train_labels)
-            predictions = classifier.predict(validation_features)
-            score = self._selection_score(
-                validation_labels,
-                predictions,
-                selection_metric,
-            )
-            if not np.isfinite(score):
-                raise ValueError(
-                    f"Validation {selection_metric} is NaN for Ridge alpha "
-                    f"{alpha}."
-                )
-            if score > best_score:
-                best_classifier = classifier
-                best_alpha = alpha
-                best_score = score
+        """Fit the shared validation-selected Ridge classifier.
 
-        if best_classifier is None or best_alpha is None:
-            raise RuntimeError("No Ridge classifier candidate was fitted.")
-        logger.info(
-            "Selected Ridge alpha %.6g with validation %s %.6f.",
-            best_alpha,
-            selection_metric,
-            best_score,
+        This compatibility helper delegates to the downstream classifier so
+        scaler fitting remains independent of the alpha candidate count.
+        """
+        classifier = ValidationSelectedRidgeClassifier(
+            self.cfg.model.classifier
         )
-        return best_classifier, float(best_alpha)
+        classifier.fit(
+            train_features,
+            train_labels,
+            validation_features,
+            validation_labels,
+        )
+        if classifier.pipeline is None or classifier.selected_alpha is None:
+            raise RuntimeError(
+                "Ridge classifier did not retain a fitted pipeline."
+            )
+        return classifier.pipeline, classifier.selected_alpha
 
     @staticmethod
     def _selection_score(
@@ -542,13 +524,13 @@ class FeatureExtractorTrainer(AbstractTrainer, ABC):
                 ds_name,
             )
 
-            self.pipeline.fit(
+            fit_result = self.pipeline.fit(
                 train_data,
                 train_labels,
                 validation_data,
                 validation_labels,
             )
-            validation_features = self.pipeline.transform(validation_data)
+            validation_features = fit_result.validation_features
             test_features = self.pipeline.transform(test_data)
             classifier = self.pipeline.classifier
             validation_metrics = self._evaluate(
