@@ -6,6 +6,7 @@ import json
 import math
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from omegaconf import OmegaConf
@@ -24,6 +25,7 @@ from baseline.hpo.config import HpoConfig
 from baseline.hpo.orchestrator import (
     CampaignRunner,
     _hpo_scope_root,
+    _study_progress,
     _study_scope_configs,
 )
 from baseline.hpo.search import (
@@ -169,6 +171,7 @@ def test_campaign_identity_excludes_seeds_and_trial_budget() -> None:
 
     base["seeds"] = [42, 43, 44]
     hpo["n_trials"] = 100
+    hpo["max_consecutive_failed_trials"] = 9
     assert get_campaign_hash(base, hpo) == original
 
     hpo["search_space"]["training.max_lr"]["high"] = 2e-3
@@ -498,6 +501,25 @@ def test_optuna_sqlite_study_resumes_existing_trials(
         / "alpha"
         / "study.sqlite3"
     ).is_file()
+
+
+def test_failed_trials_do_not_consume_resumed_hpo_budget() -> None:
+    """Only complete and pruned trials count toward a resumed target."""
+    import optuna
+
+    state = optuna.trial.TrialState
+    trials = [
+        SimpleNamespace(state=state.COMPLETE),
+        SimpleNamespace(state=state.FAIL),
+        SimpleNamespace(state=state.PRUNED),
+        SimpleNamespace(state=state.FAIL),
+        SimpleNamespace(state=state.FAIL),
+    ]
+
+    budgeted, consecutive_failures = _study_progress(trials)
+
+    assert budgeted == 2
+    assert consecutive_failures == 2
 
 
 def test_campaign_runs_hpo_once_before_all_evaluation_seeds() -> None:

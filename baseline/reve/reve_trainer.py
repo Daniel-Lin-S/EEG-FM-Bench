@@ -9,7 +9,7 @@ from optimi import StableAdamW
 from torch import nn
 from torch.utils.data import DataLoader
 from baseline.abstract.classifier import MultiHeadClassifier
-from baseline.abstract.trainer import AbstractTrainer, format_console_log_dict
+from baseline.abstract.trainer import AbstractTrainer
 from baseline.reve.model import Reve
 from baseline.reve.reve_adapter import ReveDataLoaderFactory
 from baseline.reve.reve_config import ReveConfig, ReveModelArgs
@@ -264,8 +264,11 @@ class ReveTrainer(AbstractTrainer):
         scaler = torch.amp.GradScaler(enabled=self.cfg.training.use_amp)
         
         # Calculate scheduler parameters
-        warmup_steps = len(train_loader) * self.cfg.training.warmup_epochs
-        total_steps = len(train_loader) * self.cfg.training.max_epochs
+        updates_per_epoch = math.ceil(
+            len(train_loader) / self.accumulation_steps
+        )
+        warmup_steps = updates_per_epoch * self.cfg.training.warmup_epochs
+        total_steps = updates_per_epoch * self.cfg.training.max_epochs
         
         # Save warmup steps for tracking
         self.warmup_steps = warmup_steps
@@ -295,6 +298,7 @@ class ReveTrainer(AbstractTrainer):
         self.scaler = scaler
         self.scheduler = main_scheduler
         self.warmup_scheduler = warm_scheduler
+        self._record_fixed_memory_estimate()
         
         logger.info(f"Scheduler setup: warmup_steps={warmup_steps}, total_steps={total_steps}")
 
@@ -321,84 +325,34 @@ class ReveTrainer(AbstractTrainer):
             if get_is_master():
                 logger.info(f"Warmup finished at step {self.current_step}")
 
-    def train_epoch(self, train_loader: DataLoader, train_sampler: DistributedGroupBatchSampler):
-        """Override to add warmup scheduler and custom learning rate logging."""
+    def train_epoch(
+        self,
+        train_loader: DataLoader,
+        train_sampler: DistributedGroupBatchSampler,
+    ) -> None:
+        """Train with shared accumulation and REVE warmup scheduling."""
         self.model.train()
         if self.cfg.training.freeze_encoder:
-            if torch.distributed.is_available() and torch.distributed.is_initialized():
-                self.model.module.encoder.eval()
-            else:
-                self.model.encoder.eval()
-
-        train_sampler.set_epoch(self.epoch)
-
-        if (not self.cfg.training.freeze_encoder
+            encoder = (
+                self.model.module.encoder
+                if hasattr(self.model, "module")
+                else self.model.encoder
+            )
+            encoder.eval()
+        should_unfreeze = (
+            not self.cfg.training.freeze_encoder
             and self.cfg.training.warmup_freeze_encoder
             and self.warmup_freeze_state
-            and self.epoch == self.cfg.training.warmup_freeze_encoder_epochs):
+            and self.epoch
+            == self.cfg.training.warmup_freeze_encoder_epochs
+        )
+        if should_unfreeze:
             self.unfreeze_encoder()
-
-        batch: dict
-        for step_in_epoch, batch in enumerate(train_loader):
-            self.optimizer.zero_grad()
-
-            batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-            labels = batch['label']
-            ds_name = batch['montage'][0].split('/')[0]
-
-            # Forward pass with mixed precision
-            logits, loss = self.train_step(batch, labels)
-
-            # Check for NaN loss
-            if torch.isnan(loss):
-                logger.warning(f"NaN loss detected at step {self.current_step}")
-
-            # Backward pass
-            self.scaler.scale(loss).backward()
-            grad_norm = self._clip_grad_norm_()
-
-            # Optimizer step
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-
-            # Logging with distributed reduction
-            if self.current_step % self.cfg.logging.log_step_interval == 0:
-                # Calculate step accuracy
-                preds = torch.argmax(logits, dim=-1)
-                step_acc = (preds == labels).float().mean()
-
-                # Create tensors for distributed reduction
-                loss_tensor = loss.clone().detach()
-                acc_tensor = step_acc.clone().detach()
-
-                torch.distributed.all_reduce(loss_tensor, op=torch.distributed.ReduceOp.AVG)
-                torch.distributed.all_reduce(acc_tensor, op=torch.distributed.ReduceOp.AVG)
-
-                if get_is_master():
-                    log_data = {
-                        'train/epoch': self.epoch,
-                        'train/step': self.current_step,
-                        'train/loss_ce': loss_tensor.cpu().item(),
-                        'train/acc': acc_tensor.cpu().item(),
-                        'train/grad_norm': grad_norm,
-                        'train/header_lr': self.get_current_lr()[0],
-                    }
-
-                    if not self.cfg.training.freeze_encoder:
-                        log_data['train/encoder_lr'] = self.get_current_lr()[-1]
-
-                    if not self.multitask:
-                        log_data = {f"{ds_name}/{key}": value for key, value in log_data.items()}
-
-                    # Log to cloud services
-                    if self.cfg.logging.use_cloud:
-                        self._log_to_cloud(log_data)
-
-                    logger.info(format_console_log_dict(log_data, prefix='train'))
-
-            self.current_step += 1
-            self.on_train_step_end()
-
+        self._run_accumulated_epoch(
+            train_loader,
+            train_sampler,
+            self.on_train_step_end,
+        )
 
     def _compute_eval_loss(
         self,

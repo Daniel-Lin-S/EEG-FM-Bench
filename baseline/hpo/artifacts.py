@@ -68,6 +68,7 @@ def get_campaign_hash(
     if hpo and hpo.get("enabled"):
         hpo_identity = json.loads(json.dumps(hpo, sort_keys=True))
         hpo_identity.pop("n_trials", None)
+        hpo_identity.pop("max_consecutive_failed_trials", None)
     identity["hpo"] = hpo_identity
     encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[

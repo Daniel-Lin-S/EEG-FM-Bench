@@ -278,6 +278,40 @@ python baseline_main.py conf_file=baseline/eegpt/eegpt_unified.yaml model_type=e
 python baseline_main.py list-models
 ```
 
+##### Adaptive CUDA batching
+
+Neural trainers interpret `data.batch_size` as the requested global number of
+samples per optimizer update. The value must be divisible by the distributed
+world size. At runtime, the trainer selects an exact per-rank micro-batch and
+derives gradient accumulation without changing the requested global batch.
+
+```yaml
+data:
+  batch_size: 128
+
+training:
+  adaptive_batching:
+    enabled: true
+    memory_reserve_fraction: 0.15
+    contention_wait_seconds: 300
+```
+
+The memory reserve is 15 percent of each GPU's total capacity. It limits the
+training process while accounting for other device users; it does not require
+85 percent of the GPU to be free before a run starts. A disposable
+micro-batch-one update measures activation, workspace, DDP, and allocator
+overhead alongside the analytical fixed-state estimate. The largest predicted
+safe exact divisor is selected across all ranks, and the measured model is
+cached within the invocation. Current external occupancy is still recalculated
+for every run. A recoverable CUDA OOM rebuilds the trainer with the next
+smaller exact divisor. If micro-batch one fails, the runtime releases CUDA
+state, waits once for the configured interval, and retries once.
+
+Every neural run writes `adaptive_batching.json` with the requested global
+batch, selected micro-batch, accumulation steps, allocator limit, analytical
+fixed-memory estimate, measured CUDA peak, and retry count. Deterministic
+feature-extractor baselines do not use adaptive CUDA batching.
+
 ##### Hyperparameter optimization
 
 Hyperparameter optimization uses validation performance to select values from `hpo.search_space`. It uses `hpo.seed` for trial training and `hpo.sampler.seed` for TPE sampling. For `multitask: false`, every dataset gets its own study and winner. For `multitask: true`, one joint study selects a shared winner.
@@ -287,6 +321,7 @@ hpo:
   enabled: true
   seed: 0
   n_trials: 50
+  max_consecutive_failed_trials: 5
 
   objective:
     metric: loss
@@ -336,9 +371,17 @@ Float, integer, and categorical distributions are supported at dotted configurat
 python baseline_main.py conf_file=baseline/brainomni/brainomni_unified.local.yaml model_type=brainomni hpo.n_trials=100
 ```
 
-Optuna studies use SQLite and resume automatically. `n_trials` is the total attempted-trial target, so increasing it adds trials instead of repeating the previous budget. HPO creates validation loaders only, reports its objective each epoch, and allows the median pruner to stop weak trials. MiniROCKET and catch22 ignore HPO with a warning.
+Optuna studies use SQLite and resume automatically. `n_trials` counts complete
+and pruned trials; failed trials remain in SQLite for diagnostics but do not
+consume the budget. A complete or pruned trial resets the failure streak, and
+five consecutive terminal failures abort an invalid study. HPO creates
+validation loaders only, reports its objective each epoch, and allows the
+median pruner to stop weak trials. MiniROCKET and catch22 ignore HPO with a
+warning.
 
-The HPO identity excludes `hpo.n_trials`, allowing a later invocation to extend an existing study. HPO artifacts are local and organized by study scope:
+The HPO identity excludes `hpo.n_trials` and `hpo.max_consecutive_failed_trials`,
+allowing either operational limit to be changed while resuming an existing
+study. HPO artifacts are local and organized by study scope:
 
 ```text
 <campaign>/

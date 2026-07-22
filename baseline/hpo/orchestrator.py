@@ -13,14 +13,21 @@ import json
 import logging
 import math
 import os
+import time
 import warnings
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Type
+from typing import Any, Callable, Dict, Mapping, Optional, Type
 
 import torch
 import yaml
 from pydantic import BaseModel
 
+from baseline.adaptive_batching import (
+    configure_cuda_allocator,
+    derive_batch_candidates,
+    is_cuda_oom,
+    select_safe_micro_batch,
+)
 from baseline.abstract.factory import ModelRegistry
 from baseline.hpo.artifacts import (
     CampaignPaths,
@@ -41,6 +48,7 @@ from baseline.utils.run_artifacts import get_config_hash
 from common.distributed.env import (
     clean_torch_distributed,
     get_is_master,
+    get_world_size,
 )
 
 
@@ -229,6 +237,75 @@ def _hpo_scope_root(root: Path, scope: str) -> Path:
     return root / "hpo" / "datasets" / scope
 
 
+def _study_progress(trials: list[Any]) -> tuple[int, int]:
+    """Count budgeted trials and the trailing terminal-failure streak.
+
+    Parameters
+    ----------
+    trials : list[Any]
+        Persisted Optuna trials in chronological order. Each element must
+        expose a state whose ``name`` is an Optuna trial-state name.
+
+    Returns
+    -------
+    tuple[int, int]
+        Count of complete-or-pruned trials and consecutive failed trials at
+        the end of the persisted history.
+
+    Raises
+    ------
+    ValueError
+        If a trial does not expose a recognized state name.
+    """
+    budgeted_names = frozenset({"COMPLETE", "PRUNED"})
+    terminal_names = budgeted_names | {"FAIL"}
+    state_names = [trial.state.name for trial in trials]
+    unknown = set(state_names) - terminal_names - {"RUNNING", "WAITING"}
+    if unknown:
+        raise ValueError(
+            "Expected recognized Optuna trial states, but got "
+            f"{sorted(unknown)}."
+        )
+    budgeted = sum(name in budgeted_names for name in state_names)
+    consecutive_failures = 0
+    for state_name in reversed(state_names):
+        if state_name != "FAIL":
+            break
+        consecutive_failures += 1
+    return budgeted, consecutive_failures
+
+
+def _synchronize_micro_batch(micro_batch: int) -> int:
+    """Select the smallest safe micro-batch across distributed ranks.
+
+    Parameters
+    ----------
+    micro_batch : int
+        Largest candidate predicted safe on the current rank.
+
+    Returns
+    -------
+    int
+        Minimum candidate reported by any initialized distributed rank.
+    """
+    if micro_batch <= 0:
+        raise ValueError(
+            f"Expected a positive micro-batch, but got {micro_batch}."
+        )
+    if not (
+        torch.distributed.is_available()
+        and torch.distributed.is_initialized()
+    ):
+        return micro_batch
+    device = torch.device("cuda", torch.cuda.current_device())
+    value = torch.tensor(micro_batch, device=device, dtype=torch.int64)
+    torch.distributed.all_reduce(
+        value,
+        op=torch.distributed.ReduceOp.MIN,
+    )
+    return int(value.item())
+
+
 class CampaignRunner:
     """Coordinate HPO, seed runs, failure policy, and summaries."""
 
@@ -255,6 +332,232 @@ class CampaignRunner:
             campaign_hash=self.campaign_hash,
         )
         self.distributed_initialized = False
+        self.adaptive_batch_cache: Dict[str, Dict[str, Any]] = {}
+        self.last_adaptive_memory_profile: Dict[str, Any] = {}
+
+    def _adaptive_signature(self, config: BaseModel) -> str:
+        """Return an invocation-local memory-profile identity."""
+        payload = config.model_dump(mode="json")
+        training = payload["training"]
+        signature = {
+            "model_type": payload["model_type"],
+            "model": payload["model"],
+            "data": payload["data"],
+            "fs": payload["fs"],
+            "use_amp": training["use_amp"],
+            "freeze_encoder": training["freeze_encoder"],
+            "lora": training["lora"],
+            "world_size": get_world_size(),
+        }
+        if torch.cuda.is_available():
+            signature["gpu"] = torch.cuda.get_device_name(
+                torch.cuda.current_device()
+            )
+        return json.dumps(signature, sort_keys=True)
+
+    def _measure_adaptive_memory(
+        self,
+        config: BaseModel,
+        global_batch_size: int,
+        world_size: int,
+    ) -> tuple[str, Dict[str, Dict[str, Any]], Dict[str, Any]]:
+        """Return a current or newly calibrated CUDA memory model."""
+        batching = config.training.adaptive_batching
+        signature = self._adaptive_signature(config)
+        cache = getattr(self, "adaptive_batch_cache", {})
+        cached = cache.get(signature)
+        if cached is not None:
+            return signature, cache, dict(cached)
+
+        calibration_retried = False
+        while True:
+            calibration_config = config.model_copy(deep=True)
+            calibration = ModelRegistry.create_trainer(
+                calibration_config
+            )
+            calibration.configure_runtime_batching(
+                global_batch_size,
+                1,
+                world_size,
+            )
+            try:
+                memory_model = calibration.calibrate_cuda_memory()
+            except BaseException as exc:
+                self.last_adaptive_memory_profile = dict(
+                    calibration.adaptive_batch_profile
+                )
+                if not is_cuda_oom(exc):
+                    raise
+                if calibration_retried:
+                    raise torch.cuda.OutOfMemoryError(
+                        "The model's fixed CUDA state cannot fit while "
+                        "preserving the configured memory reserve after "
+                        "two micro-batch-one calibration attempts."
+                    ) from exc
+                calibration_retried = True
+                wait_seconds = batching.contention_wait_seconds
+                logger.warning(
+                    "Micro-batch-one calibration cannot fit; releasing "
+                    "CUDA state and retrying in %d seconds.",
+                    wait_seconds,
+                )
+                calibration = None
+                _release_training_state()
+                if wait_seconds:
+                    time.sleep(wait_seconds)
+                continue
+            finally:
+                calibration = None
+                _release_training_state()
+            cache[signature] = memory_model
+            self.adaptive_batch_cache = cache
+            return signature, cache, memory_model
+
+    def _predicted_candidates(
+        self,
+        candidates: list[int],
+        memory_model: Mapping[str, Any],
+    ) -> tuple[list[int], int]:
+        """Return candidates starting at the DDP-wide predicted maximum."""
+        eligible = candidates
+        oom_cap = memory_model.get("oom_cap")
+        if oom_cap is not None:
+            eligible = [
+                candidate
+                for candidate in candidates
+                if candidate <= int(oom_cap)
+            ]
+        selected, _ = select_safe_micro_batch(
+            eligible,
+            int(memory_model["estimated_fixed_bytes"]),
+            int(memory_model["calibration_peak_reserved_bytes"]),
+            int(memory_model["calibration_batch_size"]),
+            int(memory_model["process_limit_bytes"]),
+        )
+        selected = _synchronize_micro_batch(selected)
+        _, predicted_peak = select_safe_micro_batch(
+            [selected],
+            int(memory_model["estimated_fixed_bytes"]),
+            int(memory_model["calibration_peak_reserved_bytes"]),
+            int(memory_model["calibration_batch_size"]),
+            int(memory_model["process_limit_bytes"]),
+        )
+        return candidates[candidates.index(selected):], predicted_peak
+
+    def _run_adaptive_trainer(
+        self,
+        config: BaseModel,
+        prepare: Callable[[Any], None],
+    ) -> Dict[str, Any]:
+        """Run one neural config with internal exact-divisor OOM backoff."""
+        batching = config.training.adaptive_batching
+        world_size = get_world_size()
+        global_batch_size = config.data.batch_size
+        candidates = derive_batch_candidates(
+            global_batch_size,
+            world_size,
+            batching.enabled,
+        )
+        self.last_adaptive_memory_profile = {}
+        signature = self._adaptive_signature(config)
+        cache = getattr(self, "adaptive_batch_cache", {})
+        memory_profile: Dict[str, Any] = {}
+        if batching.enabled and torch.cuda.is_available():
+            signature, cache, memory_profile = (
+                self._measure_adaptive_memory(
+                    config,
+                    global_batch_size,
+                    world_size,
+                )
+            )
+            device = torch.device(
+                "cuda",
+                torch.cuda.current_device(),
+            )
+            current_limit = configure_cuda_allocator(
+                device,
+                batching.memory_reserve_fraction,
+            )
+            if current_limit is None:
+                raise RuntimeError(
+                    "CUDA allocator configuration returned no limit."
+                )
+            memory_profile = dict(memory_profile)
+            memory_profile.update(current_limit.as_dict())
+            candidates, predicted_peak = self._predicted_candidates(
+                candidates,
+                memory_profile,
+            )
+            memory_profile["estimated_selected_peak_bytes"] = (
+                predicted_peak
+            )
+            self.last_adaptive_memory_profile = dict(
+                memory_profile
+            )
+        batch_one_retried = False
+        last_error: Optional[BaseException] = None
+        for candidate_index, micro_batch in enumerate(candidates):
+            while True:
+                attempt_config = config.model_copy(deep=True)
+                trainer = ModelRegistry.create_trainer(attempt_config)
+                trainer.configure_runtime_batching(
+                    global_batch_size,
+                    micro_batch,
+                    world_size,
+                )
+                trainer.adaptive_batch_profile["adaptive_retry"] = (
+                    candidate_index
+                )
+                trainer.adaptive_batch_profile.update(memory_profile)
+                try:
+                    prepare(trainer)
+                    result = trainer.run()
+                except BaseException as exc:
+                    last_error = exc
+                    self.last_adaptive_memory_profile = dict(
+                        trainer.adaptive_batch_profile
+                    )
+                    if not is_cuda_oom(exc):
+                        raise
+                    logger.warning(
+                        "CUDA OOM at micro-batch %d; recalibrating within "
+                        "the same run attempt.",
+                        micro_batch,
+                    )
+                    if micro_batch != 1:
+                        next_micro_batch = candidates[
+                            candidate_index + 1
+                        ]
+                        if memory_profile:
+                            memory_profile["oom_cap"] = next_micro_batch
+                            cache[signature] = dict(memory_profile)
+                            self.adaptive_batch_cache = cache
+                        break
+                    if batch_one_retried:
+                        raise torch.cuda.OutOfMemoryError(
+                            "The model's fixed CUDA state cannot fit while "
+                            "preserving the configured memory reserve after "
+                            "two micro-batch-one runtime attempts."
+                        ) from exc
+                    batch_one_retried = True
+                    wait_seconds = batching.contention_wait_seconds
+                    if wait_seconds:
+                        logger.warning(
+                            "Micro-batch one cannot fit; waiting %d seconds "
+                            "before one clean retry.",
+                            wait_seconds,
+                        )
+                        trainer = None
+                        _release_training_state()
+                        time.sleep(wait_seconds)
+                    continue
+                finally:
+                    trainer = None
+                    _release_training_state()
+                return result
+        if last_error is None:
+            raise RuntimeError("Adaptive batching produced no candidates.")
+        raise last_error
 
     def _initialize_distributed(self, seed: int) -> None:
         """Initialize one process group reused by all neural executions."""
@@ -344,6 +647,7 @@ class CampaignRunner:
         objective: Optional[float] = None,
         error: Optional[str] = None,
         objective_history: Optional[list[Mapping[str, Any]]] = None,
+        memory_information: Optional[Mapping[str, Any]] = None,
     ) -> None:
         """Persist one trial's decoded parameters and terminal state."""
         if not get_is_master():
@@ -358,6 +662,8 @@ class CampaignRunner:
             payload["error"] = error
         if objective_history is not None:
             payload["objective_history"] = list(objective_history)
+        if memory_information is not None:
+            payload["memory_information"] = dict(memory_information)
         _atomic_json(trial_root / "trial.json", payload)
 
     def _run_hpo_scope(
@@ -370,21 +676,28 @@ class CampaignRunner:
 
         study = self._create_study(scope) if get_is_master() else None
         if get_is_master():
-            terminal = {
-                optuna.trial.TrialState.COMPLETE,
-                optuna.trial.TrialState.PRUNED,
-                optuna.trial.TrialState.FAIL,
-            }
-            finished = sum(
-                trial.state in terminal
-                for trial in study.get_trials(deepcopy=False)
+            persisted_trials = study.get_trials(deepcopy=False)
+            budgeted, consecutive_failures = _study_progress(
+                persisted_trials
             )
-            remaining = max(self.hpo_config.n_trials - finished, 0)
         else:
-            remaining = 0
-        remaining = int(_broadcast_object(remaining))
+            budgeted = 0
+            consecutive_failures = 0
+        progress = _broadcast_object({
+            "budgeted": budgeted,
+            "consecutive_failures": consecutive_failures,
+        })
+        budgeted = int(progress["budgeted"])
+        consecutive_failures = int(progress["consecutive_failures"])
+        failure_limit = self.hpo_config.max_consecutive_failed_trials
+        if consecutive_failures >= failure_limit:
+            raise RuntimeError(
+                f"HPO scope '{scope}' already has {consecutive_failures} "
+                "consecutive failed trials. Correct the configuration or "
+                "search space before resuming."
+            )
 
-        for _ in range(remaining):
+        while budgeted < self.hpo_config.n_trials:
             if get_is_master():
                 trial = study.ask()
                 sampled, decoded = sample_config(
@@ -420,6 +733,8 @@ class CampaignRunner:
             )
             best_value: Optional[float] = None
             objective_history: list[Dict[str, Any]] = []
+            trial_budgeted = False
+            self.last_adaptive_memory_profile = {}
 
             def validation_callback(
                 epoch: int,
@@ -453,25 +768,32 @@ class CampaignRunner:
                 trial.report(value, step=epoch)
                 return trial.should_prune()
 
-            trainer = None
             try:
                 trial_config = self.config_class.model_validate(sampled)
                 if not trial_config.validate_config():
                     raise ValueError(
                         f"Invalid sampled configuration for scope {scope}."
                     )
-                trainer = ModelRegistry.create_trainer(trial_config)
-                trainer.configure_managed_run(
-                    log_dir=trial_root,
-                    checkpoint_dir=checkpoint_root,
-                    campaign_hash=self.campaign_hash,
-                    run_mode="hpo",
-                    validation_callback=(
-                        validation_callback if get_is_master() else None
-                    ),
-                    external_distributed=True,
+
+                def prepare_trial(attempt_trainer: Any) -> None:
+                    """Attach this Optuna trial's managed-run context."""
+                    attempt_trainer.configure_managed_run(
+                        log_dir=trial_root,
+                        checkpoint_dir=checkpoint_root,
+                        campaign_hash=self.campaign_hash,
+                        run_mode="hpo",
+                        validation_callback=(
+                            validation_callback
+                            if get_is_master()
+                            else None
+                        ),
+                        external_distributed=True,
+                    )
+
+                result = self._run_adaptive_trainer(
+                    trial_config,
+                    prepare_trial,
                 )
-                result = trainer.run()
                 pruned = bool(result.get("pruned"))
                 if get_is_master():
                     if best_value is None:
@@ -500,10 +822,22 @@ class CampaignRunner:
                             objective=best_value,
                             objective_history=objective_history,
                         )
+                trial_budgeted = True
             except Exception as exc:
                 if not _is_recoverable_trial_failure(exc):
                     raise
                 if get_is_master():
+                    fingerprint = failure_fingerprint(exc)
+                    memory_information = getattr(
+                        self,
+                        "last_adaptive_memory_profile",
+                        {},
+                    )
+                    trial.set_user_attr("error_fingerprint", fingerprint)
+                    trial.set_user_attr(
+                        "memory_information",
+                        memory_information,
+                    )
                     study.tell(
                         trial,
                         state=optuna.trial.TrialState.FAIL,
@@ -512,8 +846,9 @@ class CampaignRunner:
                         trial_root,
                         FAILED_STATUS,
                         decoded,
-                        error=failure_fingerprint(exc),
+                        error=fingerprint,
                         objective_history=objective_history,
+                        memory_information=memory_information,
                     )
                 logger.warning(
                     "HPO trial %d failed: %s",
@@ -521,8 +856,18 @@ class CampaignRunner:
                     exc,
                 )
             finally:
-                trainer = None
                 _release_training_state()
+            if trial_budgeted:
+                budgeted += 1
+                consecutive_failures = 0
+            else:
+                consecutive_failures += 1
+                if consecutive_failures >= failure_limit:
+                    raise RuntimeError(
+                        f"HPO scope '{scope}' reached "
+                        f"{consecutive_failures} consecutive failed trials. "
+                        "Correct the configuration or search space."
+                    )
 
         if get_is_master():
             try:
@@ -704,28 +1049,41 @@ class CampaignRunner:
                             "Invalid final configuration for seed "
                             f"{seed}."
                         )
-                    trainer = ModelRegistry.create_trainer(final_config)
-                    trainer.comet_experiment = cloud_context.get("comet")
-                    if (
+                    is_neural = (
                         self.base_dict["model_type"]
                         not in DETERMINISTIC_MODELS
-                    ):
-                        trainer.configure_managed_run(
-                            log_dir=seed_log_root,
-                            checkpoint_dir=seed_checkpoint_root,
-                            campaign_hash=self.campaign_hash,
-                            run_mode="final",
-                            external_distributed=True,
-                            external_cloud=bool(cloud_context),
+                    )
+                    if is_neural:
+                        def prepare_seed(
+                            attempt_trainer: Any,
+                        ) -> None:
+                            """Attach this seed's managed-run context."""
+                            attempt_trainer.comet_experiment = (
+                                cloud_context.get("comet")
+                            )
+                            attempt_trainer.configure_managed_run(
+                                log_dir=seed_log_root,
+                                checkpoint_dir=seed_checkpoint_root,
+                                campaign_hash=self.campaign_hash,
+                                run_mode="final",
+                                external_distributed=True,
+                                external_cloud=bool(cloud_context),
+                            )
+
+                        self._run_adaptive_trainer(
+                            final_config,
+                            prepare_seed,
                         )
                     else:
+                        trainer = ModelRegistry.create_trainer(final_config)
+                        trainer.comet_experiment = cloud_context.get("comet")
                         trainer.log_dir_override = seed_log_root.resolve()
                         trainer.ckpt_dir_override = (
                             seed_checkpoint_root.resolve()
                         )
                         trainer.campaign_hash = self.campaign_hash
                         trainer.external_cloud = bool(cloud_context)
-                    trainer.run()
+                        trainer.run()
                 finally:
                     trainer = None
                     _release_training_state()

@@ -91,13 +91,14 @@ class BaseDataArgs(BaseModel):
     datasets : dict[str, str]
         Mapping from benchmark dataset names to dataset configuration names.
         The trainer uses it to construct single-dataset or multitask loaders.
-    batch_size : int
-        Number of samples requested from each data loader per batch.
+    batch_size : int, optional, default=32
+        Requested global sample count for each optimizer update. Neural
+        trainers derive a per-rank micro-batch and accumulation count.
     num_workers : int
         Number of worker processes used by each PyTorch data loader.
     """
     datasets: Dict[str, str] = Field(default_factory=lambda: {})
-    batch_size: int = 32
+    batch_size: int = Field(default=32, ge=1)
     num_workers: int = 2
 
 
@@ -198,6 +199,36 @@ class EarlyStoppingArgs(BaseModel):
     min_delta: float = Field(default=0.0, ge=0.0)
 
 
+class AdaptiveBatchingArgs(BaseModel):
+    """Runtime CUDA micro-batch selection settings.
+
+    Parameters
+    ----------
+    enabled : bool, optional, default=True
+        Whether neural trainers may reduce their per-rank micro-batch and
+        derive gradient accumulation after a recoverable CUDA OOM.
+    memory_reserve_fraction : float, optional, default=0.15
+        Fraction of each CUDA device's total memory kept outside the training
+        process. This is a process usage ceiling, not a free-memory admission
+        requirement.
+    contention_wait_seconds : int, optional, default=300
+        Delay from zero through 300 seconds before the one permitted retry
+        when micro-batch one cannot fit. Zero retries immediately.
+    """
+
+    enabled: bool = True
+    memory_reserve_fraction: float = Field(
+        default=0.15,
+        ge=0.0,
+        lt=1.0,
+    )
+    contention_wait_seconds: int = Field(
+        default=300,
+        ge=0,
+        le=300,
+    )
+
+
 class BaseTrainingArgs(BaseModel):
     """Shared optimizer, schedule, precision, and adaptation settings.
 
@@ -234,6 +265,8 @@ class BaseTrainingArgs(BaseModel):
         LoRA targeting and optimization settings.
     early_stopping : EarlyStoppingArgs
         Validation-based stopping settings for ordinary training runs.
+    adaptive_batching : AdaptiveBatchingArgs
+        CUDA micro-batch estimation, reserve, and contention settings.
     """
     max_epochs: int = 100
     weight_decay: float = 0.01
@@ -254,6 +287,9 @@ class BaseTrainingArgs(BaseModel):
     lora: BaseLoRAArgs = Field(default_factory=BaseLoRAArgs)
     early_stopping: EarlyStoppingArgs = Field(
         default_factory=EarlyStoppingArgs
+    )
+    adaptive_batching: AdaptiveBatchingArgs = Field(
+        default_factory=AdaptiveBatchingArgs
     )
 
 

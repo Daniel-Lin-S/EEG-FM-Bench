@@ -4,14 +4,25 @@ Abstract trainer base class for baseline models.
 import csv
 import json
 import shutil
+from contextlib import nullcontext
 import datetime
 import os
+import math
 import logging
 import warnings
 from abc import ABC, abstractmethod
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import comet_ml
 import datasets
@@ -25,6 +36,11 @@ from torch.utils.data import DataLoader
 
 from baseline.abstract.adapter import AbstractDataLoaderFactory
 from baseline.abstract.config import AbstractConfig, BaseLoggingArgs
+from baseline.adaptive_batching import (
+    configure_cuda_allocator,
+    estimate_fixed_training_bytes,
+    profile_payload,
+)
 from baseline.utils.lora import (
     inject_lora, get_lora_state_dict, load_lora_state_dict, get_model_lora_targets
 )
@@ -159,6 +175,11 @@ class AbstractTrainer(ABC):
         self.external_distributed = False
         self.external_cloud = False
         self.training_result: Dict[str, Any] = {}
+        self.requested_global_batch_size = cfg.data.batch_size
+        self.micro_batch_size = cfg.data.batch_size
+        self.accumulation_steps = 1
+        self.adaptive_batch_profile: Dict[str, Any] = {}
+        self._runtime_batch_configured = False
 
         
         # LoRA tracking
@@ -264,6 +285,222 @@ class AbstractTrainer(ABC):
         self.validation_callback = validation_callback
         self.external_distributed = external_distributed
         self.external_cloud = external_cloud
+
+    def configure_runtime_batching(
+        self,
+        global_batch_size: int,
+        micro_batch_size: int,
+        world_size: int,
+    ) -> None:
+        """Configure one exact global-to-micro batch decomposition.
+
+        Parameters
+        ----------
+        global_batch_size : int
+            Requested samples across all ranks per optimizer update.
+        micro_batch_size : int
+            Samples loaded by each rank for one forward/backward pass.
+        world_size : int
+            Number of ranks participating in gradient synchronization.
+        """
+        if world_size <= 0:
+            raise ValueError(
+                f"Expected a positive world size, but got {world_size}."
+            )
+        denominator = micro_batch_size * world_size
+        if micro_batch_size <= 0 or global_batch_size % denominator != 0:
+            raise ValueError(
+                "The global batch must be divisible by micro_batch_size "
+                f"* world_size, but got {global_batch_size}, "
+                f"{micro_batch_size}, and {world_size}."
+            )
+        self.requested_global_batch_size = global_batch_size
+        self.micro_batch_size = micro_batch_size
+        self.accumulation_steps = global_batch_size // denominator
+        self.cfg.data.batch_size = micro_batch_size
+        if self.dataloader_factory is not None:
+            self.dataloader_factory.batch_size = micro_batch_size
+        self._runtime_batch_configured = True
+        self.adaptive_batch_profile.update({
+            "requested_global_batch_size": global_batch_size,
+            "world_size": world_size,
+            "micro_batch_size": micro_batch_size,
+            "accumulation_steps": self.accumulation_steps,
+        })
+
+    def _ensure_runtime_batching(self) -> None:
+        """Use accumulation one when no campaign override was supplied."""
+        if self._runtime_batch_configured:
+            return
+        if self.requested_global_batch_size % self.world_size != 0:
+            raise ValueError(
+                "data.batch_size must be divisible by the distributed "
+                f"world size, but got {self.requested_global_batch_size} "
+                f"and {self.world_size}."
+            )
+        micro_batch = self.requested_global_batch_size // self.world_size
+        self.configure_runtime_batching(
+            self.requested_global_batch_size,
+            micro_batch,
+            self.world_size,
+        )
+
+    def _configure_cuda_memory_limit(self) -> None:
+        """Apply and record this run's adaptive CUDA allocator ceiling."""
+        args = self.cfg.training.adaptive_batching
+        if not args.enabled or self.device.type != "cuda":
+            return
+        limit = configure_cuda_allocator(
+            self.device,
+            args.memory_reserve_fraction,
+        )
+        if limit is not None:
+            self.adaptive_batch_profile.update(limit.as_dict())
+
+    def _record_fixed_memory_estimate(self) -> None:
+        """Record analytical model, gradient, and optimizer memory."""
+        if self.model is None or self.optimizer is None:
+            raise RuntimeError(
+                "Model and optimizer are required for memory estimation."
+            )
+        fixed = estimate_fixed_training_bytes(
+            self.model,
+            self.optimizer,
+        )
+        self.adaptive_batch_profile = profile_payload(
+            self.adaptive_batch_profile,
+            fixed,
+        )
+        self._write_adaptive_batch_profile()
+
+    def _write_adaptive_batch_profile(self) -> None:
+        """Persist the current adaptive batching diagnostics."""
+        if not get_is_master() or not self.log_dir:
+            return
+        payload = dict(self.adaptive_batch_profile)
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            payload["measured_peak_allocated_bytes"] = int(
+                torch.cuda.max_memory_allocated(self.device)
+            )
+            payload["measured_peak_reserved_bytes"] = int(
+                torch.cuda.max_memory_reserved(self.device)
+            )
+        path = Path(self.log_dir) / "adaptive_batching.json"
+        temporary = path.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps(payload, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+
+    def _move_batch_to_device(
+        self,
+        batch: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """Move tensor values in one loader batch to the training device.
+
+        Parameters
+        ----------
+        batch : Mapping[str, Any]
+            Loader batch containing tensor and metadata values.
+
+        Returns
+        -------
+        dict[str, Any]
+            New batch mapping whose tensor values reside on ``self.device``.
+        """
+        return {
+            key: value.to(self.device)
+            if isinstance(value, torch.Tensor)
+            else value
+            for key, value in batch.items()
+        }
+
+    def calibrate_cuda_memory(self) -> Dict[str, Any]:
+        """Measure one disposable micro-batch update on the current rank.
+
+        Returns
+        -------
+        dict[str, Any]
+            Analytical fixed-memory values, allocator limits, and measured
+            CUDA peaks for the calibration update.
+
+        Raises
+        ------
+        RuntimeError
+            If calibration is requested without CUDA or training data.
+        """
+        seed_torch(self.cfg.seed)
+        self.setup_distributed()
+        self._ensure_runtime_batching()
+        self._configure_cuda_memory_limit()
+        if self.device.type != "cuda" or not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA memory calibration requires an available CUDA device."
+            )
+
+        if self.multitask:
+            self.collect_dataset_info(mixed=True)
+            model = self.setup_model()
+            train_loader, _ = self.create_dataloader(
+                datasets.Split.TRAIN
+            )
+        else:
+            if not self.ds_conf:
+                raise RuntimeError(
+                    "CUDA calibration requires at least one dataset."
+                )
+            dataset_name, dataset_config = next(iter(self.ds_conf.items()))
+            self.current_dataset = dataset_name
+            self.collect_dataset_info(
+                mixed=False,
+                ds_name=dataset_name,
+            )
+            model = self.setup_model()
+            train_loader, _ = self.create_single_dataloader(
+                dataset_name,
+                dataset_config,
+                datasets.Split.TRAIN,
+            )
+        if not isinstance(train_loader, DataLoader):
+            raise TypeError(
+                "CUDA calibration expected train_loader to be a DataLoader."
+            )
+        self.setup_optimizer_and_scheduler(model, train_loader)
+        try:
+            raw_batch = next(iter(train_loader))
+        except StopIteration as exc:
+            raise RuntimeError(
+                "CUDA calibration cannot use an empty training loader."
+            ) from exc
+        batch = self._move_batch_to_device(raw_batch)
+        labels = batch.get("label")
+        if not isinstance(labels, torch.Tensor) or labels.shape[0] <= 0:
+            raise RuntimeError(
+                "CUDA calibration requires a non-empty tensor label batch."
+            )
+        sample_count = int(labels.shape[0])
+        self.model.train()
+        self.optimizer.zero_grad()
+        _, loss = self.train_step(batch, labels)
+        if not torch.isfinite(loss):
+            raise ValueError(
+                "CUDA calibration produced a non-finite training loss: "
+                f"{loss.detach().item()}."
+            )
+        self.scaler.scale(loss * sample_count).backward()
+        self._finish_accumulated_update(sample_count)
+        torch.cuda.synchronize(self.device)
+        self.adaptive_batch_profile.update({
+            "calibration_batch_size": sample_count,
+            "calibration_peak_allocated_bytes": int(
+                torch.cuda.max_memory_allocated(self.device)
+            ),
+            "calibration_peak_reserved_bytes": int(
+                torch.cuda.max_memory_reserved(self.device)
+            ),
+        })
+        return dict(self.adaptive_batch_profile)
 
     def get_train_io_path(
         self,
@@ -1107,8 +1344,11 @@ class AbstractTrainer(ABC):
         scaler = torch.amp.GradScaler(enabled=self.cfg.training.use_amp)
 
         # Learning rate scheduler
-        warmup_steps = len(train_loader) * self.cfg.training.warmup_epochs
-        total_steps = len(train_loader) * self.cfg.training.max_epochs
+        updates_per_epoch = math.ceil(
+            len(train_loader) / self.accumulation_steps
+        )
+        warmup_steps = updates_per_epoch * self.cfg.training.warmup_epochs
+        total_steps = updates_per_epoch * self.cfg.training.max_epochs
 
         if self.cfg.training.lr_schedule == 'onecycle':
             scheduler = torch.optim.lr_scheduler.OneCycleLR(
@@ -1140,6 +1380,7 @@ class AbstractTrainer(ABC):
         self.optimizer = optimizer
         self.scaler = scaler
         self.scheduler = scheduler
+        self._record_fixed_memory_estimate()
 
     def debug_params_grad(self):
         for name, param in self.model.named_parameters():
@@ -1484,78 +1725,172 @@ class AbstractTrainer(ABC):
         loss = self.loss_fn(logits, labels)
         return logits, loss
 
-    def train_epoch(self, train_loader: DataLoader, train_sampler: DistributedGroupBatchSampler):
+    def _finish_accumulated_update(self, local_samples: int) -> float:
+        """Normalize accumulated gradients and perform one optimizer update."""
+        sample_tensor = torch.tensor(
+            float(local_samples),
+            dtype=torch.float64,
+            device=self.device,
+        )
+        is_distributed = (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        )
+        if is_distributed:
+            torch.distributed.all_reduce(
+                sample_tensor,
+                op=torch.distributed.ReduceOp.SUM,
+            )
+        global_samples = float(sample_tensor.item())
+        if global_samples <= 0:
+            raise ValueError(
+                "Expected a positive accumulated sample count, but got "
+                f"{global_samples}."
+            )
+        gradient_denominator = global_samples / self.world_size
+        for parameter in self.model.parameters():
+            if parameter.grad is not None:
+                parameter.grad.div_(gradient_denominator)
+        self.scaler.unscale_(self.optimizer)
+        grad_norm = self._clip_grad_norm_(already_unscaled=True)
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+        return grad_norm
+
+    def _log_accumulated_update(
+        self,
+        loss_sum: Tensor,
+        correct_sum: Tensor,
+        local_samples: int,
+        grad_norm: float,
+        dataset_name: str,
+    ) -> None:
+        """Log sample-weighted statistics for one optimizer update."""
+        if self.current_step % self.cfg.logging.log_step_interval != 0:
+            return
+        sample_tensor = torch.tensor(
+            float(local_samples),
+            dtype=torch.float64,
+            device=self.device,
+        )
+        is_distributed = (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        )
+        if is_distributed:
+            for tensor in (loss_sum, correct_sum, sample_tensor):
+                torch.distributed.all_reduce(
+                    tensor,
+                    op=torch.distributed.ReduceOp.SUM,
+                )
+        sample_count = float(sample_tensor.item())
+        if sample_count <= 0:
+            raise ValueError("Cannot log an empty optimizer update.")
+        if not get_is_master():
+            return
+        log_data = {
+            "train/epoch": self.epoch,
+            "train/step": self.current_step,
+            "train/loss_ce": float(loss_sum.item() / sample_count),
+            "train/acc": float(correct_sum.item() / sample_count),
+            "train/grad_norm": grad_norm,
+            "train/header_lr": self.get_current_lr()[0],
+        }
+        if not self.cfg.training.freeze_encoder:
+            log_data["train/encoder_lr"] = self.get_current_lr()[-1]
+        if not self.multitask:
+            log_data = {
+                f"{dataset_name}/{key}": value
+                for key, value in log_data.items()
+            }
+        if self.cfg.logging.use_cloud:
+            self._log_to_cloud(log_data)
+        self._log_to_tensorboard(log_data, self.current_step)
+        self._write_csv_metrics(log_data, self.current_step)
+        logger.info(format_console_log_dict(log_data, prefix="train"))
+
+    def _run_accumulated_epoch(
+        self,
+        train_loader: DataLoader,
+        train_sampler: DistributedGroupBatchSampler,
+        update_hook: Callable[[], None],
+    ) -> None:
+        """Train an epoch with sample-normalized gradient accumulation."""
+        train_sampler.set_epoch(self.epoch)
+        self.optimizer.zero_grad()
+        local_samples = 0
+        loss_sum = torch.zeros((), dtype=torch.float64, device=self.device)
+        correct_sum = torch.zeros(
+            (),
+            dtype=torch.float64,
+            device=self.device,
+        )
+        dataset_name = "multitask"
+        total_micro_batches = len(train_loader)
+        for micro_step, batch in enumerate(train_loader):
+            batch = self._move_batch_to_device(batch)
+            labels = batch["label"]
+            dataset_name = batch["montage"][0].split("/")[0]
+            sample_count = int(labels.shape[0])
+            if sample_count <= 0:
+                raise ValueError("Training produced an empty micro-batch.")
+            update_boundary = (
+                (micro_step + 1) % self.accumulation_steps == 0
+                or micro_step + 1 == total_micro_batches
+            )
+            sync_context = nullcontext()
+            if not update_boundary and hasattr(self.model, "no_sync"):
+                sync_context = self.model.no_sync()
+            with sync_context:
+                logits, loss = self.train_step(batch, labels)
+                if not torch.isfinite(loss):
+                    raise ValueError(
+                        "Training loss is not finite at optimizer step "
+                        f"{self.current_step}: {loss.detach().item()}."
+                    )
+                self.scaler.scale(loss * sample_count).backward()
+            predictions = torch.argmax(logits.detach(), dim=-1)
+            loss_sum += loss.detach().double() * sample_count
+            correct_sum += (
+                predictions == labels
+            ).sum().detach().double()
+            local_samples += sample_count
+            if not update_boundary:
+                continue
+            grad_norm = self._finish_accumulated_update(local_samples)
+            self._log_accumulated_update(
+                loss_sum,
+                correct_sum,
+                local_samples,
+                grad_norm,
+                dataset_name,
+            )
+            self.current_step += 1
+            update_hook()
+            self.optimizer.zero_grad()
+            local_samples = 0
+            loss_sum.zero_()
+            correct_sum.zero_()
+
+    def train_epoch(
+        self,
+        train_loader: DataLoader,
+        train_sampler: DistributedGroupBatchSampler,
+    ) -> None:
+        """Train one epoch using the configured adaptive micro-batch."""
         self.model.train()
         if self.cfg.training.freeze_encoder:
-            if torch.distributed.is_available() and torch.distributed.is_initialized():
-                self.model.module.encoder.eval()
-            else:
-                self.model.encoder.eval()
-
-        train_sampler.set_epoch(self.epoch)
-
-        batch: dict
-        for step_in_epoch, batch in enumerate(train_loader):
-            self.optimizer.zero_grad()
-
-            batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-            labels = batch['label']
-            ds_name = batch['montage'][0].split('/')[0]
-
-            # Forward pass with mixed precision
-            logits, loss = self.train_step(batch, labels)
-
-            # Check for NaN loss
-            if torch.isnan(loss):
-                logger.warning(f"NaN loss detected at step {self.current_step}")
-
-            # Backward pass
-            self.scaler.scale(loss).backward()
-            grad_norm = self._clip_grad_norm_()
-
-            # Optimizer step
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-
-            # Logging with distributed reduction
-            if self.current_step % self.cfg.logging.log_step_interval == 0:
-                # Calculate step accuracy
-                preds = torch.argmax(logits, dim=-1)
-                step_acc = (preds == labels).float().mean()
-
-                # Create tensors for distributed reduction
-                loss_tensor = loss.clone().detach()
-                acc_tensor = step_acc.clone().detach()
-
-                torch.distributed.all_reduce(loss_tensor, op=torch.distributed.ReduceOp.AVG)
-                torch.distributed.all_reduce(acc_tensor, op=torch.distributed.ReduceOp.AVG)
-
-                if get_is_master():
-                    log_data = {
-                        'train/epoch': self.epoch,
-                        'train/step': self.current_step,
-                        'train/loss_ce': loss_tensor.cpu().item(),
-                        'train/acc': acc_tensor.cpu().item(),
-                        'train/grad_norm': grad_norm,
-                        'train/header_lr': self.get_current_lr()[0],
-                    }
-
-                    if not self.cfg.training.freeze_encoder:
-                        log_data['train/encoder_lr'] = self.get_current_lr()[-1]
-
-                    if not self.multitask:
-                        log_data = {f"{ds_name}/{key}": value for key, value in log_data.items()}
-
-                    # Log to cloud services
-                    if self.cfg.logging.use_cloud:
-                        self._log_to_cloud(log_data)
-                    self._log_to_tensorboard(log_data, self.current_step)
-                    self._write_csv_metrics(log_data, self.current_step)
-
-                    logger.info(format_console_log_dict(log_data, prefix='train'))
-
-            self.current_step += 1
-            self.scheduler.step()
+            encoder = (
+                self.model.module.encoder
+                if hasattr(self.model, "module")
+                else self.model.encoder
+            )
+            encoder.eval()
+        self._run_accumulated_epoch(
+            train_loader,
+            train_sampler,
+            self.scheduler.step,
+        )
 
     def eval_step(self, batch, labels):
         with torch.amp.autocast('cuda', enabled=self.cfg.training.use_amp, dtype=torch.bfloat16):
@@ -2030,6 +2365,8 @@ class AbstractTrainer(ABC):
         """Execute one seed-scoped neural training run."""
         seed_torch(self.cfg.seed)
         self.setup_distributed()
+        self._ensure_runtime_batching()
+        self._configure_cuda_memory_limit()
         self.setup_logging()
         self.init_tensorboard_logging()
         self.init_cloud_logging()
@@ -2050,6 +2387,7 @@ class AbstractTrainer(ABC):
             self.training_result = result
             return result
         finally:
+            self._write_adaptive_batch_profile()
             self._close_csv_writer()
             self.finish_cloud_logging()
             self.finish_tensorboard_logging()

@@ -210,9 +210,12 @@ class HpoConfig(BaseModel):
         Non-negative training and data-loader seed used by every HPO trial.
         This value is independent of top-level evaluation seeds.
     n_trials : int or None, optional, default=None
-        Positive total attempted-trial target for each study. This value is
-        required when ``enabled`` is true. Existing complete, pruned, and
-        failed trials count toward the target when a SQLite study resumes.
+        Positive complete-or-pruned trial target for each study. This value is
+        required when ``enabled`` is true. Failed trials remain diagnostic and
+        do not consume the target when a SQLite study resumes.
+    max_consecutive_failed_trials : int, optional, default=5
+        Positive terminal-failure streak that aborts an invalid study. A
+        complete or pruned trial resets the streak.
     objective : HpoObjectiveArgs, optional, default=HpoObjectiveArgs()
         Validation metric, direction, and multitask reduction used to score
         trials.
@@ -230,6 +233,10 @@ class HpoConfig(BaseModel):
     enabled: bool = False
     seed: int = Field(default=0, ge=0)
     n_trials: Optional[int] = Field(default=None, ge=1)
+    max_consecutive_failed_trials: int = Field(
+        default=5,
+        ge=1,
+    )
     objective: HpoObjectiveArgs = Field(default_factory=HpoObjectiveArgs)
     sampler: TpeSamplerArgs = Field(default_factory=TpeSamplerArgs)
     pruner: MedianPrunerArgs = Field(default_factory=MedianPrunerArgs)

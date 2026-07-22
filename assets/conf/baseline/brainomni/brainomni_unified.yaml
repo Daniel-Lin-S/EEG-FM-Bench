@@ -62,6 +62,11 @@ training:
     patience: 5
     min_delta: 0.0
 
+  adaptive_batching:
+    enabled: true
+    memory_reserve_fraction: 0.15
+    contention_wait_seconds: 300
+
   # LoRA configuration
   lora:
     use_lora: false
@@ -101,6 +106,7 @@ hpo:
   enabled: true
   seed: 0
   n_trials: 50
+  max_consecutive_failed_trials: 5
 
   objective:
     metric: loss
