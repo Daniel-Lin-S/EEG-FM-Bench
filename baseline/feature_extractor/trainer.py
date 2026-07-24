@@ -35,11 +35,16 @@ from baseline.feature_extractor.classifier import (
     FeatureClassifier,
     ValidationSelectedRidgeClassifier,
 )
+from baseline.feature_extractor.artifacts import (
+    require_single_seed,
+    resolve_feature_extractor_log_path,
+)
 from baseline.feature_extractor.config import FeatureExtractorConfig
 from baseline.feature_extractor.pipeline import FeatureExtractionPipeline
+from baseline.feature_extractor.summary import write_feature_extractor_summary
 from baseline.hpo.artifacts import check_completion_compatibility
 from baseline.utils.common import seed_torch
-from baseline.utils.identity import IDENTITY_VERSION, short_identity
+from baseline.utils.identity import IDENTITY_VERSION
 from baseline.utils.run_artifacts import get_config_hash, save_resolved_config
 from common.distributed.env import get_is_master, get_world_size
 from common.log import setup_log
@@ -122,28 +127,23 @@ class FeatureExtractorTrainer(AbstractTrainer, ABC):
         if not get_is_master():
             return "", ""
 
+        require_single_seed(self.cfg)
         config = self.cfg.model_dump(mode="json")
         self.execution_id = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
         self.execution_id = f"{self.execution_id}-{os.getpid()}"
         if self.log_dir_override is not None:
             log_path = self.log_dir_override
+            reused_artifact_root = False
         else:
-            config_hash = get_config_hash(config, multitask=False)
-            experiment_name = (
-                f"{args.experiment_name}-{short_identity(config_hash)}"
-            )
-            log_path = Path(
-                args.run_dir,
-                "log",
-                "baseline",
-                self.model_type,
-                experiment_name,
+            log_path, reused_artifact_root = (
+                resolve_feature_extractor_log_path(self.cfg)
             )
         log_path.mkdir(parents=True, exist_ok=True)
-        save_resolved_config(
-            config,
-            log_path / "configs" / f"{self.execution_id}.yaml",
-        )
+        if not reused_artifact_root:
+            save_resolved_config(
+                config,
+                log_path / "configs" / f"{self.execution_id}.yaml",
+            )
         return str(log_path.resolve()), ""
 
     def setup_logging(self):
@@ -620,5 +620,18 @@ class FeatureExtractorTrainer(AbstractTrainer, ABC):
 
         self.finish_cloud_logging()
         self.finish_tensorboard_logging()
+        if get_is_master():
+            self._write_summary()
         logger.info("%s evaluation completed successfully.", self.model_type)
+
+    def _write_summary(self) -> None:
+        """Write one-seed campaign-compatible extractor summary tables."""
+        require_single_seed(self.cfg)
+        write_feature_extractor_summary(
+            Path(self.log_dir),
+            self.model_type,
+            self.cfg.seed,
+            self.ds_conf,
+            self._resolved_config_hash(),
+        )
 import os

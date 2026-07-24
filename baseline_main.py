@@ -42,6 +42,7 @@ from baseline.abstract.factory import ModelRegistry
 from baseline.hpo.config import HpoConfig
 from baseline.hpo.orchestrator import CampaignRunner
 from baseline.registry import register_builtin_models
+from baseline.utils.identity import DETERMINISTIC_MODEL_TYPES
 from common.path import get_conf_file_path
 from common.utils import setup_yaml
 
@@ -141,11 +142,32 @@ def _load_configs() -> tuple[type[Any], Any, HpoConfig]:
     return config_class, cfg, hpo_config
 
 
+def _run_feature_extractor(config: Any, hpo_config: HpoConfig) -> None:
+    """Run one deterministic extractor outside the multi-seed campaign path."""
+    if len(config.seeds) != 1:
+        raise ValueError(
+            f"{config.model_type} supports exactly one deterministic seed, "
+            f"but got {config.seeds}."
+        )
+    if hpo_config.enabled:
+        warnings.warn(
+            f"{config.model_type} is deterministic; ignoring the configured "
+            "HPO section.",
+            UserWarning,
+            stacklevel=2,
+        )
+    trainer = ModelRegistry.create_trainer(config)
+    trainer.run()
+
+
 def main() -> None:
     """Run one validated baseline campaign."""
     register_builtin_models()
     setup_yaml()
     config_class, config, hpo_config = _load_configs()
+    if config.model_type in DETERMINISTIC_MODEL_TYPES:
+        _run_feature_extractor(config, hpo_config)
+        return
     CampaignRunner(config, hpo_config, config_class).run()
 
 

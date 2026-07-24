@@ -1,5 +1,6 @@
 """Unit tests for sklearn EEG feature-extractor baselines."""
 
+import json
 import sys
 import types
 from pathlib import Path
@@ -7,7 +8,9 @@ from typing import Any
 
 import numpy as np
 import pytest
+import yaml
 
+import baseline_main
 from baseline.catch22.catch22_config import Catch22Config
 from baseline.catch22.catch22_trainer import Catch22Trainer
 import baseline.catch22.extractor as catch22_extractor_module
@@ -22,9 +25,16 @@ from baseline.feature_extractor.classifier import (
     RidgeClassifierArgs,
     ValidationSelectedRidgeClassifier,
 )
+from baseline.feature_extractor.artifacts import (
+    find_matching_artifact_root,
+)
 from baseline.feature_extractor.extractor import EEGFeatureExtractor
 from baseline.feature_extractor.pipeline import FeatureExtractionPipeline
+from baseline.feature_extractor.summary import (
+    write_feature_extractor_summary,
+)
 from baseline.feature_extractor.trainer import FeatureExtractorTrainer
+from baseline.hpo.config import HpoConfig
 from baseline.minirocket.minirocket_config import MiniRocketConfig
 from baseline.minirocket.minirocket_trainer import MiniRocketTrainer
 from baseline.utils.run_artifacts import load_final_checkpoint
@@ -392,6 +402,157 @@ def test_no_checkpoint_completion_skips_and_reports_clear_error(tmp_path):
     assert trainer._dataset_is_complete(DATASET_NAME, DATASET_CONFIG)
     with pytest.raises(FileNotFoundError, match="does not support checkpoint"):
         load_final_checkpoint(tmp_path, DATASET_NAME)
+
+
+def _write_feature_completion(
+    artifact_root: Path,
+    test_metrics: dict[str, float],
+) -> None:
+    """Write one completed deterministic extractor result for tests."""
+    trainer = MeanFeatureTrainer(make_config())
+    trainer.log_dir = str(artifact_root)
+    trainer.execution_id = "test-run"
+    trainer.final_validation_metrics[DATASET_NAME] = {
+        f"{DATASET_NAME}/eval/balanced_acc": 0.5,
+    }
+    trainer.final_test_metrics[DATASET_NAME] = test_metrics
+    trainer._write_completion(DATASET_NAME, DATASET_CONFIG)
+
+
+def test_feature_summary_has_campaign_csv_schema_without_std(tmp_path):
+    """One-seed extractor summaries omit neural fields and standard deviation."""
+    test_metrics = {
+        f"{DATASET_NAME}/test/acc": 0.6,
+        f"{DATASET_NAME}/test/balanced_acc": 0.55,
+    }
+    _write_feature_completion(tmp_path, test_metrics)
+
+    write_feature_extractor_summary(
+        tmp_path,
+        "catch22",
+        42,
+        {DATASET_NAME: DATASET_CONFIG},
+        "config-identity",
+    )
+
+    test_runs = (tmp_path / "summary" / "test_runs.csv").read_text(
+        encoding="utf-8"
+    )
+    test_summary = (tmp_path / "summary" / "test_summary.csv").read_text(
+        encoding="utf-8"
+    )
+    status = json.loads(
+        (tmp_path / "summary" / "summary.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert test_runs.splitlines()[0] == "dataset,seed,metric,value"
+    assert test_summary.splitlines()[0] == (
+        "dataset,metric,count,mean,median"
+    )
+    assert "std" not in test_summary
+    assert "epoch" not in test_runs
+    assert "loss" not in test_runs
+    assert status["status"] == "complete"
+    assert status["dataset_pairs"]["completed"] == 1
+
+
+def test_feature_summary_rejects_neural_test_metrics(tmp_path):
+    """Feature summaries reject neural-only metrics instead of exporting them."""
+    _write_feature_completion(
+        tmp_path,
+        {f"{DATASET_NAME}/test/loss": 1.0},
+    )
+
+    with pytest.raises(ValueError, match="neural-only"):
+        write_feature_extractor_summary(
+            tmp_path,
+            "catch22",
+            42,
+            {DATASET_NAME: DATASET_CONFIG},
+            "config-identity",
+        )
+
+
+def test_matching_artifact_root_normalizes_legacy_scalar_seed(tmp_path):
+    """Existing scalar-seed extractor artifacts are reused on rerun."""
+    config = make_config()
+    config.logging.run_dir = str(tmp_path)
+    artifact_root = (
+        tmp_path
+        / "log"
+        / "baseline"
+        / "catch22"
+        / "catch22-legacy"
+    )
+    config_path = artifact_root / "configs" / "legacy.yaml"
+    config_path.parent.mkdir(parents=True)
+    saved_config = config.model_dump(mode="json")
+    saved_config["seed"] = saved_config.pop("seeds")[0]
+    config_path.write_text(
+        yaml.safe_dump(saved_config, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    assert find_matching_artifact_root(config) == artifact_root
+
+
+def test_matching_artifact_root_rejects_ambiguity(tmp_path):
+    """Reruns fail instead of selecting between matching legacy roots."""
+    config = make_config()
+    config.logging.run_dir = str(tmp_path)
+    for suffix in ("first", "second"):
+        config_path = (
+            tmp_path
+            / "log"
+            / "baseline"
+            / "catch22"
+            / suffix
+            / "configs"
+            / "legacy.yaml"
+        )
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(
+            yaml.safe_dump(config.model_dump(mode="json"), sort_keys=False),
+            encoding="utf-8",
+        )
+
+    with pytest.raises(RuntimeError, match="Multiple feature-extractor"):
+        find_matching_artifact_root(config)
+
+
+def test_all_skipped_feature_rerun_writes_summary(tmp_path):
+    """Completed extractor datasets are skipped while their summary refreshes."""
+    config = make_config()
+    trainer = MeanFeatureTrainer(config)
+    trainer.log_dir = str(tmp_path)
+    trainer.execution_id = "completed-run"
+    trainer.final_validation_metrics[DATASET_NAME] = {
+        f"{DATASET_NAME}/eval/balanced_acc": 0.5,
+    }
+    trainer.final_test_metrics[DATASET_NAME] = {
+        f"{DATASET_NAME}/test/balanced_acc": 0.5,
+    }
+    trainer._write_completion(DATASET_NAME, DATASET_CONFIG)
+
+    rerun = MeanFeatureTrainer(config)
+    rerun.log_dir_override = tmp_path
+    rerun.fit_extractor = lambda _: pytest.fail("Extractor must be skipped")
+    rerun.run()
+
+    assert (tmp_path / "summary" / "test_runs.csv").is_file()
+    assert (tmp_path / "summary" / "test_summary.csv").is_file()
+    assert (tmp_path / "summary" / "summary.json").is_file()
+
+
+def test_feature_entry_point_requires_one_seed():
+    """The direct feature-extractor path rejects repeated seeds."""
+    config = make_config()
+    config.seeds = [42, 43]
+
+    with pytest.raises(ValueError, match="exactly one deterministic seed"):
+        baseline_main._run_feature_extractor(config, HpoConfig())
 
 
 def test_feature_matrix_validation_rejects_nan():
