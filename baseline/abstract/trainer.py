@@ -174,6 +174,9 @@ class AbstractTrainer(ABC):
         self.latest_eval_counts: Dict[str, int] = {}
         self.run_mode = "legacy"
         self.campaign_hash: Optional[str] = None
+        self.selection_provenance: Optional[Mapping[str, Any]] = None
+        self.campaign_invocation_id: Optional[str] = None
+        self.checkpoint_cleanup_failures: List[str] = []
         self.campaign_aliases: frozenset[str] = frozenset()
         self.log_dir_override: Optional[Path] = None
         self.ckpt_dir_override: Optional[Path] = None
@@ -280,11 +283,13 @@ class AbstractTrainer(ABC):
         run_mode: str,
         campaign_aliases: Optional[Iterable[str]] = None,
         validation_callback: Optional[Callable[..., bool]] = None,
+        selection_provenance: Optional[Mapping[str, Any]] = None,
+        invocation_id: Optional[str] = None,
         external_distributed: bool = False,
         external_cloud: bool = False,
     ) -> None:
         """Configure one campaign-controlled trainer execution."""
-        if run_mode not in {"hpo", "final"}:
+        if run_mode not in {"hpo", "final", "recovery"}:
             raise ValueError(f"Unsupported managed run mode: {run_mode}.")
         self.log_dir_override = log_dir.resolve()
         self.ckpt_dir_override = checkpoint_dir.resolve()
@@ -295,6 +300,10 @@ class AbstractTrainer(ABC):
         self.run_mode = run_mode
         self.validation_callback = validation_callback
         self.external_distributed = external_distributed
+        self.selection_provenance = (
+            dict(selection_provenance) if selection_provenance else None
+        )
+        self.campaign_invocation_id = invocation_id
         self.external_cloud = external_cloud
 
     def configure_runtime_batching(
@@ -589,12 +598,19 @@ class AbstractTrainer(ABC):
                 completion_path,
             )
             return False
-        checkpoint_path = completion.get("checkpoint_path")
+        metrics = completion.get("test_metrics")
+        numeric_metrics = [] if not isinstance(metrics, dict) else [
+            float(value)
+            for value in metrics.values()
+            if isinstance(value, (int, float))
+            and not isinstance(value, bool)
+        ]
         compatible = (
             completion.get("dataset_config") == ds_config
             and completion.get("status") == "completed"
-            and isinstance(checkpoint_path, str)
-            and Path(checkpoint_path).is_file()
+            and completion.get("config_hash") == self._resolved_config_hash()
+            and bool(numeric_metrics)
+            and all(math.isfinite(value) for value in numeric_metrics)
         )
         if self.campaign_hash is None:
             return compatible
@@ -610,29 +626,146 @@ class AbstractTrainer(ABC):
         """Remove stale traces before retrying a dataset."""
         if not get_is_master():
             return
-        if self._has_output('csv'):
-            csv_path = Path(self.log_dir, 'csv', f'{ds_name}.csv')
-            csv_path.parent.mkdir(parents=True, exist_ok=True)
-            csv_path.unlink(missing_ok=True)
-        if self._has_output('tensorboard'):
-            tensorboard_path = Path(self.log_dir, 'tensorboard', ds_name)
-            if tensorboard_path.exists():
-                shutil.rmtree(tensorboard_path)
+        self._completion_path(ds_name).unlink(missing_ok=True)
+        csv_path = Path(self.log_dir, 'csv', f'{ds_name}.csv')
+        csv_path.unlink(missing_ok=True)
+        tensorboard_path = Path(self.log_dir, 'tensorboard', ds_name)
+        if tensorboard_path.exists():
+            shutil.rmtree(tensorboard_path)
+        checkpoint_dir = self._checkpoint_scope_directory(ds_name)
+        if checkpoint_dir.exists():
+            shutil.rmtree(checkpoint_dir)
 
-    def _open_csv_writer(self, ds_name: str) -> None:
-        """Open one overwriteable metric CSV trace."""
+    def _reset_unified_outputs(self) -> None:
+        """Remove incomplete shared-run artifacts before epoch-zero restart."""
+        if not get_is_master():
+            return
+        had_artifacts = False
+        for dataset_name in self.ds_conf:
+            completion_path = self._completion_path(dataset_name)
+            had_artifacts = had_artifacts or completion_path.exists()
+            completion_path.unlink(missing_ok=True)
+            tensorboard_path = Path(
+                self.log_dir,
+                "tensorboard",
+                dataset_name,
+            )
+            if tensorboard_path.exists():
+                had_artifacts = True
+                shutil.rmtree(tensorboard_path)
+        csv_path = Path(self.log_dir, "csv", "training.csv")
+        had_artifacts = had_artifacts or csv_path.exists()
+        csv_path.unlink(missing_ok=True)
+        checkpoint_dir = self._checkpoint_scope_directory(None)
+        if checkpoint_dir.exists():
+            had_artifacts = True
+            shutil.rmtree(checkpoint_dir)
+        if had_artifacts:
+            logger.warning(
+                "Reset incomplete multitask artifacts before restarting at "
+                "epoch 0 under %s.",
+                Path(self.log_dir).resolve(),
+            )
+
+    def _checkpoint_scope_directory(
+        self,
+        ds_name: Optional[str],
+    ) -> Path:
+        """Return the checkpoint directory for one training scope.
+
+        Parameters
+        ----------
+        ds_name : str or None
+            Dataset name for separate training, or ``None`` for multitask.
+
+        Returns
+        -------
+        pathlib.Path
+            Directory containing temporary and retained scope checkpoints.
+        """
+        if ds_name is None:
+            return Path(self.ckpt_dir, "unified")
+        return Path(self.ckpt_dir, "seperated", ds_name)
+
+    def _cleanup_checkpoint_artifacts(
+        self,
+        ds_name: Optional[str],
+        best_checkpoint: Path,
+    ) -> list[str]:
+        """Remove temporary checkpoints and return cleanup failures.
+
+        Parameters
+        ----------
+        ds_name : str or None
+            Dataset name for separate training, or ``None`` for multitask.
+        best_checkpoint : pathlib.Path
+            Validation-best checkpoint used for final evaluation.
+
+        Returns
+        -------
+        list[str]
+            Absolute paths that could not be removed.
+        """
+        if not get_is_master():
+            return []
+        scope_dir = self._checkpoint_scope_directory(ds_name)
+        if not scope_dir.exists():
+            return []
+        retained = {best_checkpoint.resolve()}
+        targets = [scope_dir]
+        if self.cfg.logging.save_checkpoints:
+            targets = [
+                path
+                for path in scope_dir.iterdir()
+                if path.resolve() not in retained
+            ]
+        failures: list[str] = []
+        for target in targets:
+            try:
+                if target.is_dir():
+                    shutil.rmtree(target)
+                else:
+                    target.unlink(missing_ok=True)
+            except OSError as exc:
+                resolved = str(target.resolve())
+                failures.append(resolved)
+                logger.warning(
+                    "Checkpoint cleanup failed at %s: %s",
+                    resolved,
+                    exc,
+                )
+        self.checkpoint_cleanup_failures.extend(failures)
+        return failures
+
+    def _open_csv_writer(
+        self,
+        ds_name: str,
+        append: bool = False,
+    ) -> None:
+        """Open one metric CSV trace for replacement or recovery.
+
+        Parameters
+        ----------
+        ds_name : str
+            Dataset name or the shared ``training`` trace name.
+        append : bool, optional, default=False
+            Whether to preserve an existing trace and append new events.
+        """
         if not self._has_output('csv') or not get_is_master():
             return
         self._close_csv_writer()
         csv_path = Path(self.log_dir, 'csv', f'{ds_name}.csv')
         csv_path.parent.mkdir(parents=True, exist_ok=True)
-        self.csv_file = csv_path.open('w', newline='', encoding='utf-8')
+        mode = 'a' if append and csv_path.is_file() else 'w'
+        write_header = mode == 'w' or csv_path.stat().st_size == 0
+        self.csv_file = csv_path.open(mode, newline='', encoding='utf-8')
         self.csv_writer = csv.DictWriter(
             self.csv_file,
             fieldnames=['timestamp', 'dataset', 'split', 'epoch', 'step',
                         'metric', 'value'],
         )
-        self.csv_writer.writeheader()
+        if write_header:
+            self.csv_writer.writeheader()
 
     def _close_csv_writer(self) -> None:
         """Flush and close the active metric CSV writer."""
@@ -683,6 +816,10 @@ class AbstractTrainer(ABC):
                 "test and validation metrics."
             )
         completion_path = self._completion_path(ds_name)
+        retain_checkpoint = self.cfg.logging.save_checkpoints
+        stored_checkpoint = (
+            str(checkpoint_path.resolve()) if retain_checkpoint else None
+        )
         completion_path.parent.mkdir(parents=True, exist_ok=True)
         content = {
             'status': 'completed',
@@ -693,7 +830,11 @@ class AbstractTrainer(ABC):
             'config_hash_version': COMPLETION_CONFIG_HASH_VERSION,
             'dataset_config': ds_config,
             'execution_id': self.execution_id,
-            'checkpoint_path': str(checkpoint_path.resolve()),
+            'invocation_id': self.campaign_invocation_id,
+            'has_checkpoint': retain_checkpoint,
+            'checkpoint_path': stored_checkpoint,
+            'checkpoint_retention_requested': retain_checkpoint,
+            'selection_provenance': self.selection_provenance,
             'validation_metrics': validation_metrics,
             'test_metrics': metrics,
             'completed_at': datetime.datetime.now().isoformat(),
@@ -2200,6 +2341,13 @@ class AbstractTrainer(ABC):
                 "model_state_dict mapping."
             )
         self.model.load_state_dict(state_dict)
+        epoch = checkpoint.get("epoch")
+        if isinstance(epoch, int) and not isinstance(epoch, bool):
+            if epoch < 0:
+                raise ValueError(
+                    "Training checkpoint epoch cannot be negative."
+                )
+            self.epoch = epoch
 
     def _broadcast_bool(self, value: bool) -> bool:
         """Broadcast one master-process decision to every training rank."""
@@ -2456,6 +2604,122 @@ class AbstractTrainer(ABC):
             if not self.external_distributed:
                 clean_torch_distributed(self.local_rank)
 
+    def recover_multitask_datasets(
+        self,
+        dataset_names: Iterable[str],
+        checkpoint_path: Path,
+    ) -> Dict[str, Any]:
+        """Evaluate missing multitask datasets from one retained best state.
+
+        Parameters
+        ----------
+        dataset_names : Iterable[str]
+            Missing datasets whose existing compatible peers stay untouched.
+        checkpoint_path : pathlib.Path
+            Retained shared validation-best training checkpoint.
+
+        Returns
+        -------
+        dict[str, Any]
+            Recovered validation/test metrics and cleanup diagnostics.
+        """
+        missing = list(dataset_names)
+        if not self.multitask or self.run_mode != "recovery":
+            raise ValueError(
+                "Shared evaluation recovery requires multitask mode and "
+                "run_mode='recovery'."
+            )
+        unknown = [name for name in missing if name not in self.ds_conf]
+        if not missing or unknown:
+            raise ValueError(
+                "Expected known missing multitask datasets, but got "
+                f"{missing}; unknown={unknown}."
+            )
+
+        seed_torch(self.cfg.seed)
+        self.setup_distributed()
+        self._ensure_runtime_batching()
+        self._configure_cuda_memory_limit()
+        self.setup_logging()
+        self.init_tensorboard_logging()
+        self.init_cloud_logging()
+        try:
+            self._open_csv_writer("training", append=True)
+            self.collect_dataset_info(mixed=True)
+            self.setup_model()
+            self.load_training_checkpoint(checkpoint_path)
+            validation_loaders: list[DataLoader] = []
+            test_loaders: list[DataLoader] = []
+            for dataset_name in missing:
+                dataset_config = self.ds_conf[dataset_name]
+                validation_loader, _ = self.create_single_dataloader(
+                    dataset_name,
+                    dataset_config,
+                    datasets.Split.VALIDATION,
+                )
+                test_loader, _ = self.create_single_dataloader(
+                    dataset_name,
+                    dataset_config,
+                    datasets.Split.TEST,
+                )
+                if not isinstance(validation_loader, DataLoader):
+                    raise TypeError(
+                        "Recovery validation loader must be a DataLoader."
+                    )
+                if not isinstance(test_loader, DataLoader):
+                    raise TypeError(
+                        "Recovery test loader must be a DataLoader."
+                    )
+                validation_loaders.append(validation_loader)
+                test_loaders.append(test_loader)
+            validation_metrics = self.eval_epoch(
+                validation_loaders,
+                "eval",
+            )
+            test_metrics = self.eval_epoch(test_loaders, "test")
+            if get_is_master():
+                for dataset_name in missing:
+                    dataset_config = self.ds_conf[dataset_name]
+                    if (
+                        dataset_name not in validation_metrics
+                        or dataset_name not in test_metrics
+                    ):
+                        raise RuntimeError(
+                            "Evaluation recovery returned no metrics for "
+                            f"dataset '{dataset_name}'."
+                        )
+                    self.final_validation_metrics[dataset_name] = (
+                        validation_metrics[dataset_name]
+                    )
+                    self.final_test_metrics[dataset_name] = (
+                        test_metrics[dataset_name]
+                    )
+                    self.final_checkpoint_paths[dataset_name] = (
+                        checkpoint_path
+                    )
+                    self._write_completion(
+                        dataset_name,
+                        dataset_config,
+                    )
+                self._cleanup_checkpoint_artifacts(
+                    None,
+                    checkpoint_path,
+                )
+            return {
+                "validation_metrics": validation_metrics,
+                "test_metrics": test_metrics,
+                "checkpoint_cleanup_failures": list(
+                    self.checkpoint_cleanup_failures
+                ),
+            }
+        finally:
+            self._write_adaptive_batch_profile()
+            self._close_csv_writer()
+            self.finish_cloud_logging()
+            self.finish_tensorboard_logging()
+            if not self.external_distributed:
+                clean_torch_distributed(self.local_rank)
+
     def run_unified_training(self) -> Dict[str, Any]:
         """Train one shared model for all configured datasets."""
         if (
@@ -2464,6 +2728,8 @@ class AbstractTrainer(ABC):
         ):
             torch.distributed.barrier()
 
+        if self.run_mode != "hpo":
+            self._reset_unified_outputs()
         self._open_csv_writer("training")
         self.collect_dataset_info(mixed=True)
         model = self.setup_model()
@@ -2522,9 +2788,19 @@ class AbstractTrainer(ABC):
                 )
                 self.final_checkpoint_paths[dataset_name] = checkpoint_path
                 self._write_completion(dataset_name, dataset_config)
+            self._cleanup_checkpoint_artifacts(
+                None, checkpoint_path
+            )
         result.update({
             "test_metrics": test_metrics,
-            "checkpoint_path": str(checkpoint_path.resolve()),
+            "checkpoint_path": (
+                str(checkpoint_path.resolve())
+                if self.cfg.logging.save_checkpoints
+                else None
+            ),
+            "checkpoint_cleanup_failures": list(
+                self.checkpoint_cleanup_failures
+            ),
         })
         return result
 
@@ -2635,12 +2911,19 @@ class AbstractTrainer(ABC):
                     dataset_name,
                     dataset_config,
                 )
+                self._cleanup_checkpoint_artifacts(
+                    dataset_name,
+                    checkpoint_path,
+                )
                 self._close_csv_writer()
 
             self.epoch = 0
             self.current_step = 0
 
         return {
+            "checkpoint_cleanup_failures": list(
+                self.checkpoint_cleanup_failures
+            ),
             "validation_metrics": all_validation,
             "test_metrics": all_test,
             "pruned": pruned,

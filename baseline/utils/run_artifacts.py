@@ -105,10 +105,15 @@ def load_final_checkpoint(run_dir: str | Path, dataset_name: str) -> Path:
     completion = json.loads(completion_path.read_text(encoding="utf-8"))
     if completion.get("has_checkpoint") is False:
         model_type = completion.get("model_type", "this baseline")
+        retention = completion.get("checkpoint_retention_requested")
+        reason = (
+            "checkpoint retention was disabled"
+            if retention is False
+            else "the completed pipeline retained no checkpoint"
+        )
         raise FileNotFoundError(
             f"{model_type} completed {dataset_name} without a checkpoint; "
-            "this feature-extractor baseline does not support checkpoint "
-            "loading."
+            f"{reason}."
         )
     checkpoint_path = completion.get("checkpoint_path")
     if not isinstance(checkpoint_path, str) or not checkpoint_path:

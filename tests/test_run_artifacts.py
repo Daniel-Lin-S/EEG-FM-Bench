@@ -11,6 +11,20 @@ from baseline.utils.run_artifacts import load_saved_run_config
 from baseline.utils.run_artifacts import save_resolved_config
 
 
+def test_checkpoint_retention_default_and_identity_exclusion() -> None:
+    """Checkpoint retention defaults off and remains operational."""
+    logging_args = BrainOmniLoggingArgs()
+    assert logging_args.save_checkpoints is False
+    assert BrainOmniLoggingArgs(
+        save_checkpoints=True
+    ).save_checkpoints is True
+
+    config = BrainOmniConfig().model_dump(mode="json")
+    original = get_config_hash(config, multitask=False)
+    config["logging"]["save_checkpoints"] = True
+    assert get_config_hash(config, multitask=False) == original
+
+
 def test_outputs_default_and_validation() -> None:
     """Local trace outputs default to CSV and reject empty selections."""
     assert BrainOmniLoggingArgs().outputs == ['csv']

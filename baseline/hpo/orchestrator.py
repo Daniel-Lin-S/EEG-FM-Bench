@@ -6,6 +6,7 @@ completion metadata, and campaign test summaries.
 """
 
 from __future__ import annotations
+import csv
 
 import copy
 import datetime
@@ -15,6 +16,7 @@ import json
 import logging
 import math
 import os
+import shutil
 import sqlite3
 import time
 import warnings
@@ -75,6 +77,51 @@ OOM_MESSAGE_PARTS = (
     "out of memory",
     "cuda error: memory allocation",
 )
+
+
+@dataclass
+class ExecutionLocks:
+    """Advisory locks held for one seed's selected scopes.
+
+    Parameters
+    ----------
+    files : tuple[BinaryIO, ...]
+        Open files whose exclusive nonblocking locks are held by rank zero.
+    paths : tuple[pathlib.Path, ...]
+        Absolute lock paths used for conflict diagnostics.
+    """
+
+    files: tuple[BinaryIO, ...]
+    paths: tuple[Path, ...]
+
+
+def _execution_lock_path(
+    paths: CampaignPaths,
+    seed: int,
+    scope: str,
+) -> Path:
+    """Return a stable execution-lock path for one seed and scope."""
+    scope_identity = semantic_digest({"scope": scope})
+    return paths.log_root / ".locks" / f"seed_{seed}" / scope_identity
+
+
+@dataclass(frozen=True)
+class ReplacementArchive:
+    """Completed artifacts copied before an authorized replacement.
+
+    Parameters
+    ----------
+    root : pathlib.Path
+        Exclusive archive root owned by the current invocation.
+    copies : tuple[tuple[pathlib.Path, pathlib.Path], ...]
+        Original and archived artifact pairs.
+    cleanup_paths : tuple[pathlib.Path, ...]
+        Ordinary partial paths removed before restoration.
+    """
+
+    root: Path
+    copies: tuple[tuple[Path, Path], ...]
+    cleanup_paths: tuple[Path, ...]
 
 
 @dataclass
@@ -342,51 +389,15 @@ def _seed_scope_is_complete(
     return True
 
 
-def _checkpoint_root_for_log_root(
-    paths: CampaignPaths,
-    seed: int,
-    log_root: Path,
-) -> Path:
-    """Map one seed log namespace to its checkpoint namespace.
-
-    Parameters
-    ----------
-    paths : CampaignPaths
-        Campaign log and checkpoint roots.
-    seed : int
-        Effective evaluation seed.
-    log_root : pathlib.Path
-        Legacy or identity-namespaced seed log root.
-
-    Returns
-    -------
-    pathlib.Path
-        Corresponding checkpoint root.
-    """
-    seed_log_root = paths.seed_log_root(seed)
-    try:
-        relative = log_root.relative_to(seed_log_root)
-    except ValueError as exc:
-        raise RuntimeError(
-            f"Completion root {log_root.resolve()} is outside seed root "
-            f"{seed_log_root.resolve()}."
-        ) from exc
-    return paths.seed_checkpoint_root(seed) / relative
-
-
 def _scope_artifact_roots(
     paths: CampaignPaths,
     campaign_hash: str,
     seed: int,
     scoped_config: Mapping[str, Any],
     campaign_aliases: tuple[str, ...] = (),
+    allow_replacement: bool = False,
 ) -> tuple[Path, Path, bool]:
-    """Select safe roots for one final scoped configuration.
-
-    Compatible partial results keep using their existing root. When stale
-    completions occupy the legacy location, new work uses a full final-config
-    identity namespace so no changed winner can overwrite prior artifacts.
-
+    """Return ordinary roots after validating existing completions.
 
     Parameters
     ----------
@@ -400,12 +411,14 @@ def _scope_artifact_roots(
         Selected final configuration containing one effective seed.
     campaign_aliases : tuple[str, ...], optional, default=()
         Validated historical campaign identifiers.
+    allow_replacement : bool, optional, default=False
+        Whether proven HPO budget growth authorizes terminal replacement.
+
     Returns
     -------
     tuple[pathlib.Path, pathlib.Path, bool]
-        Log root, checkpoint root, and whether the scope is already complete.
+        Ordinary log root, checkpoint root, and completion state.
     """
-    datasets = scoped_config["data"]["datasets"]
     located = [
         locate_completion(
             paths.log_root,
@@ -415,59 +428,39 @@ def _scope_artifact_roots(
             scoped_config,
             campaign_aliases=campaign_aliases,
         )
-        for dataset_name in datasets
+        for dataset_name in scoped_config["data"]["datasets"]
     ]
     compatible = [
         item for item in located if item.compatibility.compatible
     ]
-    ambiguous = [
+    conflicts = [
         item for item in located
-        if "multiple compatible completions" in item.compatibility.reason
+        if item.compatibility.terminal
+        and not item.compatibility.compatible
     ]
-    if ambiguous:
+    if conflicts and not allow_replacement:
         reasons = "; ".join(
-            item.compatibility.reason for item in ambiguous
+            f"{item.path.resolve()}: {item.compatibility.reason}"
+            for item in conflicts
         )
         raise RuntimeError(
-            "Cannot select a safe seed artifact root: " + reasons
+            "A completed result conflicts with the selected semantic "
+            "configuration and cannot be overwritten: " + reasons
         )
+    log_root = paths.seed_log_root(seed)
+    checkpoint_root = paths.seed_checkpoint_root(seed)
     if len(compatible) == len(located):
-        base_log = paths.seed_log_root(seed)
-        return base_log, paths.seed_checkpoint_root(seed), True
-
-    compatible_roots = {item.run_root for item in compatible}
-    if len(compatible_roots) > 1:
-        roots = ", ".join(
-            str(path.resolve()) for path in sorted(compatible_roots)
+        return log_root, checkpoint_root, True
+    if compatible:
+        completed = ", ".join(
+            item.path.parent.name for item in compatible
         )
         raise RuntimeError(
-            "Compatible partial results span multiple artifact roots: "
-            + roots
+            "A multitask scope has compatible completed datasets and cannot "
+            "be retrained. Recover its missing datasets instead: "
+            + completed
         )
-    if compatible_roots:
-        log_root = compatible_roots.pop()
-        checkpoint_root = _checkpoint_root_for_log_root(
-            paths,
-            seed,
-            log_root,
-        )
-        return log_root, checkpoint_root, False
-
-    has_stale_completion = any(
-        item.existing_paths for item in located
-    )
-    if has_stale_completion:
-        config_identity = _config_hash(scoped_config)
-        return (
-            paths.seed_log_root(seed, config_identity),
-            paths.seed_checkpoint_root(seed, config_identity),
-            False,
-        )
-    return (
-        paths.seed_log_root(seed),
-        paths.seed_checkpoint_root(seed),
-        False,
-    )
+    return log_root, checkpoint_root, False
 
 
 def _is_recoverable_trial_failure(exc: Exception) -> bool:
@@ -487,11 +480,635 @@ def _release_training_state() -> None:
         torch.cuda.empty_cache()
 
 
+def _remove_checkpoint_tree(path: Path, purpose: str) -> Optional[str]:
+    """Remove one checkpoint tree and return a failed absolute path.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Checkpoint directory owned by the current run or trial.
+    purpose : str
+        Human-readable cleanup context for diagnostics.
+
+    Returns
+    -------
+    str or None
+        Absolute path when cleanup fails, otherwise ``None``.
+    """
+    if not path.exists():
+        return None
+    try:
+        shutil.rmtree(path)
+    except OSError as exc:
+        resolved = str(path.resolve())
+        logger.warning(
+            "%s checkpoint cleanup failed at %s: %s",
+            purpose,
+            resolved,
+            exc,
+        )
+        return resolved
+
+    return None
+
+
+def _acquire_execution_locks(
+    paths: CampaignPaths,
+    seed: int,
+    scopes: Mapping[str, Mapping[str, Any]],
+) -> ExecutionLocks:
+    """Acquire every selected scope lock without waiting.
+
+    Parameters
+    ----------
+    paths : CampaignPaths
+        Campaign paths containing the lock namespace.
+    seed : int
+        Effective evaluation seed.
+    scopes : Mapping[str, Mapping[str, Any]]
+        Selected final configurations keyed by scope name.
+
+    Returns
+    -------
+    ExecutionLocks
+        Rank-zero lock handles and their absolute paths.
+
+    Raises
+    ------
+    RuntimeError
+        If another invocation owns any requested scope.
+    """
+    files: list[BinaryIO] = []
+    lock_paths = tuple(
+        _execution_lock_path(paths, seed, scope).resolve()
+        for scope in sorted(scopes)
+    )
+    error: Optional[str] = None
+    if get_is_master():
+        try:
+            for lock_path in lock_paths:
+                lock_path.parent.mkdir(parents=True, exist_ok=True)
+                lock_file = lock_path.open("a+b")
+                try:
+                    fcntl.flock(
+                        lock_file.fileno(),
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
+                except BlockingIOError:
+                    lock_file.close()
+                    raise RuntimeError(
+                        "Another invocation owns the execution lock at "
+                        f"{lock_path}."
+                    )
+                files.append(lock_file)
+        except Exception as exc:
+            error = str(exc)
+            for lock_file in reversed(files):
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                lock_file.close()
+            files = []
+    error = _broadcast_object(error)
+    if error is not None:
+        raise RuntimeError(error)
+    return ExecutionLocks(tuple(files), lock_paths)
+
+
+def _release_execution_locks(locks: ExecutionLocks) -> None:
+    """Release rank-zero execution locks held by an invocation."""
+    if not get_is_master():
+        return
+    for lock_file in reversed(locks.files):
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
+
+
+def _checkpoint_scope_path(
+    paths: CampaignPaths,
+    seed: int,
+    dataset_name: Optional[str],
+) -> Path:
+    """Return the ordinary checkpoint directory for one final scope."""
+    seed_root = paths.seed_checkpoint_root(seed)
+    if dataset_name is None:
+        return seed_root / "unified"
+    return seed_root / "seperated" / dataset_name
+
+
+def _maintain_completed_scope(
+    paths: CampaignPaths,
+    seed: int,
+    scoped_config: Mapping[str, Any],
+    located: list[Any],
+) -> list[str]:
+    """Clean disabled leftovers or warn about expected retained checkpoints.
+
+    Parameters
+    ----------
+    paths : CampaignPaths
+        Ordinary campaign paths.
+    seed : int
+        Effective evaluation seed.
+    scoped_config : Mapping[str, Any]
+        Selected final configuration.
+    located : list[Any]
+        Compatible direct completion locations for this scope.
+
+    Returns
+    -------
+    list[str]
+        Absolute checkpoint paths whose cleanup failed.
+    """
+    if not get_is_master():
+        return []
+    retain = bool(
+        scoped_config.get("logging", {}).get("save_checkpoints", False)
+    )
+    if not retain:
+        dataset_names: list[Optional[str]]
+        if scoped_config.get("multitask"):
+            dataset_names = [None]
+        else:
+            dataset_names = [
+                item.path.parent.name for item in located
+            ]
+        failures = []
+        for dataset_name in dataset_names:
+            checkpoint_root = _checkpoint_scope_path(
+                paths,
+                seed,
+                dataset_name,
+            )
+            failure = _remove_checkpoint_tree(
+                checkpoint_root,
+                f"Completed seed {seed}",
+            )
+            if failure is not None:
+                failures.append(failure)
+        return failures
+
+    for item in located:
+        completion = item.compatibility.completion or {}
+        if (
+            completion.get("checkpoint_retention_requested") is False
+            or completion.get("has_checkpoint") is False
+        ):
+            continue
+        checkpoint_value = completion.get("checkpoint_path")
+        checkpoint_path = (
+            Path(checkpoint_value)
+            if isinstance(checkpoint_value, str) and checkpoint_value
+            else None
+        )
+        if checkpoint_path is None or not checkpoint_path.is_file():
+            displayed = (
+                checkpoint_path.resolve()
+                if checkpoint_path is not None
+                else item.path.resolve()
+            )
+            logger.warning(
+                "Completed seed %d dataset %s requested checkpoint "
+                "retention, but its checkpoint is missing at %s. The "
+                "completion remains authoritative.",
+                seed,
+                item.path.parent.name,
+                displayed,
+            )
+    return []
+
+
+def _ignored_configuration_namespaces(log_root: Path) -> list[Path]:
+    """Return legacy configuration namespaces excluded from execution.
+
+    Parameters
+    ----------
+    log_root : pathlib.Path
+        Campaign log root to inspect without modification.
+
+    Returns
+    -------
+    list[pathlib.Path]
+        Absolute legacy namespace paths in deterministic order.
+    """
+    return [
+        path.resolve()
+        for path in sorted(
+            log_root.glob("logs/seed_*/configurations")
+        )
+        if path.is_dir()
+    ]
+
+
+def _warn_ignored_configuration_namespaces(log_root: Path) -> None:
+    """Warn for every preserved legacy configuration namespace."""
+    for path in _ignored_configuration_namespaces(log_root):
+        logger.warning("Ignoring legacy configuration namespace at %s.", path)
+
+
+def _copy_artifact(source: Path, destination: Path) -> None:
+    """Copy one file or directory without replacing an archive artifact."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if source.is_dir():
+        shutil.copytree(source, destination)
+    else:
+        shutil.copy2(source, destination)
+
+
+def _remove_artifact(path: Path) -> None:
+    """Remove one current-attempt artifact when it exists."""
+    if path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def _replacement_sources(
+    paths: CampaignPaths,
+    seed: int,
+    scoped_config: Mapping[str, Any],
+    located: list[Any],
+) -> list[tuple[Path, Path]]:
+    """Return original artifacts and archive-relative destinations."""
+    seed_log_root = paths.seed_log_root(seed)
+    sources: list[tuple[Path, Path]] = []
+    seen: set[Path] = set()
+
+    def add(source: Path, prefix: str, base: Path) -> None:
+        resolved = source.resolve()
+        if resolved in seen or not source.exists():
+            return
+        seen.add(resolved)
+        sources.append((source, Path(prefix) / source.relative_to(base)))
+
+    for item in located:
+        dataset_name = item.path.parent.name
+        completion = item.compatibility.completion or {}
+        add(item.path, "log", paths.log_root)
+        add(
+            seed_log_root / "csv" / f"{dataset_name}.csv",
+            "log",
+            paths.log_root,
+        )
+        add(
+            seed_log_root / "tensorboard" / dataset_name,
+            "log",
+            paths.log_root,
+        )
+        execution_id = completion.get("execution_id")
+        if (
+            isinstance(execution_id, str)
+            and execution_id
+            and Path(execution_id).name == execution_id
+        ):
+            add(
+                seed_log_root / "configs" / f"{execution_id}.yaml",
+                "log",
+                paths.log_root,
+            )
+            add(
+                seed_log_root / "logs" / f"{execution_id}.log",
+                "log",
+                paths.log_root,
+            )
+    checkpoint_name = None if scoped_config.get("multitask") else (
+        next(iter(scoped_config["data"]["datasets"]))
+    )
+    add(
+        _checkpoint_scope_path(paths, seed, checkpoint_name),
+        "checkpoint",
+        paths.checkpoint_root,
+    )
+    return sources
+
+
+def _replacement_cleanup_paths(
+    paths: CampaignPaths,
+    seed: int,
+    scoped_config: Mapping[str, Any],
+    located: list[Any],
+) -> tuple[Path, ...]:
+    """Return ordinary partial paths removed before restoration."""
+    seed_root = paths.seed_log_root(seed)
+    cleanup: list[Path] = []
+    for item in located:
+        dataset_name = item.path.parent.name
+        cleanup.extend((
+            item.path,
+            seed_root / "csv" / f"{dataset_name}.csv",
+            seed_root / "tensorboard" / dataset_name,
+        ))
+    checkpoint_name = None if scoped_config.get("multitask") else (
+        next(iter(scoped_config["data"]["datasets"]))
+    )
+    cleanup.append(
+        _checkpoint_scope_path(paths, seed, checkpoint_name)
+    )
+    return tuple(cleanup)
+
+
+def _archive_completed_scope(
+    paths: CampaignPaths,
+    invocation_root: Path,
+    seed: int,
+    scope: str,
+    scoped_config: Mapping[str, Any],
+    located: list[Any],
+) -> Optional[ReplacementArchive]:
+    """Copy a valid completed scope and remove its terminal markers.
+
+    Parameters
+    ----------
+    paths : CampaignPaths
+        Ordinary campaign artifact roots.
+    invocation_root : pathlib.Path
+        Exclusive current invocation root.
+    seed : int
+        Effective evaluation seed.
+    scope : str
+        Dataset or multitask scope being replaced.
+    scoped_config : Mapping[str, Any]
+        Newly selected final configuration.
+    located : list[Any]
+        Valid terminal completions authorized for replacement.
+
+    Returns
+    -------
+    ReplacementArchive or None
+        Rank-zero archive metadata, or ``None`` on other ranks.
+    """
+    if not get_is_master():
+        return None
+    archive_root = (
+        invocation_root
+        / "superseded"
+        / f"seed_{seed}"
+        / semantic_digest({"scope": scope})
+    )
+    if archive_root.exists():
+        raise RuntimeError(
+            "Replacement archive already exists at "
+            f"{archive_root.resolve()}."
+        )
+    sources = _replacement_sources(
+        paths,
+        seed,
+        scoped_config,
+        located,
+    )
+    completion_sources = {item.path.resolve() for item in located}
+    if not completion_sources:
+        raise RuntimeError("Replacement requires a completed result.")
+    copies: list[tuple[Path, Path]] = []
+    try:
+        for source, relative in sources:
+            destination = archive_root / relative
+            _copy_artifact(source, destination)
+            copies.append((source, destination))
+        archived_completions = {
+            source.resolve()
+            for source, _ in copies
+            if source.resolve() in completion_sources
+        }
+        if archived_completions != completion_sources:
+            raise RuntimeError(
+                "Replacement archive did not capture every completion."
+            )
+    except Exception:
+        if archive_root.exists():
+            shutil.rmtree(archive_root)
+        raise
+    for completion_path in completion_sources:
+        completion_path.unlink()
+    logger.warning(
+        "Archived completed seed %d scope %s before HPO replacement at %s.",
+        seed,
+        scope,
+        archive_root.resolve(),
+    )
+    cleanup_paths = _replacement_cleanup_paths(
+        paths,
+        seed,
+        scoped_config,
+        located,
+    )
+    return ReplacementArchive(archive_root, tuple(copies), cleanup_paths)
+
+
+def _restore_completed_scope(archive: Optional[ReplacementArchive]) -> None:
+    """Restore an archived completed scope after replacement failure."""
+    if archive is None or not get_is_master():
+        return
+    for partial_path in archive.cleanup_paths:
+        if partial_path.exists():
+            _remove_artifact(partial_path)
+    for original, archived in archive.copies:
+        if original.exists() and original not in archive.cleanup_paths:
+            _remove_artifact(original)
+        _copy_artifact(archived, original)
+    logger.warning(
+        "Restored completed result from %s after replacement failure.",
+        archive.root.resolve(),
+    )
+
+
 def _hpo_scope_root(root: Path, scope: str) -> Path:
     """Return the requested log or checkpoint root for one HPO scope."""
     if scope == "multitask":
         return root / "hpo" / "multitask"
     return root / "hpo" / "datasets" / scope
+
+
+def _finite_csv_metrics(
+    rows: list[Mapping[str, str]],
+    dataset_name: str,
+    split: str,
+    epoch: Optional[int] = None,
+) -> Dict[str, float]:
+    """Return one unambiguous finite metric event from a shared CSV."""
+    values: Dict[str, set[float]] = {}
+    for row in rows:
+        if row.get("dataset") != dataset_name or row.get("split") != split:
+            continue
+        if epoch is not None:
+            try:
+                row_epoch = int(float(row.get("epoch", "")))
+            except (TypeError, ValueError):
+                continue
+            if row_epoch != epoch:
+                continue
+        metric = row.get("metric")
+        try:
+            value = float(row.get("value", ""))
+        except (TypeError, ValueError):
+            continue
+        if not metric or not math.isfinite(value):
+            continue
+        values.setdefault(metric, set()).add(value)
+    ambiguous = [
+        metric for metric, metric_values in values.items()
+        if len(metric_values) != 1
+    ]
+    if ambiguous:
+        raise ValueError(
+            f"Dataset '{dataset_name}' has ambiguous {split} metrics in "
+            f"the shared CSV: {sorted(ambiguous)}."
+        )
+    metrics = {
+        f"{dataset_name}/{split}/{metric}": next(iter(metric_values))
+        for metric, metric_values in values.items()
+    }
+    if not metrics:
+        raise ValueError(
+            f"Dataset '{dataset_name}' has no finite {split} metrics in "
+            "the shared CSV."
+        )
+    return metrics
+
+
+def _shared_validation_epoch(located: list[Any]) -> int:
+    """Return the unique validation-best epoch from compatible completions."""
+    epochs: set[int] = set()
+    for item in located:
+        if not item.compatibility.compatible:
+            continue
+        completion = item.compatibility.completion or {}
+        metrics = completion.get("validation_metrics")
+        if not isinstance(metrics, dict):
+            continue
+        for key, value in metrics.items():
+            if not str(key).endswith("/eval/epoch"):
+                continue
+            if isinstance(value, bool) or not isinstance(
+                value,
+                (int, float),
+            ):
+                continue
+            numeric = float(value)
+            if math.isfinite(numeric) and numeric.is_integer():
+                epochs.add(int(numeric))
+    if len(epochs) != 1:
+        raise ValueError(
+            "Compatible multitask completions do not identify one shared "
+            f"validation-best epoch: {sorted(epochs)}."
+        )
+    return next(iter(epochs))
+
+
+def _recover_multitask_from_csv(
+    paths: CampaignPaths,
+    campaign_hash: str,
+    seed: int,
+    scoped_config: Mapping[str, Any],
+    located: list[Any],
+    provenance: Optional[Mapping[str, Any]],
+    invocation_id: str,
+) -> bool:
+    """Recover every missing multitask completion from one shared CSV.
+
+    Returns ``False`` without writing when no partial compatible set exists.
+    Raises before writing if the shared metric event is ambiguous or missing.
+    """
+    compatible = [
+        item for item in located if item.compatibility.compatible
+    ]
+    incomplete = [
+        item for item in located
+        if not item.compatibility.compatible
+        and not item.compatibility.terminal
+    ]
+    conflicts = [
+        item for item in located
+        if item.compatibility.terminal
+        and not item.compatibility.compatible
+    ]
+    if conflicts or not compatible or not incomplete:
+        return False
+    csv_path = paths.seed_log_root(seed) / "csv" / "training.csv"
+    if not csv_path.is_file():
+        raise ValueError(
+            "Partial multitask recovery requires the shared CSV at "
+            f"{csv_path.resolve()}."
+        )
+    with csv_path.open(newline="", encoding="utf-8") as file_obj:
+        reader = csv.DictReader(file_obj)
+        required = {"dataset", "split", "epoch", "metric", "value"}
+        if reader.fieldnames is None or not required.issubset(
+            reader.fieldnames
+        ):
+            raise ValueError(
+                f"Shared CSV at {csv_path.resolve()} lacks required columns "
+                f"{sorted(required)}."
+            )
+        rows = list(reader)
+    best_epoch = _shared_validation_epoch(compatible)
+    templates = [
+        item.compatibility.completion or {} for item in compatible
+    ]
+    execution_ids = {
+        item.get("execution_id") for item in templates
+        if isinstance(item.get("execution_id"), str)
+    }
+    if len(execution_ids) != 1:
+        raise ValueError(
+            "Compatible multitask completions do not share one execution ID."
+        )
+    template = templates[0]
+    retain = bool(
+        scoped_config.get("logging", {}).get("save_checkpoints", False)
+    )
+    checkpoint_values = {
+        item.get("checkpoint_path") for item in templates
+        if isinstance(item.get("checkpoint_path"), str)
+        and Path(item["checkpoint_path"]).is_file()
+    }
+    checkpoint_value = (
+        next(iter(checkpoint_values))
+        if retain and len(checkpoint_values) == 1
+        else None
+    )
+    payloads: list[tuple[Path, Dict[str, Any]]] = []
+    for item in incomplete:
+        dataset_name = item.path.parent.name
+        validation_metrics = _finite_csv_metrics(
+            rows,
+            dataset_name,
+            "eval",
+            epoch=best_epoch,
+        )
+        test_metrics = _finite_csv_metrics(
+            rows,
+            dataset_name,
+            "test",
+        )
+        payloads.append((item.path, {
+            "status": "completed",
+            "campaign_hash": campaign_hash,
+            "campaign_identity_version": IDENTITY_VERSION,
+            "config_hash": _config_hash(scoped_config),
+            "config_hash_version": IDENTITY_VERSION,
+            "seed": seed,
+            "dataset_config": scoped_config["data"]["datasets"][
+                dataset_name
+            ],
+            "execution_id": next(iter(execution_ids)),
+            "invocation_id": invocation_id,
+            "has_checkpoint": checkpoint_value is not None,
+            "checkpoint_path": checkpoint_value,
+            "checkpoint_retention_requested": retain,
+            "selection_provenance": dict(provenance or {}),
+            "validation_metrics": validation_metrics,
+            "test_metrics": test_metrics,
+            "completed_at": datetime.datetime.now().isoformat(),
+            "batching": template.get("batching"),
+            "recovered_from_csv": str(csv_path.resolve()),
+        }))
+    for completion_path, payload in payloads:
+        _atomic_json(completion_path, payload)
+        logger.warning(
+            "Recovered missing multitask completion from %s at %s.",
+            csv_path.resolve(),
+            completion_path.resolve(),
+        )
+    return True
 
 
 def _read_sqlite_studies(storage_path: Path) -> list[Dict[str, Any]]:
@@ -868,6 +1485,9 @@ class CampaignRunner:
         )
         self.distributed_initialized = False
         self._active_study_runtime: Optional[StudyRuntime] = None
+        self.selection_provenance: Dict[str, Dict[str, Any]] = {}
+        self.checkpoint_cleanup_failures: list[str] = []
+        self._ignored_namespace_warnings: set[Path] = set()
         self.adaptive_batch_cache: Dict[str, Dict[str, Any]] = {}
         self.last_adaptive_memory_profile: Dict[str, Any] = {}
 
@@ -1199,6 +1819,10 @@ class CampaignRunner:
                 datetime.timezone.utc
             ).isoformat(),
         }
+        if self.checkpoint_cleanup_failures:
+            payload["checkpoint_cleanup_failures"] = list(
+                dict.fromkeys(self.checkpoint_cleanup_failures)
+            )
         if invocation is not None:
             payload["seeds"] = dict(invocation)
         if dataset_pairs is not None:
@@ -1782,6 +2406,15 @@ class CampaignRunner:
                 )
             finally:
                 _release_training_state()
+                if get_is_master():
+                    cleanup_failure = _remove_checkpoint_tree(
+                        checkpoint_root,
+                        f"HPO trial {trial_number}",
+                    )
+                    if cleanup_failure is not None:
+                        self.checkpoint_cleanup_failures.append(
+                            cleanup_failure
+                        )
             if trial_budgeted:
                 budgeted += 1
                 consecutive_failures = 0
@@ -1821,6 +2454,16 @@ class CampaignRunner:
                 "objective": best_trial.value,
                 "parameters": decoded,
             }
+            selection_payload = {
+                **best_payload,
+                "source": "hpo",
+                "scope": scope,
+                "requested_budget": self.hpo_config.n_trials,
+                "effective_budget": budgeted,
+                "parameter_digest": semantic_digest({
+                    "parameters": decoded,
+                }),
+            }
             best_path = (
                 artifact_root
                 / f"best_trial_{best_trial.number:05d}.json"
@@ -1831,12 +2474,19 @@ class CampaignRunner:
                 _exclusive_json(best_path, best_payload)
             _exclusive_json(
                 self.invocation_root / "hpo" / f"{scope}.json",
-                best_payload,
+                selection_payload,
             )
         else:
+            selection_payload = None
             best_payload = None
             best_path = None
-        best_payload = _broadcast_object(best_payload)
+        selection_payload = _broadcast_object(selection_payload)
+        best_payload = selection_payload
+        if not hasattr(self, "selection_provenance"):
+            self.selection_provenance = {}
+        self.selection_provenance[scope] = dict(
+            selection_payload
+        )
         if get_is_master():
             logger.info(
                 "HPO scope %s selected trial %d with objective %.8g; "
@@ -1885,9 +2535,227 @@ class CampaignRunner:
         return selected
 
     def _fixed_scopes(self) -> Dict[str, Dict[str, Any]]:
-        """Return one fixed campaign scope when HPO is disabled."""
-        scope = "multitask" if self.base_dict["multitask"] else "fixed"
-        return {scope: copy.deepcopy(self.base_dict)}
+        """Return independently lockable scopes when HPO is disabled."""
+        if self.base_dict["multitask"]:
+            scopes = {"multitask": copy.deepcopy(self.base_dict)}
+        else:
+            scopes = {}
+            for dataset_name, dataset_config in self.base_dict[
+                "data"
+            ]["datasets"].items():
+                scoped = _scoped_config(
+                    self.base_dict,
+                    seed=0,
+                    datasets_config={dataset_name: dataset_config},
+                )
+                scoped["seeds"] = list(self.base_dict["seeds"])
+                scopes[dataset_name] = scoped
+        for scope, config in scopes.items():
+            self.selection_provenance[scope] = {
+                "source": "fixed",
+                "scope": scope,
+                "parameter_digest": semantic_digest({
+                    "configuration": config,
+                }),
+            }
+        return scopes
+
+    def _legacy_completion_provenance(
+        self,
+        scope: str,
+        seed: int,
+        completion: Mapping[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Recover selection provenance from immutable invocation records.
+
+        Parameters
+        ----------
+        scope : str
+            Dataset name or ``multitask``.
+        seed : int
+            Effective evaluation seed.
+        completion : Mapping[str, Any]
+            Valid terminal completion lacking new provenance metadata.
+
+        Returns
+        -------
+        dict[str, Any] or None
+            Unique highest-budget matching selection, when recoverable.
+        """
+        completion_hash = completion.get("config_hash")
+        if not isinstance(completion_hash, str):
+            return None
+        candidates: list[Dict[str, Any]] = []
+        invocations_root = self.paths.log_root / "invocations"
+        for invocation_root in sorted(invocations_root.glob("*")):
+            invocation_path = invocation_root / "invocation.yaml"
+            winner_path = invocation_root / "hpo" / f"{scope}.json"
+            if not invocation_path.is_file() or not winner_path.is_file():
+                continue
+            try:
+                invocation = yaml.safe_load(
+                    invocation_path.read_text(encoding="utf-8")
+                )
+                winner = json.loads(
+                    winner_path.read_text(encoding="utf-8")
+                )
+            except (OSError, yaml.YAMLError, json.JSONDecodeError):
+                continue
+            if not isinstance(invocation, dict) or not isinstance(
+                winner,
+                dict,
+            ):
+                continue
+            model_config = invocation.get("model_config")
+            parameters = winner.get("parameters")
+            hpo = invocation.get("hpo")
+            if (
+                not isinstance(model_config, dict)
+                or not isinstance(parameters, dict)
+                or not isinstance(hpo, dict)
+            ):
+                continue
+            if scope == "multitask":
+                selected = _scoped_config(model_config, seed)
+            else:
+                datasets_config = model_config.get("data", {}).get(
+                    "datasets",
+                    {},
+                )
+                dataset_config = datasets_config.get(scope)
+                if not isinstance(dataset_config, str):
+                    continue
+                selected = _scoped_config(
+                    model_config,
+                    seed,
+                    datasets_config={scope: dataset_config},
+                )
+            try:
+                for path, value in parameters.items():
+                    set_dotted_value(selected, path, value)
+                selected_hash = _config_hash(selected)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if selected_hash != completion_hash:
+                continue
+            requested_budget = hpo.get("n_trials")
+            effective_budget = winner.get(
+                "effective_budget",
+                requested_budget,
+            )
+            study_identity = winner.get("study_identity")
+            if (
+                isinstance(requested_budget, bool)
+                or not isinstance(requested_budget, int)
+                or requested_budget <= 0
+                or isinstance(effective_budget, bool)
+                or not isinstance(effective_budget, int)
+                or effective_budget <= 0
+                or not isinstance(study_identity, str)
+                or not study_identity
+            ):
+                continue
+            candidates.append({
+                "source": "hpo",
+                "scope": scope,
+                "study_identity": study_identity,
+                "requested_budget": requested_budget,
+                "effective_budget": effective_budget,
+                "parameter_digest": semantic_digest({
+                    "parameters": parameters,
+                }),
+            })
+        if not candidates:
+            return None
+        maximum = max(
+            int(candidate["effective_budget"])
+            for candidate in candidates
+        )
+        highest = [
+            candidate for candidate in candidates
+            if candidate["effective_budget"] == maximum
+        ]
+        identities = {
+            canonical_json(candidate) for candidate in highest
+        }
+        if len(identities) != 1:
+            logger.warning(
+                "Legacy HPO provenance for seed %d scope %s is ambiguous.",
+                seed,
+                scope,
+            )
+            return None
+        return highest[0]
+
+    def _completion_provenance(
+        self,
+        scope: str,
+        seed: int,
+        completion: Mapping[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Return new or safely recovered completion provenance."""
+        provenance = completion.get("selection_provenance")
+        if isinstance(provenance, dict):
+            return dict(provenance)
+        return self._legacy_completion_provenance(
+            scope,
+            seed,
+            completion,
+        )
+
+    def _replacement_is_authorized(
+        self,
+        scope: str,
+        seed: int,
+        located: list[Any],
+    ) -> bool:
+        """Return whether larger-budget HPO provenance proves replacement."""
+        current = self.selection_provenance.get(scope)
+        if not isinstance(current, dict) or current.get("source") != "hpo":
+            return False
+        current_budget = current.get("effective_budget")
+        current_study = current.get("study_identity")
+        current_digest = current.get("parameter_digest")
+        if (
+            isinstance(current_budget, bool)
+            or not isinstance(current_budget, int)
+            or current_budget <= 0
+            or not isinstance(current_study, str)
+            or not isinstance(current_digest, str)
+        ):
+            return False
+        conflicts = [
+            item for item in located
+            if item.compatibility.terminal
+            and not item.compatibility.compatible
+        ]
+        if not conflicts:
+            return False
+        for item in conflicts:
+            completion = item.compatibility.completion
+            if not isinstance(completion, dict):
+                return False
+            previous = self._completion_provenance(
+                scope,
+                seed,
+                completion,
+            )
+            if previous is None:
+                return False
+            if (
+                previous.get("source") != "hpo"
+                or previous.get("study_identity") != current_study
+                or previous.get("parameter_digest") == current_digest
+            ):
+                return False
+            previous_budget = previous.get("effective_budget")
+            if (
+                isinstance(previous_budget, bool)
+                or not isinstance(previous_budget, int)
+                or current_budget <= previous_budget
+            ):
+                return False
+        return True
 
     def _start_seed_cloud(self, seed: int) -> Dict[str, Any]:
         """Start one cloud run shared by all dataset runs for a seed."""
@@ -1988,35 +2856,164 @@ class CampaignRunner:
         self,
         seed: int,
         selected_configs: Mapping[str, Mapping[str, Any]],
-    ) -> None:
-        """Execute all selected configurations for one independent seed."""
-        cloud_context = self._start_seed_cloud(seed)
+    ) -> bool:
+        """Execute incomplete scopes and return whether training was needed."""
+        locks = _acquire_execution_locks(
+            self.paths,
+            seed,
+            selected_configs,
+        )
+        cloud_context: Dict[str, Any] = {}
         try:
-            for selected in selected_configs.values():
-                trainer = None
-                try:
-                    scoped = _scoped_config(selected, seed)
-                    (
-                        seed_log_root,
-                        seed_checkpoint_root,
-                        scope_complete,
-                    ) = _scope_artifact_roots(
-                        self.paths,
+            pending: Dict[
+                str,
+                tuple[
+                    Dict[str, Any],
+                    list[Any],
+                    bool,
+                    Optional[Path],
+                ],
+            ] = {}
+            for scope, selected in selected_configs.items():
+                scoped = _scoped_config(selected, seed)
+                located = [
+                    locate_completion(
+                        self.paths.log_root,
                         self.campaign_hash,
                         seed,
+                        dataset_name,
                         scoped,
                         campaign_aliases=self.campaign_aliases,
                     )
-                    if scope_complete:
-                        continue
-                    base_seed_root = self.paths.seed_log_root(seed)
-                    if seed_log_root != base_seed_root:
-                        logger.warning(
-                            "Preserving stale seed artifacts under %s; "
-                            "the selected configuration will write to %s.",
-                            base_seed_root.resolve(),
-                            seed_log_root.resolve(),
+                    for dataset_name in scoped["data"]["datasets"]
+                ]
+                recovery_checkpoint: Optional[Path] = None
+                recovery = {"recovered": False, "error": None}
+                if scoped.get("multitask") and get_is_master():
+                    try:
+                        recovery["recovered"] = (
+                            _recover_multitask_from_csv(
+                                self.paths,
+                                self.campaign_hash,
+                                seed,
+                                scoped,
+                                located,
+                                self.selection_provenance.get(scope),
+                                self.invocation_id,
+                            )
                         )
+                    except ValueError as exc:
+                        recovery["error"] = str(exc)
+                recovery = _broadcast_object(recovery)
+                if recovery["error"] is not None:
+                    retained = {
+                        Path(value).resolve()
+                        for item in located
+                        if item.compatibility.compatible
+                        and isinstance(
+                            item.compatibility.completion,
+                            dict,
+                        )
+                        for value in [
+                            item.compatibility.completion.get(
+                                "checkpoint_path"
+                            )
+                        ]
+                        if isinstance(value, str)
+                        and Path(value).is_file()
+                    }
+                    if len(retained) != 1:
+                        raise RuntimeError(
+                            "Multitask completion recovery failed: "
+                            f"{recovery['error']} Expected one compatible "
+                            "retained shared checkpoint, but found "
+                            f"{sorted(str(path) for path in retained)}."
+                        )
+                    recovery_checkpoint = next(iter(retained))
+                    logger.warning(
+                        "CSV recovery was unavailable; evaluating only "
+                        "missing multitask datasets from %s.",
+                        recovery_checkpoint,
+                    )
+                if recovery["recovered"]:
+                    located = [
+                        locate_completion(
+                            self.paths.log_root,
+                            self.campaign_hash,
+                            seed,
+                            dataset_name,
+                            scoped,
+                            campaign_aliases=self.campaign_aliases,
+                        )
+                        for dataset_name in scoped["data"]["datasets"]
+                    ]
+                if recovery_checkpoint is not None:
+                    pending[scope] = (
+                        scoped,
+                        located,
+                        False,
+                        recovery_checkpoint,
+                    )
+                    continue
+                replace = self._replacement_is_authorized(
+                    scope,
+                    seed,
+                    located,
+                )
+                _, _, complete = _scope_artifact_roots(
+                    self.paths,
+                    self.campaign_hash,
+                    seed,
+                    scoped,
+                    campaign_aliases=self.campaign_aliases,
+                    allow_replacement=replace,
+                )
+                if not complete:
+                    pending[scope] = (
+                        scoped,
+                        located,
+                        replace,
+                        None,
+                    )
+                    continue
+                failures = _maintain_completed_scope(
+                    self.paths,
+                    seed,
+                    scoped,
+                    located,
+                )
+                self.checkpoint_cleanup_failures.extend(failures)
+            if not pending:
+                return False
+            cloud_context = self._start_seed_cloud(seed)
+            for scope, pending_scope in pending.items():
+                trainer = None
+                archive: Optional[ReplacementArchive] = None
+                scoped, located, replace, recovery_checkpoint = pending_scope
+                try:
+                    archive_error: Optional[str] = None
+                    if replace:
+                        try:
+                            archive = _archive_completed_scope(
+                                self.paths,
+                                self.invocation_root,
+                                seed,
+                                scope,
+                                scoped,
+                                located,
+                            )
+                        except Exception as exc:
+                            archive_error = str(exc)
+                    archive_error = _broadcast_object(archive_error)
+                    if archive_error is not None:
+                        raise RuntimeError(
+                            "Completed-result archival failed: "
+                            f"{archive_error}"
+                        )
+                    seed_log_root = self.paths.seed_log_root(seed)
+                    seed_checkpoint_root = (
+                        self.paths.seed_checkpoint_root(seed)
+                    )
                     logger.debug(
                         "Seed %d selected artifact root %s.",
                         seed,
@@ -2044,15 +3041,98 @@ class CampaignRunner:
                                 log_dir=seed_log_root,
                                 checkpoint_dir=seed_checkpoint_root,
                                 campaign_hash=self.campaign_hash,
-                                run_mode="final",
+                                run_mode=(
+                                    "recovery" if recovery_checkpoint
+                                    else "final"
+                                ),
                                 campaign_aliases=self.campaign_aliases,
+                                selection_provenance=(
+                                    self.selection_provenance.get(scope)
+                                ),
+                                invocation_id=self.invocation_id,
                                 external_distributed=True,
                                 external_cloud=bool(cloud_context),
                             )
 
-                        self._run_adaptive_trainer(
-                            final_config,
-                            prepare_seed,
+                        if recovery_checkpoint is None:
+                            result = self._run_adaptive_trainer(
+                                final_config,
+                                prepare_seed,
+                            )
+                        else:
+                            batching_profiles = [
+                                item.compatibility.completion.get(
+                                    "batching"
+                                )
+                                for item in located
+                                if item.compatibility.compatible
+                                and isinstance(
+                                    item.compatibility.completion,
+                                    dict,
+                                )
+                            ]
+                            serialized_profiles = {
+                                canonical_json(profile)
+                                for profile in batching_profiles
+                                if isinstance(profile, dict)
+                            }
+                            if len(serialized_profiles) != 1:
+                                raise RuntimeError(
+                                    "Compatible multitask completions do "
+                                    "not share one runtime batching profile."
+                                )
+                            profile = json.loads(
+                                next(iter(serialized_profiles))
+                            )
+                            requested_batch = int(
+                                scoped["data"]["batch_size"]
+                            )
+                            world_size = get_world_size()
+                            profile_world_size = profile.get("world_size")
+                            profile_global_batch = profile.get(
+                                "requested_global_batch_size"
+                            )
+                            micro_batch = profile.get(
+                                "micro_batch_size"
+                            )
+                            if (
+                                profile_world_size != world_size
+                                or profile_global_batch != requested_batch
+                                or isinstance(micro_batch, bool)
+                                or not isinstance(micro_batch, int)
+                                or micro_batch <= 0
+                                or requested_batch
+                                % (world_size * micro_batch) != 0
+                            ):
+                                raise RuntimeError(
+                                    "Retained shared checkpoint batching is "
+                                    "incompatible with this invocation: "
+                                    f"{profile}."
+                                )
+                            trainer = ModelRegistry.create_trainer(
+                                final_config
+                            )
+                            prepare_seed(trainer)
+                            trainer.configure_runtime_batching(
+                                requested_batch,
+                                micro_batch,
+                                world_size,
+                            )
+                            missing = [
+                                item.path.parent.name
+                                for item in located
+                                if not item.compatibility.compatible
+                            ]
+                            result = trainer.recover_multitask_datasets(
+                                missing,
+                                recovery_checkpoint,
+                            )
+                        cleanup_failures = result.get(
+                            "checkpoint_cleanup_failures",
+                            [],
+                        )
+                        self.checkpoint_cleanup_failures.extend(
+                            cleanup_failures
                         )
                     else:
                         trainer = ModelRegistry.create_trainer(final_config)
@@ -2061,16 +3141,25 @@ class CampaignRunner:
                         trainer.ckpt_dir_override = (
                             seed_checkpoint_root.resolve()
                         )
+                        trainer.selection_provenance = (
+                            self.selection_provenance.get(scope)
+                        )
+                        trainer.campaign_invocation_id = self.invocation_id
                         trainer.campaign_hash = self.campaign_hash
                         trainer.campaign_aliases = self.campaign_aliases
                         trainer.external_cloud = bool(cloud_context)
                         trainer.run()
+                except BaseException:
+                    _restore_completed_scope(archive)
+                    raise
                 finally:
                     trainer = None
                     _release_training_state()
         finally:
-            if get_is_master():
+            if get_is_master() and cloud_context:
                 self._finish_seed_cloud(cloud_context)
+            _release_execution_locks(locks)
+        return True
 
     def _run_seeds(
         self,
@@ -2086,35 +3175,11 @@ class CampaignRunner:
         previous_failure: Optional[str] = None
         first_attempt_succeeded: Optional[bool] = None
 
-        pending: list[int] = []
-        for seed in seeds:
-            if _seed_scope_is_complete(
-                self.paths,
-                self.campaign_hash,
-                seed,
-                selected_configs,
-                campaign_aliases=tuple(
-                    getattr(self, "campaign_aliases", ())
-                ),
-            ):
-                skipped.append(seed)
-                logger.info(
-                    "Seed %d is already complete and compatible; skipping.",
-                    seed,
-                )
-                continue
-            pending.append(seed)
-
-        for index, seed in enumerate(pending):
-            attempted.append(seed)
-            logger.info(
-                "Starting seed %d; artifacts: %s.",
-                seed,
-                self.paths.seed_log_root(seed).resolve(),
-            )
+        for index, seed in enumerate(seeds):
             try:
-                self._run_seed(seed, selected_configs)
+                did_run = self._run_seed(seed, selected_configs)
             except Exception as exc:
+                attempted.append(seed)
                 fingerprint = failure_fingerprint(exc)
                 failed.append({
                     "seed": seed,
@@ -2130,9 +3195,18 @@ class CampaignRunner:
                     fingerprint,
                 )
                 if repeated:
-                    unattempted.extend(pending[index + 1:])
+                    unattempted.extend(seeds[index + 1:])
                     break
             else:
+                if did_run is False:
+                    skipped.append(seed)
+                    logger.info(
+                        "Seed %d is already complete and compatible; "
+                        "skipping.",
+                        seed,
+                    )
+                    continue
+                attempted.append(seed)
                 succeeded.append(seed)
                 logger.info(
                     "Seed %d completed; artifacts: %s.",
@@ -2498,12 +3572,21 @@ class CampaignRunner:
             ),
             "studies": studies,
             "completions": completions,
+            "ignored_legacy_namespaces": [
+                str(path)
+                for path in _ignored_configuration_namespaces(
+                    self.paths.log_root
+                )
+            ],
         }
 
     def run(self) -> Dict[str, Any]:
         """Run HPO if enabled, then execute independent configured seeds."""
         self._configure_campaign_logging()
         self._save_campaign_config()
+        paths = getattr(self, "paths", None)
+        if paths is not None:
+            _warn_ignored_configuration_namespaces(paths.log_root)
         hpo_enabled = self.hpo_config.enabled
         if (
             hpo_enabled

@@ -87,6 +87,7 @@ logging:
   experiment_name: brainomni-base
 
   ckpt_interval: 10
+  save_checkpoints: false
 
   # local logging
   run_dir: assets/run

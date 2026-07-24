@@ -107,3 +107,4 @@ logging:
   # Logging intervals
   log_step_interval: 1
   ckpt_interval: 20
+  save_checkpoints: false

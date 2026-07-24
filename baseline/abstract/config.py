@@ -331,6 +331,10 @@ class BaseLoggingArgs(BaseModel):
         event files in ``<run log directory>/tensorboard``. Default: False.
     ckpt_interval : int
         Number of completed epochs between checkpoint saves.
+    save_checkpoints : bool, optional, default=False
+        Whether to retain the validation-best checkpoint after successful
+        final evaluation. Pipelines may create temporary checkpoints even
+        when this is false, but remove them after completion.
     outputs : list[{'log', 'tensorboard', 'csv'}]
         Local artifacts to persist. ``'csv'`` writes metric event traces,
         ``'log'`` writes one console log file per invocation, and
@@ -352,6 +356,7 @@ class BaseLoggingArgs(BaseModel):
     level: Literal['debug', 'info', 'warning', 'error'] = 'info'
     ckpt_interval: int = 1
     use_tensorboard: bool = False
+    save_checkpoints: bool = False
 
     outputs: List[Literal['log', 'tensorboard', 'csv']] = Field(
         default_factory=lambda: ['csv']

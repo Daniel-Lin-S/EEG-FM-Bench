@@ -416,7 +416,7 @@ Every HPO scope has a full semantic study identity. New SQLite, trial, checkpoin
             └── trials/trial_<number>/
 ```
 
-Each trial directory contains its resolved configuration, decoded parameters, objective history, status, and epoch-level validation CSV.
+Each trial directory contains its resolved configuration, decoded parameters, objective history, status, and epoch-level validation CSV. Trial checkpoints are temporary and are removed after every complete, pruned, or failed trial.
 
 Legacy shared SQLite studies are inspected using the canonical campaign configuration, exact persisted Optuna distributions and decoded parameter metadata, objective direction, and completed budget. A directory suffix or study-name hash is never sufficient. A unique completed study is reused in place. Incomplete duplicate studies are reported and preserved, while all newly written trial and winner files use the namespaced layout.
 
@@ -436,8 +436,6 @@ python baseline_main.py conf_file=<local-config>.local.yaml model_type=brainomni
 
 The default is `seeds: [42]` (single-seed).
 
-Checkpoints for each repeated run are stored below the matching `seed_<seed>` directory in the campaign checkpoint root.
-
 The campaign identity excludes the seed list, so later invocations can add compatible seeds to the same result collection:
 
 ```text
@@ -456,7 +454,9 @@ The campaign identity excludes the seed list, so later invocations can add compa
     └── summary.json
 ```
 
-When a larger HPO budget selects a different final configuration, existing seed artifacts remain untouched. The changed configuration writes below `logs/seed_<seed>/configurations/<full-final-identity>/`, with the same relative layout and a mirrored checkpoint namespace. Completion discovery and aggregation inspect both this namespace and the legacy seed location; multiple compatible copies are rejected as ambiguous instead of being selected implicitly.
+Each requested seed and dataset is protected by a nonblocking execution lock. Compatible finite `completion.json` metadata at the ordinary path is authoritative and is skipped without requiring a checkpoint. Missing, malformed, invalid-status, or non-finite completions restart at epoch zero after their partial CSV, TensorBoard, and checkpoint artifacts are reset.
+
+Legacy `configurations/` namespaces are preserved but ignored. Execution, completion discovery, and aggregation use only the ordinary `logs/seed_<seed>/` paths.
 
 ##### Campaign identity and invocation records
 
@@ -480,7 +480,27 @@ Use the audit command to resolve identities, inspect legacy or duplicate studies
 python baseline_main.py audit-campaign conf_file=<local-config>.local.yaml
 ```
 
+##### Checkpoint retention
+
+Final-training checkpoint retention is controlled independently from HPO and seed selection:
+
+```yaml
+logging:
+  save_checkpoints: false
+```
+
+The default is `false`. Neural pipelines still create a temporary validation-best checkpoint, reload it for the single final test evaluation, write terminal completion metadata, and then remove best, periodic, and LoRA companion checkpoints for that dataset or multitask scope. A completed run records `has_checkpoint: false`, `checkpoint_path: null`, and does not emit a missing-checkpoint warning on later reuse.
+
+With `save_checkpoints: true`, only the single loadable validation-best checkpoint is retained. Periodic, superseded, and LoRA companion checkpoints are removed after completion. Cleanup failures are warnings recorded in the invocation status; they do not invalidate completion or trigger retraining.
+
+Incomplete runs do not use resume checkpoints. They restart from epoch zero and overwrite their partial metric artifacts.
+
+##### Completion replacement after HPO budget growth
+
+A completed result is replaced only when immutable provenance proves that the same semantic HPO study reached a strictly larger effective budget and selected different parameters. The old completed artifacts are archived under the current invocation before replacement. If replacement fails, new partial artifacts are removed and the archived completion is restored to the ordinary paths. Incomplete results are overwritten directly and are never archived.
+
 #### Step 3: Analysis & Visualization
+
 ```bash
 # Generate t-SNE embeddings
 python plot_vis.py t_sne assets/conf/baseline/csbrain/csbrain_unified.yaml plot/configs/example/tsne_config_csbrain.yaml

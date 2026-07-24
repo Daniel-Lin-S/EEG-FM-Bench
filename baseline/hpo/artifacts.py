@@ -53,56 +53,35 @@ class CampaignPaths:
     log_root: Path
     checkpoint_root: Path
 
-    def seed_log_root(
-        self,
-        seed: int,
-        config_identity: Optional[str] = None,
-    ) -> Path:
-        """Return the artifact root for one seed and configuration.
-
-        ``config_identity`` is omitted for the legacy/current base layout. A
-        full identity selects an immutable collision-avoidance namespace.
+    def seed_log_root(self, seed: int) -> Path:
+        """Return the ordinary artifact root for one seed.
 
         Parameters
         ----------
         seed : int
             Effective evaluation seed.
-        config_identity : str, optional, default=None
-            Full final-run identity for a collision-avoidance namespace.
 
         Returns
         -------
         pathlib.Path
             Seed artifact root matching ``log_root``.
         """
-        root = self.log_root / "logs" / f"seed_{seed}"
-        if config_identity is None:
-            return root
-        return root / "configurations" / config_identity
+        return self.log_root / "logs" / f"seed_{seed}"
 
-    def seed_checkpoint_root(
-        self,
-        seed: int,
-        config_identity: Optional[str] = None,
-    ) -> Path:
-        """Return the checkpoint root for one seed and configuration.
+    def seed_checkpoint_root(self, seed: int) -> Path:
+        """Return the ordinary checkpoint root for one seed.
 
         Parameters
         ----------
         seed : int
             Effective evaluation seed.
-        config_identity : str, optional, default=None
-            Full final-run identity for a collision-avoidance namespace.
 
         Returns
         -------
         pathlib.Path
-            Checkpoint root mirroring the selected log namespace.
+            Checkpoint root mirroring the ordinary seed log root.
         """
-        root = self.checkpoint_root / f"seed_{seed}"
-        if config_identity is None:
-            return root
-        return root / "configurations" / config_identity
+        return self.checkpoint_root / f"seed_{seed}"
 
     @property
     def summary_root(self) -> Path:
@@ -159,17 +138,20 @@ class CompletionCompatibility:
         Human-readable diagnostic for rejection or recovery.
     completion : Mapping[str, Any], optional, default=None
         Parsed completion metadata when valid JSON was available.
+    terminal : bool, optional, default=False
+        Whether the record is a structurally valid completed result even when
+        its semantic configuration is incompatible.
     """
-
     compatible: bool
     mode: str
     reason: str
     completion: Optional[Mapping[str, Any]] = None
+    terminal: bool = False
 
 
 @dataclass(frozen=True)
 class LocatedCompletion:
-    """Completion selected across legacy and identity namespaces.
+    """Completion selected from the ordinary seed artifact path.
 
     Parameters
     ----------
@@ -178,7 +160,7 @@ class LocatedCompletion:
     compatibility : CompletionCompatibility
         Compatibility result for the selected dataset-seed pair.
     existing_paths : tuple[pathlib.Path, ...]
-        Every existing completion candidate inspected for this pair.
+        The direct completion path when it exists, otherwise an empty tuple.
     """
 
     path: Path
@@ -187,7 +169,7 @@ class LocatedCompletion:
 
     @property
     def run_root(self) -> Path:
-        """Return the seed/configuration artifact root for ``path``."""
+        """Return the ordinary seed artifact root for ``path``."""
         return self.path.parents[2]
 
 
@@ -301,7 +283,7 @@ def _campaign_aliases(
         if final_component:
             aliases.add(final_component)
     for completion_path in sorted(
-        log_root.glob("logs/seed_*/**/completion.json")
+        log_root.glob("logs/seed_*/datasets/*/completion.json")
     ):
         try:
             completion = json.loads(
@@ -474,23 +456,19 @@ def _config_identity_hash(config: Mapping[str, Any]) -> str:
     return get_config_hash(config, bool(config.get("multitask")))
 
 
-def _completion_artifact_error(
+def _completion_artifact_validation(
     path: Path,
     completion: Mapping[str, Any],
     campaign_identifiers: frozenset[str],
     seed: int,
-) -> Optional[str]:
-    """Return a validation error for common completion artifacts."""
+) -> tuple[Optional[str], bool]:
+    """Return an artifact error and terminal-record classification."""
     if completion.get("status") != "completed":
-        return "completion status is not 'completed'"
-    if completion.get("campaign_hash") not in campaign_identifiers:
-        return "campaign identity is not an accepted semantic or legacy ID"
-    if completion.get("seed") != seed:
-        return "seed does not match"
+        return "completion status is not 'completed'", False
 
     metrics = completion.get("test_metrics")
     if not isinstance(metrics, dict):
-        return "test_metrics is not a mapping"
+        return "test_metrics is not a mapping", False
     numeric_count = 0
     for metric_key, value in metrics.items():
         if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -498,22 +476,29 @@ def _completion_artifact_error(
         numeric_count += 1
         if not math.isfinite(float(value)):
             return (
-                f"test metric '{metric_key}' is not finite at "
-                f"{path.resolve()}"
+                (
+                    f"test metric '{metric_key}' is not finite at "
+                    f"{path.resolve()}"
+                ),
+                False,
             )
     if numeric_count == 0:
-        return "test_metrics contains no numeric values"
+        return "test_metrics contains no numeric values", False
 
-    checkpoint = completion.get("checkpoint_path")
-    if completion.get("has_checkpoint") is not False:
-        if not isinstance(checkpoint, str) or not Path(checkpoint).is_file():
-            return "checkpoint_path is missing or does not exist"
-    return None
+    if completion.get("campaign_hash") not in campaign_identifiers:
+        return (
+            "campaign identity is not an accepted semantic or legacy ID",
+            True,
+        )
+    if completion.get("seed") != seed:
+        return "seed does not match", True
+    return None, True
 
 
 def _compatibility_failure(
     reason: str,
     completion: Optional[Mapping[str, Any]] = None,
+    terminal: bool = False,
 ) -> CompletionCompatibility:
     """Return one standardized rejected compatibility result."""
     return CompletionCompatibility(
@@ -521,6 +506,7 @@ def _compatibility_failure(
         mode="rejected",
         reason=reason,
         completion=completion,
+        terminal=terminal,
     )
 
 
@@ -676,14 +662,18 @@ def check_completion_compatibility(
         campaign_hash,
         *campaign_aliases,
     })
-    artifact_error = _completion_artifact_error(
+    artifact_error, terminal = _completion_artifact_validation(
         path,
         completion,
         campaign_identifiers,
         seed,
     )
     if artifact_error is not None:
-        return _compatibility_failure(artifact_error, completion)
+        return _compatibility_failure(
+            artifact_error,
+            completion,
+            terminal=terminal,
+        )
 
     if isinstance(expected_config, str):
         expected_hash = expected_config
@@ -704,6 +694,7 @@ def check_completion_compatibility(
             return _compatibility_failure(
                 "dataset configuration does not match",
                 completion,
+                terminal=True,
             )
 
     canonical_campaign = completion.get("campaign_hash") == campaign_hash
@@ -716,6 +707,7 @@ def check_completion_compatibility(
             mode="exact_canonical_hash",
             reason="canonical configuration hash matches",
             completion=completion,
+            terminal=True,
         )
     if isinstance(expected_config, str):
         if not canonical_campaign:
@@ -723,49 +715,25 @@ def check_completion_compatibility(
                 "a legacy campaign alias requires a selected configuration "
                 "for full semantic validation",
                 completion,
+                terminal=True,
             )
         return _compatibility_failure(
             "configuration hash does not match",
             completion,
+            terminal=True,
         )
-    return _legacy_runtime_batch_compatibility(
+    legacy = _legacy_runtime_batch_compatibility(
         path,
         completion,
         expected_config,
     )
-
-
-def _completion_candidate_paths(
-    campaign_root: Path,
-    seed: int,
-    dataset_name: str,
-) -> tuple[Path, ...]:
-    """Return legacy and identity-namespaced completion candidates.
-
-    Parameters
-    ----------
-    campaign_root : pathlib.Path
-        Campaign log root.
-    seed : int
-        Effective evaluation seed.
-    dataset_name : str
-        Dataset key in the selected configuration.
-
-    Returns
-    -------
-    tuple[pathlib.Path, ...]
-        Legacy path first, followed by full-identity namespaces.
-    """
-    seed_root = campaign_root / "logs" / f"seed_{seed}"
-    legacy_path = (
-        seed_root / "datasets" / dataset_name / "completion.json"
+    return CompletionCompatibility(
+        compatible=legacy.compatible,
+        mode=legacy.mode,
+        reason=legacy.reason,
+        completion=completion,
+        terminal=True,
     )
-    namespaced = sorted(
-        (
-            seed_root / "configurations"
-        ).glob(f"*/datasets/{dataset_name}/completion.json")
-    )
-    return (legacy_path, *namespaced)
 
 
 def locate_completion(
@@ -776,7 +744,7 @@ def locate_completion(
     expected_config: Mapping[str, Any] | str,
     campaign_aliases: Iterable[str] = (),
 ) -> LocatedCompletion:
-    """Locate one uniquely compatible completion across run namespaces.
+    """Locate one completion at the ordinary seed artifact path.
 
     Parameters
     ----------
@@ -796,57 +764,25 @@ def locate_completion(
     Returns
     -------
     LocatedCompletion
-        Unique compatible completion, a missing result, or a rejection with
-        every inspected path in its reason.
+        Direct-path completion and its compatibility result.
     """
-    candidates = _completion_candidate_paths(
-        campaign_root,
+    path = (
+        campaign_root
+        / "logs"
+        / f"seed_{seed}"
+        / "datasets"
+        / dataset_name
+        / "completion.json"
+    )
+    result = check_completion_compatibility(
+        path,
+        campaign_hash,
         seed,
-        dataset_name,
+        expected_config,
+        campaign_aliases=campaign_aliases,
     )
-    existing = tuple(path for path in candidates if path.is_file())
-    if not existing:
-        missing = check_completion_compatibility(
-            candidates[0],
-            campaign_hash,
-            seed,
-            expected_config,
-            campaign_aliases=campaign_aliases,
-        )
-        return LocatedCompletion(candidates[0], missing, existing)
-
-    inspected = [
-        (
-            path,
-            check_completion_compatibility(
-                path,
-                campaign_hash,
-                seed,
-                expected_config,
-                campaign_aliases=campaign_aliases,
-            ),
-        )
-        for path in existing
-    ]
-    compatible = [item for item in inspected if item[1].compatible]
-    if len(compatible) == 1:
-        path, result = compatible[0]
-        return LocatedCompletion(path, result, existing)
-    if len(compatible) > 1:
-        paths = ", ".join(str(path.resolve()) for path, _ in compatible)
-        result = _compatibility_failure(
-            "multiple compatible completions are ambiguous: " + paths
-        )
-        return LocatedCompletion(candidates[0], result, existing)
-
-    reasons = "; ".join(
-        f"{path.resolve()}: {result.reason}"
-        for path, result in inspected
-    )
-    result = _compatibility_failure(
-        "no compatible completion among existing candidates: " + reasons
-    )
-    return LocatedCompletion(existing[0], result, existing)
+    existing = (path,) if path.is_file() else ()
+    return LocatedCompletion(path, result, existing)
 
 
 def _append_metric_rows(
@@ -933,7 +869,7 @@ def collect_test_rows(
         compatible_config_hashes = {}
         logs_root = campaign_root / "logs"
         for completion_path in sorted(
-            logs_root.glob("seed_*/**/completion.json")
+            logs_root.glob("seed_*/datasets/*/completion.json")
         ):
             seed_parts = [
                 part for part in completion_path.parts

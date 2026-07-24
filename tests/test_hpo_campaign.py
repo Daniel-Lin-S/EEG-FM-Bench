@@ -311,8 +311,11 @@ def make_failure_runner(
     def run_seed(seed, selected):
         del selected
         outcome = outcomes.get(seed)
+        if outcome is False:
+            return False
         if outcome is not None:
             raise outcome
+        return True
 
     runner._run_seed = run_seed
     return runner
@@ -380,12 +383,10 @@ def test_skipped_seed_does_not_become_first_attempt(
     runner = make_failure_runner(
         tmp_path,
         monkeypatch,
-        {43: ValueError("first attempted seed failed")},
-    )
-    monkeypatch.setattr(
-        orchestrator_module,
-        "_seed_scope_is_complete",
-        lambda *args, **kwargs: args[2] == 42,
+        {
+            42: False,
+            43: ValueError("first attempted seed failed"),
+        },
     )
     invocation, eligible = runner._run_seeds({"fixed": {}})
     assert invocation["skipped"] == [42]

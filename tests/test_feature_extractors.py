@@ -400,7 +400,7 @@ def test_no_checkpoint_completion_skips_and_reports_clear_error(tmp_path):
     trainer._write_completion(DATASET_NAME, DATASET_CONFIG)
 
     assert trainer._dataset_is_complete(DATASET_NAME, DATASET_CONFIG)
-    with pytest.raises(FileNotFoundError, match="does not support checkpoint"):
+    with pytest.raises(FileNotFoundError, match="retention was disabled"):
         load_final_checkpoint(tmp_path, DATASET_NAME)
 
 

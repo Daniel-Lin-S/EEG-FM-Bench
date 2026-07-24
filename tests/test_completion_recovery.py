@@ -21,7 +21,13 @@ from baseline.hpo.artifacts import (
     write_campaign_summary,
 )
 from baseline.hpo.orchestrator import (
+    CampaignRunner,
+    _acquire_execution_locks,
+    _archive_completed_scope,
     _force_local_trial_logging,
+    _release_execution_locks,
+    _recover_multitask_from_csv,
+    _restore_completed_scope,
     _scope_artifact_roots,
 )
 from baseline.utils.run_artifacts import get_config_hash
@@ -157,13 +163,13 @@ def test_short_campaign_alias_requires_full_semantic_config(
     assert accepted.mode == "legacy_semantic_compatible"
 
 
-def test_namespaced_completion_is_discovered(
+def test_namespaced_completion_is_ignored(
     tmp_path: Path,
 ) -> None:
-    """A full-identity namespace participates in centralized discovery."""
+    """Legacy configuration namespaces never participate in discovery."""
     selected = _selected_config()
     config_hash = get_config_hash(selected, multitask=False)
-    expected_path = _write_completion(
+    ignored_path = _write_completion(
         tmp_path,
         config_hash,
         config_identity=config_hash,
@@ -177,30 +183,18 @@ def test_namespaced_completion_is_discovered(
         selected,
     )
 
-    assert located.compatibility.compatible is True
-    assert located.path == expected_path
-    summary = write_campaign_summary(
-        CampaignPaths(tmp_path, tmp_path / "checkpoints"),
-        CAMPAIGN_HASH,
-        {"attempted": [SEED], "complete": True},
-        {(SEED, DATASET_NAME): selected},
-    )
-    assert summary.written is True
-    assert summary.test_runs == [{
-        "dataset": DATASET_NAME,
-        "seed": SEED,
-        "metric": "acc",
-        "value": 0.75,
+    assert located.compatibility.mode == "missing"
+    assert located.path != ignored_path
+    assert ignored_path.is_file()
 
-    }]
 
-def test_duplicate_compatible_completions_are_ambiguous(
+def test_direct_completion_wins_over_ignored_namespace(
     tmp_path: Path,
 ) -> None:
-    """Two valid locations are rejected instead of chosen implicitly."""
+    """A legacy namespace cannot make one direct completion ambiguous."""
     selected = _selected_config()
     config_hash = get_config_hash(selected, multitask=False)
-    _write_completion(tmp_path, config_hash)
+    direct_path = _write_completion(tmp_path, config_hash)
     _write_completion(
         tmp_path,
         config_hash,
@@ -215,38 +209,30 @@ def test_duplicate_compatible_completions_are_ambiguous(
         selected,
     )
 
-    assert located.compatibility.compatible is False
-    assert "multiple compatible completions" in (
-        located.compatibility.reason
-    )
+    assert located.compatibility.compatible is True
+    assert located.path == direct_path
 
 
-def test_changed_final_config_uses_namespace_without_overwrite(
+def test_changed_final_config_aborts_without_proven_budget_growth(
     tmp_path: Path,
 ) -> None:
-    """A changed HPO winner never reuses a stale final artifact root."""
+    """A semantic mismatch cannot overwrite a completed direct result."""
     old_config = _selected_config()
     old_hash = get_config_hash(old_config, multitask=False)
     old_path = _write_completion(tmp_path, old_hash)
     original = old_path.read_bytes()
     selected = copy.deepcopy(old_config)
     selected["model"]["classifier_head"]["hidden_dims"] = [64]
-    selected_hash = get_config_hash(selected, multitask=False)
     paths = CampaignPaths(tmp_path, tmp_path / "checkpoints")
 
-    log_root, checkpoint_root, complete = _scope_artifact_roots(
-        paths,
-        CAMPAIGN_HASH,
-        SEED,
-        selected,
-    )
+    with pytest.raises(RuntimeError, match="cannot be overwritten"):
+        _scope_artifact_roots(
+            paths,
+            CAMPAIGN_HASH,
+            SEED,
+            selected,
+        )
 
-    assert complete is False
-    assert log_root == paths.seed_log_root(SEED, selected_hash)
-    assert checkpoint_root == paths.seed_checkpoint_root(
-        SEED,
-        selected_hash,
-    )
     assert old_path.read_bytes() == original
 
 
@@ -307,19 +293,37 @@ def test_legacy_recovery_rejects_semantic_or_invalid_batch_changes(
     assert "positive divisor" in invalid_batch.reason
 
 
-@pytest.mark.parametrize("failure", ["missing_checkpoint", "nonfinite"])
-def test_completion_rejects_invalid_artifacts(
+def test_missing_checkpoint_does_not_invalidate_completion(
     tmp_path: Path,
-    failure: str,
 ) -> None:
-    """Missing checkpoints and non-finite metrics are rejected."""
+    """Finite terminal metadata is authoritative without a checkpoint."""
     selected = _selected_config()
     config_hash = get_config_hash(selected, multitask=False)
-    metric = float("nan") if failure == "nonfinite" else 0.75
-    path = _write_completion(tmp_path, config_hash, metric=metric)
-    if failure == "missing_checkpoint":
-        completion = json.loads(path.read_text(encoding="utf-8"))
-        Path(completion["checkpoint_path"]).unlink()
+    path = _write_completion(tmp_path, config_hash)
+    completion = json.loads(path.read_text(encoding="utf-8"))
+    Path(completion["checkpoint_path"]).unlink()
+
+    result = check_completion_compatibility(
+        path,
+        CAMPAIGN_HASH,
+        SEED,
+        selected,
+    )
+
+    assert result.compatible is True
+
+
+def test_completion_rejects_nonfinite_metrics(
+    tmp_path: Path,
+) -> None:
+    """A non-finite terminal metric is incomplete and must be restarted."""
+    selected = _selected_config()
+    config_hash = get_config_hash(selected, multitask=False)
+    path = _write_completion(
+        tmp_path,
+        config_hash,
+        metric=float("nan"),
+    )
 
     result = check_completion_compatibility(
         path,
@@ -425,3 +429,216 @@ def test_hpo_trial_text_logs_follow_debug_verbosity() -> None:
     }
     _force_local_trial_logging(debug)
     assert debug["logging"]["outputs"] == ["log", "csv"]
+
+
+def test_execution_lock_rejects_a_concurrent_scope(
+    tmp_path: Path,
+) -> None:
+    """Two invocations cannot execute one semantic seed scope together."""
+    paths = CampaignPaths(tmp_path / "log", tmp_path / "checkpoints")
+    scopes = {DATASET_NAME: _selected_config()}
+    first = _acquire_execution_locks(paths, SEED, scopes)
+    try:
+        with pytest.raises(RuntimeError, match="execution lock"):
+            _acquire_execution_locks(paths, SEED, scopes)
+    finally:
+        _release_execution_locks(first)
+    second = _acquire_execution_locks(paths, SEED, scopes)
+    _release_execution_locks(second)
+
+
+def test_larger_hpo_budget_and_changed_winner_authorize_replacement(
+    tmp_path: Path,
+) -> None:
+    """Replacement requires one study, budget growth, and a new winner."""
+    old_config = _selected_config()
+    completion_path = _write_completion(
+        tmp_path,
+        get_config_hash(old_config, multitask=False),
+    )
+    completion = json.loads(
+        completion_path.read_text(encoding="utf-8")
+    )
+    completion["selection_provenance"] = {
+        "source": "hpo",
+        "scope": DATASET_NAME,
+        "study_identity": "study",
+        "effective_budget": 30,
+        "parameter_digest": "old",
+    }
+    completion_path.write_text(
+        json.dumps(completion),
+        encoding="utf-8",
+    )
+    selected = copy.deepcopy(old_config)
+    selected["model"]["classifier_head"]["hidden_dims"] = [64]
+    located = locate_completion(
+        tmp_path,
+        CAMPAIGN_HASH,
+        SEED,
+        DATASET_NAME,
+        selected,
+    )
+    runner = CampaignRunner.__new__(CampaignRunner)
+    runner.paths = CampaignPaths(tmp_path, tmp_path / "checkpoints")
+    runner.selection_provenance = {
+        DATASET_NAME: {
+            "source": "hpo",
+            "scope": DATASET_NAME,
+            "study_identity": "study",
+            "effective_budget": 31,
+            "parameter_digest": "new",
+        },
+    }
+
+    assert runner._replacement_is_authorized(
+        DATASET_NAME,
+        SEED,
+        [located],
+    )
+    runner.selection_provenance[DATASET_NAME]["effective_budget"] = 30
+    assert not runner._replacement_is_authorized(
+        DATASET_NAME,
+        SEED,
+        [located],
+    )
+
+
+def test_completed_replacement_archive_restores_after_failure(
+    tmp_path: Path,
+) -> None:
+    """A failed new attempt restores the archived ordinary artifacts."""
+    selected = _selected_config()
+    completion_path = _write_completion(
+        tmp_path,
+        get_config_hash(selected, multitask=False),
+    )
+    original_completion = completion_path.read_bytes()
+    csv_path = (
+        tmp_path / "logs" / f"seed_{SEED}" / "csv"
+        / f"{DATASET_NAME}.csv"
+    )
+    csv_path.parent.mkdir(parents=True)
+    csv_path.write_text("old metrics", encoding="utf-8")
+    checkpoint = (
+        tmp_path / "checkpoints" / f"seed_{SEED}" / "seperated"
+        / DATASET_NAME / "best.pt"
+    )
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_text("old checkpoint", encoding="utf-8")
+    paths = CampaignPaths(tmp_path, tmp_path / "checkpoints")
+    located = locate_completion(
+        tmp_path,
+        CAMPAIGN_HASH,
+        SEED,
+        DATASET_NAME,
+        selected,
+    )
+
+    archive = _archive_completed_scope(
+        paths,
+        tmp_path / "invocations" / "replacement",
+        SEED,
+        DATASET_NAME,
+        selected,
+        [located],
+    )
+    assert archive is not None
+    assert not completion_path.exists()
+    completion_path.write_text("new partial", encoding="utf-8")
+    csv_path.write_text("new partial", encoding="utf-8")
+    checkpoint.write_text("new partial", encoding="utf-8")
+
+    _restore_completed_scope(archive)
+
+    assert completion_path.read_bytes() == original_completion
+    assert csv_path.read_text(encoding="utf-8") == "old metrics"
+    assert checkpoint.read_text(encoding="utf-8") == "old checkpoint"
+
+
+def test_partial_multitask_completion_recovers_from_shared_csv(
+    tmp_path: Path,
+) -> None:
+    """Unambiguous best-validation and test rows recover a missing pair."""
+    second_dataset = "bcic_1a"
+    selected = BrainOmniConfig(
+        seeds=[SEED],
+        multitask=True,
+        data={
+            "datasets": {
+                DATASET_NAME: DATASET_CONFIG,
+                second_dataset: DATASET_CONFIG,
+            },
+        },
+    ).model_dump(mode="json")
+    config_hash = get_config_hash(selected, multitask=True)
+    first_path = _completion_path(tmp_path)
+    first_path.parent.mkdir(parents=True, exist_ok=True)
+    first_path.write_text(
+        json.dumps({
+            "status": "completed",
+            "campaign_hash": CAMPAIGN_HASH,
+            "config_hash": config_hash,
+            "seed": SEED,
+            "dataset_config": DATASET_CONFIG,
+            "execution_id": "shared-run",
+            "has_checkpoint": False,
+            "checkpoint_path": None,
+            "checkpoint_retention_requested": False,
+            "validation_metrics": {
+                f"{DATASET_NAME}/eval/epoch": 2,
+                f"{DATASET_NAME}/eval/loss": 0.5,
+            },
+            "test_metrics": {
+                f"{DATASET_NAME}/test/loss": 0.6,
+            },
+            "batching": {
+                "requested_global_batch_size": 32,
+                "world_size": 1,
+                "micro_batch_size": 16,
+                "accumulation_steps": 2,
+            },
+        }),
+        encoding="utf-8",
+    )
+    second_path = (
+        tmp_path / "logs" / f"seed_{SEED}" / "datasets"
+        / second_dataset / "completion.json"
+    )
+    located = [
+        locate_completion(
+            tmp_path,
+            CAMPAIGN_HASH,
+            SEED,
+            dataset_name,
+            selected,
+        )
+        for dataset_name in (DATASET_NAME, second_dataset)
+    ]
+    csv_path = (
+        tmp_path / "logs" / f"seed_{SEED}" / "csv" / "training.csv"
+    )
+    csv_path.parent.mkdir(parents=True)
+    csv_path.write_text(
+        "timestamp,dataset,split,epoch,step,metric,value\n"
+        f"now,{second_dataset},eval,2,3,loss,0.7\n"
+        f"now,{second_dataset},test,4,3,loss,0.8\n",
+        encoding="utf-8",
+    )
+
+    recovered = _recover_multitask_from_csv(
+        CampaignPaths(tmp_path, tmp_path / "checkpoints"),
+        CAMPAIGN_HASH,
+        SEED,
+        selected,
+        located,
+        {"source": "fixed"},
+        "recovery-invocation",
+    )
+
+    assert recovered is True
+    completion = json.loads(second_path.read_text(encoding="utf-8"))
+    assert completion["test_metrics"] == {
+        f"{second_dataset}/test/loss": 0.8,
+    }
+    assert completion["checkpoint_path"] is None

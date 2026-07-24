@@ -125,4 +125,5 @@ logging:
   # Logging intervals
   log_step_interval: 1      # Log every N steps
   ckpt_interval: 5       # Evaluate every N epochs
+  save_checkpoints: false
 

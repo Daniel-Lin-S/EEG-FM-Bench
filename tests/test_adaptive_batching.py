@@ -7,8 +7,9 @@ optimizer update without creating datasets or campaign artifacts.
 
 from __future__ import annotations
 
-from typing import Any
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -229,3 +230,68 @@ def test_accumulation_normalizes_by_samples() -> None:
     assert trainer.current_step == 2
     assert trainer.scheduler.steps == 2
     assert trainer.model.weight.detach().item() == pytest.approx(0.36)
+
+
+@pytest.mark.parametrize("retain", [False, True])
+def test_checkpoint_cleanup_retains_only_requested_best(
+    tmp_path: Path,
+    retain: bool,
+) -> None:
+    """Final cleanup discards all or retains only the loadable best state."""
+    config = BrainOmniConfig(
+        logging={"save_checkpoints": retain},
+    )
+    trainer = DummyTrainer(config)
+    trainer.ckpt_dir = str(tmp_path / "checkpoints")
+    trainer.checkpoint_cleanup_failures = []
+    checkpoint_root = (
+        Path(trainer.ckpt_dir) / "seperated" / "alpha"
+    )
+    checkpoint_root.mkdir(parents=True)
+    best = checkpoint_root / "dummy_alpha_best.pt"
+    companion = checkpoint_root / "dummy_alpha_best_lora.pt"
+    periodic = checkpoint_root / "dummy_alpha_epoch_1.pt"
+    for path in (best, companion, periodic):
+        path.write_text(path.name, encoding="utf-8")
+
+    failures = trainer._cleanup_checkpoint_artifacts("alpha", best)
+
+    assert failures == []
+    if retain:
+        assert {path.name for path in checkpoint_root.iterdir()} == {
+            best.name,
+        }
+    else:
+        assert not checkpoint_root.exists()
+
+
+def test_incomplete_dataset_reset_removes_only_partial_artifacts(
+    tmp_path: Path,
+) -> None:
+    """Epoch-zero restart clears partial outputs but keeps diagnostics."""
+    trainer = DummyTrainer(BrainOmniConfig())
+    trainer.log_dir = str(tmp_path / "log")
+    trainer.ckpt_dir = str(tmp_path / "checkpoints")
+    completion = trainer._completion_path("alpha")
+    csv_path = Path(trainer.log_dir) / "csv" / "alpha.csv"
+    tensorboard = Path(trainer.log_dir) / "tensorboard" / "alpha"
+    checkpoint = (
+        Path(trainer.ckpt_dir)
+        / "seperated"
+        / "alpha"
+        / "partial.pt"
+    )
+    diagnostic = Path(trainer.log_dir) / "configs" / "old.yaml"
+    for path in (completion, csv_path, checkpoint, diagnostic):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("partial", encoding="utf-8")
+    tensorboard.mkdir(parents=True)
+    (tensorboard / "events").write_text("partial", encoding="utf-8")
+
+    trainer._reset_dataset_outputs("alpha")
+
+    assert not completion.exists()
+    assert not csv_path.exists()
+    assert not tensorboard.exists()
+    assert not checkpoint.parent.exists()
+    assert diagnostic.is_file()
