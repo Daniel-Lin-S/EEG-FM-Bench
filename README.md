@@ -509,6 +509,43 @@ python plot_vis.py t_sne assets/conf/baseline/csbrain/csbrain_unified.yaml plot/
 python plot_vis.py integrated_gradients assets/conf/baseline/csbrain/csbrain_unified.yaml plot/configs/example/integrated_gradients_config_csbrain.yaml
 ```
 
+#### Cross-artifact test-result comparison
+
+Use a local YAML specification to compare completed artifact summaries without
+modifying their source directories:
+
+```bash
+cp assets/conf/analysis/result_comparison.example.yaml <comparison.local.yaml>
+python result_vis.py <comparison.local.yaml>
+```
+
+The YAML must use absolute paths, explicit labels, and a direction for every
+selected test metric. Labels can describe models, experimental conditions, or
+any other run distinction. `epoch` is never allowed; list `loss` explicitly
+with `direction: minimize` when it should be compared.
+
+```yaml
+artifacts:
+  - label: condition_a
+    root: <absolute artifact root>
+  - label: condition_b
+    root: <absolute artifact root>
+metrics:
+  - name: acc
+    direction: maximize
+  - name: loss
+    direction: minimize
+output_dir: <absolute comparison output root>
+statistics:
+  near_best_q_threshold: 0.05
+```
+
+The separate output root contains normalized CSVs, per-metric figures,
+Mann–Whitney U and Cliff's-delta statistics with per-metric BH-FDR q-values,
+and a copyable Markdown plus PNG performance table. Best mean values are bold;
+`†` marks lower-ranked results that are not distinguishable from the best at
+the configured adjusted-q threshold.
+
 #### Step 4: Gradient/Representation Analysis (New)
 
 This analysis is a two-stage workflow:

@@ -1,0 +1,28 @@
+# Cross-artifact test-result comparison template.
+#
+# Copy this public template to a local YAML file, replace every placeholder
+# path with an absolute path, then run:
+#   python result_vis.py <comparison.local.yaml>
+#
+# Labels describe any comparison condition. They do not need to be model names.
+
+artifacts:
+  - label: condition_a
+    root: /replace/with/absolute/artifact_root_a
+  - label: condition_b
+    root: /replace/with/absolute/artifact_root_b
+
+# Select only test metrics to compare. epoch is intentionally forbidden.
+# Add loss only when it should be compared with direction: minimize.
+metrics:
+  - name: acc
+    direction: maximize
+  - name: f1
+    direction: maximize
+
+# This directory is owned by result_vis.py. It must not be inside an artifact.
+output_dir: /replace/with/absolute/comparison_output_root
+
+statistics:
+  # Lower-ranked table cells receive † when q is at least this threshold.
+  near_best_q_threshold: 0.05
