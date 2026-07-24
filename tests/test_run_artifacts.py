@@ -32,12 +32,12 @@ def test_logging_level_is_normalized_and_not_part_of_identity() -> None:
 
 
 
-def test_single_task_hash_ignores_dataset_selection() -> None:
-    """Single-task experiment identity remains stable as datasets are added."""
+def test_final_run_identity_includes_dataset_selection() -> None:
+    """Completion identity includes its selected dataset configuration."""
     config = BrainOmniConfig().model_dump(mode='json')
     first_hash = get_config_hash(config, multitask=False)
     config['data']['datasets'] = {'bcic_1a': 'finetune'}
-    assert first_hash == get_config_hash(config, multitask=False)
+    assert first_hash != get_config_hash(config, multitask=False)
     assert first_hash != get_config_hash(config, multitask=True)
 
 

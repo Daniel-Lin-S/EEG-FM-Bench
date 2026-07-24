@@ -7,6 +7,10 @@ Run a fixed configuration for every top-level seed::
 
     python baseline_main.py conf_file=assets/conf/baseline/example.yaml
 
+Audit campaign reuse without writing artifacts or starting trainers::
+
+    python baseline_main.py audit-campaign conf_file=example.yaml
+
 Override campaign or HPO fields without changing YAML::
 
     python baseline_main.py conf_file=example.yaml seeds=[42,43,44]
@@ -27,6 +31,7 @@ logs/seed_<seed>. HPO trials and aggregate test summaries are stored under
 the same campaign root.
 """
 
+import json
 import sys
 import warnings
 from typing import Any
@@ -144,6 +149,19 @@ def main() -> None:
     CampaignRunner(config, hpo_config, config_class).run()
 
 
+def audit_campaign() -> None:
+    """Print a read-only semantic campaign and artifact audit as JSON."""
+    register_builtin_models()
+    setup_yaml()
+    config_class, config, hpo_config = _load_configs()
+    report = CampaignRunner(
+        config,
+        hpo_config,
+        config_class,
+    ).audit()
+    print(json.dumps(report, indent=2, sort_keys=True))
+
+
 def list_available_models() -> None:
     """Print all registered baseline model identifiers."""
     register_builtin_models()
@@ -155,5 +173,8 @@ def list_available_models() -> None:
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "list-models":
         list_available_models()
+    elif len(sys.argv) > 1 and sys.argv[1] == "audit-campaign":
+        sys.argv.pop(1)
+        audit_campaign()
     else:
         main()

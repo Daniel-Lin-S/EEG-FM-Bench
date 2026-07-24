@@ -3,29 +3,34 @@
 Each invocation stores the fully resolved trainer configuration in YAML. The
 helpers here validate saved data directly and never merge source files.
 """
-import hashlib
 import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 import yaml
 
+from baseline.utils.identity import get_run_identity
+
 if TYPE_CHECKING:
     from baseline.abstract.config import AbstractConfig
 
 
-CONFIG_HASH_LENGTH = 12
-
-
 def get_config_hash(config: dict[str, Any], multitask: bool) -> str:
-    """Return a stable experiment hash for a resolved configuration."""
-    identity = json.loads(json.dumps(config, sort_keys=True))
-    identity["logging"].pop("run_dir", None)
-    identity["logging"].pop("level", None)
-    if not multitask:
-        identity["data"].pop("datasets", None)
-    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:CONFIG_HASH_LENGTH]
+    """Return a full semantic identity for a resolved configuration.
+
+    Parameters
+    ----------
+    config : dict[str, Any]
+        Final seed-scoped resolved trainer configuration.
+    multitask : bool
+        Whether the trainer jointly evaluates multiple datasets.
+
+    Returns
+    -------
+    str
+        Full SHA-256 semantic execution identity.
+    """
+    return get_run_identity(config, multitask)
 
 
 def save_resolved_config(config: dict[str, Any], path: Path) -> None:
@@ -72,10 +77,14 @@ def load_saved_run_config(
         )
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     if not isinstance(config, dict):
-        raise ValueError(f"Saved configuration at {config_path} is not a mapping.")
+        raise ValueError(
+            f"Saved configuration at {config_path} is not a mapping."
+        )
     model_type = config.get("model_type")
     if not isinstance(model_type, str) or not model_type:
-        raise ValueError(f"Saved configuration at {config_path} has no model_type.")
+        raise ValueError(
+            f"Saved configuration at {config_path} has no model_type."
+        )
     from baseline.abstract.factory import ModelRegistry
 
     config_class = ModelRegistry.get_config_class(model_type)
@@ -85,7 +94,9 @@ def load_saved_run_config(
 def load_final_checkpoint(run_dir: str | Path, dataset_name: str) -> Path:
     """Return a dataset final checkpoint recorded by a completed run."""
     artifact_dir = Path(run_dir).resolve()
-    completion_path = artifact_dir / "datasets" / dataset_name / "completion.json"
+    completion_path = (
+        artifact_dir / "datasets" / dataset_name / "completion.json"
+    )
     if not completion_path.is_file():
         raise FileNotFoundError(
             f"Completion metadata for dataset '{dataset_name}' was not found "

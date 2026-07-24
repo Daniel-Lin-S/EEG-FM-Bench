@@ -7,22 +7,31 @@ files. Outputs are atomic JSON/CSV summaries under the campaign log root.
 from __future__ import annotations
 
 import csv
-import hashlib
 import json
+import logging
 import math
 import re
 import statistics
-import warnings
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Mapping, Optional
+from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
 
 import yaml
 
+from baseline.utils.identity import (
+    IDENTITY_VERSION,
+    build_campaign_semantic_config,
+    build_run_semantic_config,
+    get_campaign_identity,
+    get_legacy_run_hash,
+    semantic_digest,
+    short_identity,
+)
 from baseline.utils.run_artifacts import get_config_hash
 
 
-CONFIG_HASH_LENGTH = 12
+logger = logging.getLogger("baseline")
 SEED_DIRECTORY_PATTERN = re.compile(r"^seed_(\d+)$")
 ABSOLUTE_PATH_PATTERN = re.compile(r"(?:/[\w.\-]+){2,}")
 VOLATILE_TOKEN_PATTERN = re.compile(
@@ -35,6 +44,8 @@ VOLATILE_NUMBER_PATTERN = re.compile(
     r"(?:\d+(?:\.\d*)?|\.\d+)"
     r"(?:[eE][-+]?\d+)?"
 )
+
+
 @dataclass(frozen=True)
 class CampaignPaths:
     """Resolved log and checkpoint locations for one campaign."""
@@ -42,18 +53,96 @@ class CampaignPaths:
     log_root: Path
     checkpoint_root: Path
 
-    def seed_log_root(self, seed: int) -> Path:
-        """Return the current-style artifact root for one seed."""
-        return self.log_root / "logs" / f"seed_{seed}"
+    def seed_log_root(
+        self,
+        seed: int,
+        config_identity: Optional[str] = None,
+    ) -> Path:
+        """Return the artifact root for one seed and configuration.
 
-    def seed_checkpoint_root(self, seed: int) -> Path:
-        """Return the checkpoint root for one seed."""
-        return self.checkpoint_root / f"seed_{seed}"
+        ``config_identity`` is omitted for the legacy/current base layout. A
+        full identity selects an immutable collision-avoidance namespace.
+
+        Parameters
+        ----------
+        seed : int
+            Effective evaluation seed.
+        config_identity : str, optional, default=None
+            Full final-run identity for a collision-avoidance namespace.
+
+        Returns
+        -------
+        pathlib.Path
+            Seed artifact root matching ``log_root``.
+        """
+        root = self.log_root / "logs" / f"seed_{seed}"
+        if config_identity is None:
+            return root
+        return root / "configurations" / config_identity
+
+    def seed_checkpoint_root(
+        self,
+        seed: int,
+        config_identity: Optional[str] = None,
+    ) -> Path:
+        """Return the checkpoint root for one seed and configuration.
+
+        Parameters
+        ----------
+        seed : int
+            Effective evaluation seed.
+        config_identity : str, optional, default=None
+            Full final-run identity for a collision-avoidance namespace.
+
+        Returns
+        -------
+        pathlib.Path
+            Checkpoint root mirroring the selected log namespace.
+        """
+        root = self.checkpoint_root / f"seed_{seed}"
+        if config_identity is None:
+            return root
+        return root / "configurations" / config_identity
 
     @property
     def summary_root(self) -> Path:
         """Return the campaign summary directory."""
         return self.log_root / "summary"
+
+
+@dataclass(frozen=True)
+class CampaignResolution:
+    """Resolved semantic campaign and its artifact aliases.
+
+    Parameters
+    ----------
+    paths : CampaignPaths
+        Selected log and checkpoint roots.
+    campaign_identity : str
+        Full SHA-256 semantic campaign identity.
+    semantic_config : Mapping[str, Any]
+        Canonical semantic parameters for ``campaign.yaml``.
+    aliases : frozenset[str]
+        Historical or display identifiers accepted for legacy artifacts.
+    legacy : bool
+        Whether an existing legacy campaign manifest was selected.
+    """
+
+    paths: CampaignPaths
+    campaign_identity: str
+    semantic_config: Mapping[str, Any]
+    aliases: frozenset[str]
+    legacy: bool
+
+
+@dataclass(frozen=True)
+class CampaignSummaryResult:
+    """In-memory campaign summary and persisted status payload."""
+
+    status: Mapping[str, Any]
+    test_runs: Sequence[Mapping[str, Any]]
+    test_summary: Sequence[Mapping[str, Any]]
+    written: bool
 
 
 @dataclass(frozen=True)
@@ -78,28 +167,36 @@ class CompletionCompatibility:
     completion: Optional[Mapping[str, Any]] = None
 
 
+@dataclass(frozen=True)
+class LocatedCompletion:
+    """Completion selected across legacy and identity namespaces.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Selected completion path, or the expected legacy path when missing.
+    compatibility : CompletionCompatibility
+        Compatibility result for the selected dataset-seed pair.
+    existing_paths : tuple[pathlib.Path, ...]
+        Every existing completion candidate inspected for this pair.
+    """
+
+    path: Path
+    compatibility: CompletionCompatibility
+    existing_paths: tuple[Path, ...]
+
+    @property
+    def run_root(self) -> Path:
+        """Return the seed/configuration artifact root for ``path``."""
+        return self.path.parents[2]
+
+
 def get_campaign_hash(
     config: Mapping[str, Any],
     hpo: Optional[Mapping[str, Any]],
 ) -> str:
-    """Return a stable campaign identity excluding seeds and HPO budget."""
-    identity = json.loads(json.dumps(config, sort_keys=True))
-    identity.pop("seeds", None)
-    logging_config = identity.get("logging")
-    if isinstance(logging_config, dict):
-        logging_config.pop("run_dir", None)
-        logging_config.pop("level", None)
-
-    hpo_identity: Dict[str, Any] = {}
-    if hpo and hpo.get("enabled"):
-        hpo_identity = json.loads(json.dumps(hpo, sort_keys=True))
-        hpo_identity.pop("n_trials", None)
-        hpo_identity.pop("max_consecutive_failed_trials", None)
-    identity["hpo"] = hpo_identity
-    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[
-        :CONFIG_HASH_LENGTH
-    ]
+    """Return the full versioned semantic campaign identity."""
+    return get_campaign_identity(config, hpo)
 
 
 def build_campaign_paths(
@@ -110,10 +207,229 @@ def build_campaign_paths(
 ) -> CampaignPaths:
     """Build absolute log and checkpoint campaign roots."""
     root = Path(run_dir).resolve()
-    name = f"{experiment_name}-{campaign_hash}"
+    display_hash = campaign_hash
+    if len(campaign_hash) == 64:
+        display_hash = short_identity(campaign_hash)
+    name = f"{experiment_name}-{display_hash}"
     log_root = root / "log" / "baseline" / model_type / name
     checkpoint_root = root / "ckpt" / "baseline" / model_type / name
     return CampaignPaths(log_root=log_root, checkpoint_root=checkpoint_root)
+
+
+def _read_campaign_manifest(path: Path) -> dict[str, Any]:
+    """Read one campaign YAML mapping without modifying it.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Absolute or relative path to ``campaign.yaml``.
+
+    Returns
+    -------
+    dict[str, Any]
+        Parsed campaign mapping.
+
+    Raises
+    ------
+    ValueError
+        If the file is unreadable, malformed, or not a mapping.
+    """
+    try:
+        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        raise ValueError(
+            f"Campaign manifest at {path.resolve()} is invalid: {exc}."
+        ) from exc
+    if not isinstance(payload, dict):
+        raise ValueError(
+            f"Expected a mapping at {path.resolve()}, but got "
+            f"{type(payload).__name__}."
+        )
+    return payload
+
+
+def _manifest_semantic_config(
+    manifest: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Canonicalize a current or legacy campaign manifest.
+
+    Parameters
+    ----------
+    manifest : Mapping[str, Any]
+        Parsed ``campaign.yaml`` payload.
+
+    Returns
+    -------
+    dict[str, Any]
+        Version-two semantic campaign parameters.
+    """
+    model_config = json.loads(json.dumps(manifest, sort_keys=True))
+    hpo = model_config.pop("hpo", {})
+    return build_campaign_semantic_config(model_config, hpo)
+
+
+def _campaign_aliases(
+    log_root: Path,
+    experiment_name: str,
+    campaign_identity: str,
+) -> frozenset[str]:
+    """Return accepted current and legacy identifiers for one root.
+
+    Parameters
+    ----------
+    log_root : pathlib.Path
+        Selected campaign log root.
+    experiment_name : str
+        Requested human-readable experiment label.
+    campaign_identity : str
+        Full semantic campaign identity.
+
+    Returns
+    -------
+    frozenset[str]
+        Full identity, display prefix, detectable directory suffix, and IDs
+        recovered from contained completion metadata.
+    """
+    aliases = {campaign_identity, short_identity(campaign_identity)}
+    prefix = f"{experiment_name}-"
+    if log_root.name.startswith(prefix):
+        suffix = log_root.name[len(prefix):]
+        if suffix:
+            aliases.add(suffix)
+    else:
+        final_component = log_root.name.rsplit("-", maxsplit=1)[-1]
+        if final_component:
+            aliases.add(final_component)
+    for completion_path in sorted(
+        log_root.glob("logs/seed_*/**/completion.json")
+    ):
+        try:
+            completion = json.loads(
+                completion_path.read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(completion, dict):
+            continue
+        stored_identity = completion.get("campaign_hash")
+        if isinstance(stored_identity, str) and stored_identity:
+            aliases.add(stored_identity)
+    return frozenset(aliases)
+
+
+def resolve_campaign(
+    run_dir: str,
+    model_type: str,
+    experiment_name: str,
+    config: Mapping[str, Any],
+    hpo: Optional[Mapping[str, Any]],
+) -> CampaignResolution:
+    """Resolve a unique semantic campaign root, including legacy roots.
+
+    Parameters
+    ----------
+    run_dir : str
+        Configured artifact root.
+    model_type : str
+        Registered baseline model identifier.
+    experiment_name : str
+        Requested display label for a newly created campaign.
+    config : Mapping[str, Any]
+        Fully resolved model configuration.
+    hpo : Mapping[str, Any], optional
+        Fully resolved HPO configuration.
+
+    Returns
+    -------
+    CampaignResolution
+        Unique existing semantic match or a safe new campaign location.
+
+    Raises
+    ------
+    RuntimeError
+        If multiple semantic matches exist, an identity file conflicts, or
+        the intended new path already contains unrelated artifacts.
+    """
+    semantic_config = build_campaign_semantic_config(config, hpo)
+    campaign_identity = semantic_digest(semantic_config)
+    requested_paths = build_campaign_paths(
+        run_dir,
+        model_type,
+        experiment_name,
+        campaign_identity,
+    )
+    model_root = requested_paths.log_root.parent
+    matches: list[tuple[Path, bool]] = []
+    if model_root.is_dir():
+        for candidate in sorted(model_root.iterdir()):
+            manifest_path = candidate / "campaign.yaml"
+            if not candidate.is_dir() or not manifest_path.is_file():
+                continue
+            try:
+                manifest = _read_campaign_manifest(manifest_path)
+                candidate_semantic = _manifest_semantic_config(manifest)
+            except ValueError as exc:
+                logger.warning("Ignoring invalid campaign candidate: %s", exc)
+                continue
+            if candidate_semantic != semantic_config:
+                continue
+            identity_path = candidate / "identity.json"
+            if identity_path.is_file():
+                try:
+                    identity_payload = json.loads(
+                        identity_path.read_text(encoding="utf-8")
+                    )
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise RuntimeError(
+                        f"Identity metadata at {identity_path.resolve()} is "
+                        f"invalid: {exc}."
+                    ) from exc
+                stored_identity = identity_payload.get("campaign_identity")
+                if stored_identity != campaign_identity:
+                    raise RuntimeError(
+                        "Campaign semantic parameters match but identity "
+                        f"metadata conflicts at {identity_path.resolve()}."
+                    )
+            matches.append((candidate, manifest != semantic_config))
+
+    if len(matches) > 1:
+        candidates = ", ".join(
+            str(path.resolve()) for path, _ in matches
+        )
+        raise RuntimeError(
+            "Multiple campaign roots have the same semantic parameters: "
+            f"{candidates}. Resolve the ambiguity without deleting results."
+        )
+    if matches:
+        log_root, legacy = matches[0]
+        checkpoint_root = (
+            Path(run_dir).resolve()
+            / "ckpt"
+            / "baseline"
+            / model_type
+            / log_root.name
+        )
+        paths = CampaignPaths(log_root, checkpoint_root)
+    else:
+        paths = requested_paths
+        legacy = False
+        if paths.log_root.exists():
+            raise RuntimeError(
+                "The intended campaign path already exists without a matching "
+                f"semantic manifest: {paths.log_root.resolve()}."
+            )
+    aliases = _campaign_aliases(
+        paths.log_root,
+        experiment_name,
+        campaign_identity,
+    )
+    return CampaignResolution(
+        paths=paths,
+        campaign_identity=campaign_identity,
+        semantic_config=semantic_config,
+        aliases=aliases,
+        legacy=legacy,
+    )
 
 
 def normalize_failure_message(message: str) -> str:
@@ -153,15 +469,6 @@ def _write_csv(
     temporary.replace(path)
 
 
-def _normalized_identity(config: Mapping[str, Any]) -> Dict[str, Any]:
-    """Return a JSON-safe config without operational verbosity."""
-    normalized = json.loads(json.dumps(config, sort_keys=True))
-    logging_config = normalized.get("logging")
-    if isinstance(logging_config, dict):
-        logging_config.pop("level", None)
-    return normalized
-
-
 def _config_identity_hash(config: Mapping[str, Any]) -> str:
     """Return the resolved identity hash for one configuration."""
     return get_config_hash(config, bool(config.get("multitask")))
@@ -170,14 +477,14 @@ def _config_identity_hash(config: Mapping[str, Any]) -> str:
 def _completion_artifact_error(
     path: Path,
     completion: Mapping[str, Any],
-    campaign_hash: str,
+    campaign_identifiers: frozenset[str],
     seed: int,
 ) -> Optional[str]:
     """Return a validation error for common completion artifacts."""
     if completion.get("status") != "completed":
         return "completion status is not 'completed'"
-    if completion.get("campaign_hash") != campaign_hash:
-        return "campaign hash does not match"
+    if completion.get("campaign_hash") not in campaign_identifiers:
+        return "campaign identity is not an accepted semantic or legacy ID"
     if completion.get("seed") != seed:
         return "seed does not match"
 
@@ -260,16 +567,33 @@ def _legacy_runtime_batch_compatibility(
         )
 
     try:
-        saved_hash = _config_identity_hash(saved_config)
+        multitask = bool(saved_config.get("multitask"))
+        saved_hashes = {
+            _config_identity_hash(saved_config),
+            get_legacy_run_hash(saved_config, multitask),
+        }
     except (KeyError, TypeError, ValueError) as exc:
         return _compatibility_failure(
             f"resolved configuration cannot be hashed: {exc}",
             completion,
         )
-    if completion.get("config_hash") != saved_hash:
+    if completion.get("config_hash") not in saved_hashes:
         return _compatibility_failure(
             "stored config hash does not match the resolved configuration",
             completion,
+        )
+
+    saved_semantic = build_run_semantic_config(saved_config, multitask)
+    expected_semantic = build_run_semantic_config(
+        expected_config,
+        bool(expected_config.get("multitask")),
+    )
+    if saved_semantic == expected_semantic:
+        return CompletionCompatibility(
+            compatible=True,
+            mode="legacy_semantic_compatible",
+            reason="accepted a semantically identical legacy completion",
+            completion=completion,
         )
 
     adaptive = saved_config.get("training", {}).get(
@@ -307,10 +631,8 @@ def _legacy_runtime_batch_compatibility(
             completion,
         )
 
-    normalized_saved = _normalized_identity(saved_config)
-    normalized_expected = _normalized_identity(expected_config)
-    normalized_saved["data"]["batch_size"] = requested_batch
-    if normalized_saved != normalized_expected:
+    saved_semantic["data"]["batch_size"] = requested_batch
+    if saved_semantic != expected_semantic:
         return _compatibility_failure(
             "resolved configuration differs beyond the runtime batch",
             completion,
@@ -330,6 +652,7 @@ def check_completion_compatibility(
     campaign_hash: str,
     seed: int,
     expected_config: Mapping[str, Any] | str,
+    campaign_aliases: Iterable[str] = (),
 ) -> CompletionCompatibility:
     """Validate one completion against its selected semantic config."""
     if not path.is_file():
@@ -349,10 +672,14 @@ def check_completion_compatibility(
             "completion metadata is not a mapping"
         )
 
+    campaign_identifiers = frozenset({
+        campaign_hash,
+        *campaign_aliases,
+    })
     artifact_error = _completion_artifact_error(
         path,
         completion,
-        campaign_hash,
+        campaign_identifiers,
         seed,
     )
     if artifact_error is not None:
@@ -379,7 +706,11 @@ def check_completion_compatibility(
                 completion,
             )
 
-    if completion.get("config_hash") == expected_hash:
+    canonical_campaign = completion.get("campaign_hash") == campaign_hash
+    if (
+        completion.get("config_hash") == expected_hash
+        and canonical_campaign
+    ):
         return CompletionCompatibility(
             compatible=True,
             mode="exact_canonical_hash",
@@ -387,6 +718,12 @@ def check_completion_compatibility(
             completion=completion,
         )
     if isinstance(expected_config, str):
+        if not canonical_campaign:
+            return _compatibility_failure(
+                "a legacy campaign alias requires a selected configuration "
+                "for full semantic validation",
+                completion,
+            )
         return _compatibility_failure(
             "configuration hash does not match",
             completion,
@@ -396,6 +733,120 @@ def check_completion_compatibility(
         completion,
         expected_config,
     )
+
+
+def _completion_candidate_paths(
+    campaign_root: Path,
+    seed: int,
+    dataset_name: str,
+) -> tuple[Path, ...]:
+    """Return legacy and identity-namespaced completion candidates.
+
+    Parameters
+    ----------
+    campaign_root : pathlib.Path
+        Campaign log root.
+    seed : int
+        Effective evaluation seed.
+    dataset_name : str
+        Dataset key in the selected configuration.
+
+    Returns
+    -------
+    tuple[pathlib.Path, ...]
+        Legacy path first, followed by full-identity namespaces.
+    """
+    seed_root = campaign_root / "logs" / f"seed_{seed}"
+    legacy_path = (
+        seed_root / "datasets" / dataset_name / "completion.json"
+    )
+    namespaced = sorted(
+        (
+            seed_root / "configurations"
+        ).glob(f"*/datasets/{dataset_name}/completion.json")
+    )
+    return (legacy_path, *namespaced)
+
+
+def locate_completion(
+    campaign_root: Path,
+    campaign_hash: str,
+    seed: int,
+    dataset_name: str,
+    expected_config: Mapping[str, Any] | str,
+    campaign_aliases: Iterable[str] = (),
+) -> LocatedCompletion:
+    """Locate one uniquely compatible completion across run namespaces.
+
+    Parameters
+    ----------
+    campaign_root : pathlib.Path
+        Campaign log root.
+    campaign_hash : str
+        Full semantic campaign identity.
+    seed : int
+        Effective evaluation seed.
+    dataset_name : str
+        Dataset key in the selected configuration.
+    expected_config : Mapping[str, Any] or str
+        Selected configuration or its exact final identity.
+    campaign_aliases : Iterable[str], optional, default=()
+        Historical campaign identifiers accepted for recovery.
+
+    Returns
+    -------
+    LocatedCompletion
+        Unique compatible completion, a missing result, or a rejection with
+        every inspected path in its reason.
+    """
+    candidates = _completion_candidate_paths(
+        campaign_root,
+        seed,
+        dataset_name,
+    )
+    existing = tuple(path for path in candidates if path.is_file())
+    if not existing:
+        missing = check_completion_compatibility(
+            candidates[0],
+            campaign_hash,
+            seed,
+            expected_config,
+            campaign_aliases=campaign_aliases,
+        )
+        return LocatedCompletion(candidates[0], missing, existing)
+
+    inspected = [
+        (
+            path,
+            check_completion_compatibility(
+                path,
+                campaign_hash,
+                seed,
+                expected_config,
+                campaign_aliases=campaign_aliases,
+            ),
+        )
+        for path in existing
+    ]
+    compatible = [item for item in inspected if item[1].compatible]
+    if len(compatible) == 1:
+        path, result = compatible[0]
+        return LocatedCompletion(path, result, existing)
+    if len(compatible) > 1:
+        paths = ", ".join(str(path.resolve()) for path, _ in compatible)
+        result = _compatibility_failure(
+            "multiple compatible completions are ambiguous: " + paths
+        )
+        return LocatedCompletion(candidates[0], result, existing)
+
+    reasons = "; ".join(
+        f"{path.resolve()}: {result.reason}"
+        for path, result in inspected
+    )
+    result = _compatibility_failure(
+        "no compatible completion among existing candidates: " + reasons
+    )
+    return LocatedCompletion(existing[0], result, existing)
 
 
 def _append_metric_rows(
@@ -424,6 +875,7 @@ def collect_test_rows_with_diagnostics(
         tuple[int, str],
         Mapping[str, Any] | str,
     ],
+    campaign_aliases: Iterable[str] = (),
 ) -> tuple[list[Dict[str, Any]], Dict[str, list[Dict[str, Any]]]]:
     """Collect compatible dataset-seed pairs and their diagnostics."""
     rows: list[Dict[str, Any]] = []
@@ -435,24 +887,19 @@ def collect_test_rows_with_diagnostics(
     for (seed, dataset_name), expected in sorted(
         compatible_configs.items()
     ):
-        completion_path = (
-            campaign_root
-            / "logs"
-            / f"seed_{seed}"
-            / "datasets"
-            / dataset_name
-            / "completion.json"
-        )
-        result = check_completion_compatibility(
-            completion_path,
+        located = locate_completion(
+            campaign_root,
             campaign_hash,
             seed,
+            dataset_name,
             expected,
+            campaign_aliases=campaign_aliases,
         )
+        result = located.compatibility
         diagnostic = {
             "seed": seed,
             "dataset": dataset_name,
-            "path": str(completion_path.resolve()),
+            "path": str(located.path.resolve()),
             "reason": result.reason,
         }
         if not result.compatible:
@@ -479,18 +926,20 @@ def collect_test_rows(
     compatible_config_hashes: Optional[
         Mapping[tuple[int, str], Mapping[str, Any] | str]
     ] = None,
+    campaign_aliases: Iterable[str] = (),
 ) -> list[Dict[str, Any]]:
     """Collect compatible numeric test metrics from completed seed runs."""
     if compatible_config_hashes is None:
         compatible_config_hashes = {}
         logs_root = campaign_root / "logs"
         for completion_path in sorted(
-            logs_root.glob("seed_*/datasets/*/completion.json")
+            logs_root.glob("seed_*/**/completion.json")
         ):
-            match = SEED_DIRECTORY_PATTERN.match(
-                completion_path.parents[2].name
-            )
-            if match is None:
+            seed_parts = [
+                part for part in completion_path.parts
+                if SEED_DIRECTORY_PATTERN.match(part)
+            ]
+            if len(seed_parts) != 1:
                 continue
             try:
                 completion = json.loads(
@@ -501,16 +950,28 @@ def collect_test_rows(
             config_hash = completion.get("config_hash")
             if not isinstance(config_hash, str):
                 continue
-            compatible_config_hashes[
-                (int(match.group(1)), completion_path.parent.name)
-            ] = config_hash
+            match = SEED_DIRECTORY_PATTERN.match(seed_parts[0])
+            if match is None:
+                continue
+            key = (
+                int(match.group(1)),
+                completion_path.parent.name,
+            )
+            previous = compatible_config_hashes.get(key)
+            if previous is not None and previous != config_hash:
+                raise ValueError(
+                    "Multiple final configuration identities exist for "
+                    f"seed {key[0]} and dataset '{key[1]}'. Provide the "
+                    "expected configuration explicitly."
+                )
+            compatible_config_hashes[key] = config_hash
     rows, _ = collect_test_rows_with_diagnostics(
         campaign_root,
         campaign_hash,
         compatible_config_hashes,
+        campaign_aliases=campaign_aliases,
     )
     return rows
-
 
 
 def summarize_test_rows(
@@ -537,6 +998,59 @@ def summarize_test_rows(
     return summary_rows
 
 
+def _log_compatibility_problems(
+    diagnostics: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> None:
+    """Emit every missing or rejected pair to the stderr logger.
+
+    Parameters
+    ----------
+    diagnostics : Mapping[str, Sequence[Mapping[str, Any]]]
+        Pair-level compatibility diagnostics grouped by status.
+    """
+    for status in ("missing", "rejected"):
+        for diagnostic in diagnostics.get(status, ()):
+            logger.warning(
+                "Campaign compatibility %s for seed %s dataset %s at %s: %s",
+                status,
+                diagnostic["seed"],
+                diagnostic["dataset"],
+                diagnostic["path"],
+                diagnostic["reason"],
+            )
+
+
+def _compact_invocation_status(
+    invocation: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return only seed lifecycle fields for the compact summary.
+
+    Parameters
+    ----------
+    invocation : Mapping[str, Any]
+        Completed invocation lifecycle mapping.
+
+    Returns
+    -------
+    dict[str, Any]
+        Invocation identifier and requested or resulting seed lists.
+    """
+    fields = (
+        "id",
+        "requested",
+        "attempted",
+        "succeeded",
+        "failed",
+        "skipped",
+        "unattempted",
+    )
+    return {
+        field: invocation[field]
+        for field in fields
+        if field in invocation
+    }
+
+
 def write_campaign_summary(
     paths: CampaignPaths,
     campaign_hash: str,
@@ -545,48 +1059,73 @@ def write_campaign_summary(
         tuple[int, str],
         Mapping[str, Any] | str,
     ],
-) -> Optional[Dict[str, Any]]:
-    """Regenerate summaries, preserving old summaries when none match."""
+    campaign_aliases: Iterable[str] = (),
+) -> CampaignSummaryResult:
+    """Regenerate metric CSVs and a compact status-only JSON summary.
+
+    Parameters
+    ----------
+    paths : CampaignPaths
+        Selected campaign artifact roots.
+    campaign_hash : str
+        Full semantic campaign identity.
+    invocation : Mapping[str, Any]
+        Current invocation seed lifecycle status.
+    compatible_configs : Mapping[tuple[int, str], Mapping[str, Any] | str]
+        Expected configuration for every seed and dataset pair.
+    campaign_aliases : Iterable[str], optional
+        Validated historical campaign identifiers, default=().
+
+    Returns
+    -------
+    CampaignSummaryResult
+        Compact status plus in-memory rows for console and cloud reporting.
+        ``written`` is false when no compatible metric row exists.
+    """
     test_rows, diagnostics = collect_test_rows_with_diagnostics(
         paths.log_root,
         campaign_hash,
         compatible_configs,
+        campaign_aliases=campaign_aliases,
     )
+    _log_compatibility_problems(diagnostics)
+    pair_status = {
+        "expected": len(compatible_configs),
+        "completed": len(diagnostics["accepted"]),
+        "missing": len(diagnostics["missing"]),
+        "rejected": len(diagnostics["rejected"]),
+    }
+    partial = (
+        not bool(invocation.get("complete", True))
+        or pair_status["missing"] > 0
+        or pair_status["rejected"] > 0
+    )
+    status_payload = {
+        "campaign_identity_version": IDENTITY_VERSION,
+        "campaign_identity": campaign_hash,
+        "status": "partial" if partial else "complete",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "latest_invocation": _compact_invocation_status(invocation),
+        "dataset_pairs": pair_status,
+    }
     if not test_rows:
-        report_path = (
-            paths.summary_root / "compatibility_report.json"
+        logger.warning(
+            "No compatible completed seed results exist under %s; previous "
+            "metric CSVs and summary.json were left unchanged.",
+            paths.log_root.resolve(),
         )
-        report = {
-            "campaign_hash": campaign_hash,
-            "invocation": dict(invocation),
-            "compatibility": diagnostics,
-            "status": "no_compatible_results",
-        }
-        _atomic_write_text(
-            report_path,
-            json.dumps(report, indent=2, sort_keys=True),
+        status_payload["status"] = "no_compatible_results"
+        return CampaignSummaryResult(
+            status=status_payload,
+            test_runs=(),
+            test_summary=(),
+            written=False,
         )
-        warnings.warn(
-            "No compatible completed seed results were found. "
-            "Previous summaries were left unchanged; see "
-            f"{report_path.resolve()}.",
-            UserWarning,
-            stacklevel=2,
-        )
-        return None
 
     summary_rows = summarize_test_rows(test_rows)
-    include_std = any("std" in row for row in summary_rows)
-    summary_fields = [
-        "dataset",
-        "metric",
-        "count",
-        "mean",
-        "median",
-    ]
-    if include_std:
+    summary_fields = ["dataset", "metric", "count", "mean", "median"]
+    if any("std" in row for row in summary_rows):
         summary_fields.append("std")
-
     _write_csv(
         paths.summary_root / "test_runs.csv",
         ["dataset", "seed", "metric", "value"],
@@ -597,20 +1136,13 @@ def write_campaign_summary(
         summary_fields,
         summary_rows,
     )
-    partial = (
-        not bool(invocation.get("complete", True))
-        or bool(diagnostics["missing"] or diagnostics["rejected"])
-    )
-    payload = {
-        "campaign_hash": campaign_hash,
-        "invocation": dict(invocation),
-        "status": "partial" if partial else "complete",
-        "compatibility": diagnostics,
-        "test_runs": test_rows,
-        "test_summary": summary_rows,
-    }
     _atomic_write_text(
         paths.summary_root / "summary.json",
-        json.dumps(payload, indent=2, sort_keys=True),
+        json.dumps(status_payload, indent=2, sort_keys=True),
     )
-    return payload
+    return CampaignSummaryResult(
+        status=status_payload,
+        test_runs=test_rows,
+        test_summary=summary_rows,
+        written=True,
+    )

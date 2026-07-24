@@ -8,15 +8,19 @@ completion metadata, and campaign test summaries.
 from __future__ import annotations
 
 import copy
+import datetime
+import fcntl
 import gc
 import json
 import logging
 import math
 import os
+import sqlite3
 import time
 import warnings
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Mapping, Optional, Type
+from typing import Any, BinaryIO, Callable, Dict, Mapping, Optional, Type
 
 import torch
 import yaml
@@ -31,10 +35,11 @@ from baseline.adaptive_batching import (
 from baseline.abstract.factory import ModelRegistry
 from baseline.hpo.artifacts import (
     CampaignPaths,
-    build_campaign_paths,
-    check_completion_compatibility,
+    CampaignResolution,
+    CampaignSummaryResult,
     failure_fingerprint,
-    get_campaign_hash,
+    locate_completion,
+    resolve_campaign,
     write_campaign_summary,
 )
 from baseline.hpo.config import HpoConfig
@@ -44,6 +49,13 @@ from baseline.hpo.search import (
     sample_config,
     set_dotted_value,
     validate_search_space,
+)
+from baseline.utils.identity import (
+    DETERMINISTIC_MODEL_TYPES,
+    IDENTITY_VERSION,
+    canonical_json,
+    semantic_digest,
+    short_identity,
 )
 from baseline.utils.run_artifacts import get_config_hash
 from common.distributed.env import (
@@ -55,7 +67,7 @@ from common.log import setup_log
 
 
 logger = logging.getLogger("baseline")
-DETERMINISTIC_MODELS = frozenset({"catch22", "minirocket"})
+DETERMINISTIC_MODELS = DETERMINISTIC_MODEL_TYPES
 PRUNED_STATUS = "pruned"
 COMPLETE_STATUS = "complete"
 FAILED_STATUS = "failed"
@@ -63,6 +75,40 @@ OOM_MESSAGE_PARTS = (
     "out of memory",
     "cuda error: memory allocation",
 )
+
+
+@dataclass
+class StudyRuntime:
+    """Mutable handle for one exclusively locked Optuna study.
+
+    Parameters
+    ----------
+    study : Any
+        Loaded Optuna study.
+    study_identity : str
+        Full semantic study identity.
+    storage_path : pathlib.Path
+        SQLite storage selected for the study.
+    artifact_root : pathlib.Path
+        Exclusive namespaced trial and winner root.
+    checkpoint_root : pathlib.Path
+        Exclusive namespaced trial checkpoint root.
+    legacy : bool
+        Whether the selected study lives in legacy shared SQLite storage.
+    duplicate_names : tuple[str, ...]
+        Preserved non-selected study names found in legacy storage.
+    lock_file : BinaryIO
+        Open file whose advisory lock is held for this runtime.
+    """
+
+    study: Any
+    study_identity: str
+    storage_path: Path
+    artifact_root: Path
+    checkpoint_root: Path
+    legacy: bool
+    duplicate_names: tuple[str, ...]
+    lock_file: BinaryIO
 
 
 class CampaignExecutionError(RuntimeError):
@@ -88,13 +134,96 @@ def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
     temporary.replace(path)
 
 
-def _atomic_yaml(path: Path, payload: Mapping[str, Any]) -> None:
-    """Atomically write one YAML mapping."""
+def _exclusive_text(path: Path, content: str) -> None:
+    """Create one text artifact without replacing an existing path.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Destination that must not exist.
+    content : str
+        Complete UTF-8 file contents.
+
+    Raises
+    ------
+    FileExistsError
+        If another artifact already owns ``path``.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    with temporary.open("w", encoding="utf-8") as file_obj:
-        yaml.safe_dump(dict(payload), file_obj, sort_keys=False)
-    temporary.replace(path)
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+    )
+    try:
+        with temporary.open("x", encoding="utf-8") as file_obj:
+            file_obj.write(content)
+            file_obj.flush()
+            os.fsync(file_obj.fileno())
+        os.link(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _exclusive_json(path: Path, payload: Mapping[str, Any]) -> None:
+    """Create one immutable JSON mapping.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Destination that must not exist.
+    payload : Mapping[str, Any]
+        JSON-compatible mapping to serialize.
+    """
+    _exclusive_text(
+        path,
+        json.dumps(payload, indent=2, sort_keys=True),
+    )
+
+
+def _exclusive_yaml(path: Path, payload: Mapping[str, Any]) -> None:
+    """Create one immutable YAML mapping.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Destination that must not exist.
+    payload : Mapping[str, Any]
+        YAML-compatible mapping to serialize.
+    """
+    _exclusive_text(
+        path,
+        yaml.safe_dump(dict(payload), sort_keys=False),
+    )
+
+
+def _validate_immutable_json(
+    path: Path,
+    expected: Mapping[str, Any],
+) -> None:
+    """Require an existing JSON artifact to equal an expected mapping.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Existing JSON artifact.
+    expected : Mapping[str, Any]
+        Exact expected payload.
+
+    Raises
+    ------
+    RuntimeError
+        If the artifact is invalid or differs from ``expected``.
+    """
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"Immutable JSON artifact at {path.resolve()} is invalid: {exc}."
+        ) from exc
+    if existing != dict(expected):
+        raise RuntimeError(
+            f"Refusing to overwrite mismatching immutable artifact at "
+            f"{path.resolve()}."
+        )
 
 
 def _broadcast_object(value: Any) -> Any:
@@ -187,31 +316,158 @@ def _seed_scope_is_complete(
     campaign_hash: str,
     seed: int,
     selected_configs: Mapping[str, Mapping[str, Any]],
+    campaign_aliases: tuple[str, ...] = (),
 ) -> bool:
     """Return whether every selected dataset scope has matching completion."""
     expected = _expected_configs(selected_configs, seed)
     for dataset_name, config in expected.items():
-        completion_path = (
-            paths.seed_log_root(seed)
-            / "datasets"
-            / dataset_name
-            / "completion.json"
-        )
-        result = check_completion_compatibility(
-            completion_path,
+        located = locate_completion(
+            paths.log_root,
             campaign_hash,
             seed,
+            dataset_name,
             config,
+            campaign_aliases=campaign_aliases,
         )
+        result = located.compatibility
         if not result.compatible:
             logger.debug(
-                "Seed %d dataset %s is incomplete: %s",
+                "Seed %d dataset %s is incomplete at %s: %s",
                 seed,
                 dataset_name,
+                located.path.resolve(),
                 result.reason,
             )
             return False
     return True
+
+
+def _checkpoint_root_for_log_root(
+    paths: CampaignPaths,
+    seed: int,
+    log_root: Path,
+) -> Path:
+    """Map one seed log namespace to its checkpoint namespace.
+
+    Parameters
+    ----------
+    paths : CampaignPaths
+        Campaign log and checkpoint roots.
+    seed : int
+        Effective evaluation seed.
+    log_root : pathlib.Path
+        Legacy or identity-namespaced seed log root.
+
+    Returns
+    -------
+    pathlib.Path
+        Corresponding checkpoint root.
+    """
+    seed_log_root = paths.seed_log_root(seed)
+    try:
+        relative = log_root.relative_to(seed_log_root)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Completion root {log_root.resolve()} is outside seed root "
+            f"{seed_log_root.resolve()}."
+        ) from exc
+    return paths.seed_checkpoint_root(seed) / relative
+
+
+def _scope_artifact_roots(
+    paths: CampaignPaths,
+    campaign_hash: str,
+    seed: int,
+    scoped_config: Mapping[str, Any],
+    campaign_aliases: tuple[str, ...] = (),
+) -> tuple[Path, Path, bool]:
+    """Select safe roots for one final scoped configuration.
+
+    Compatible partial results keep using their existing root. When stale
+    completions occupy the legacy location, new work uses a full final-config
+    identity namespace so no changed winner can overwrite prior artifacts.
+
+
+    Parameters
+    ----------
+    paths : CampaignPaths
+        Campaign log and checkpoint roots.
+    campaign_hash : str
+        Full semantic campaign identity.
+    seed : int
+        Effective evaluation seed.
+    scoped_config : Mapping[str, Any]
+        Selected final configuration containing one effective seed.
+    campaign_aliases : tuple[str, ...], optional, default=()
+        Validated historical campaign identifiers.
+    Returns
+    -------
+    tuple[pathlib.Path, pathlib.Path, bool]
+        Log root, checkpoint root, and whether the scope is already complete.
+    """
+    datasets = scoped_config["data"]["datasets"]
+    located = [
+        locate_completion(
+            paths.log_root,
+            campaign_hash,
+            seed,
+            dataset_name,
+            scoped_config,
+            campaign_aliases=campaign_aliases,
+        )
+        for dataset_name in datasets
+    ]
+    compatible = [
+        item for item in located if item.compatibility.compatible
+    ]
+    ambiguous = [
+        item for item in located
+        if "multiple compatible completions" in item.compatibility.reason
+    ]
+    if ambiguous:
+        reasons = "; ".join(
+            item.compatibility.reason for item in ambiguous
+        )
+        raise RuntimeError(
+            "Cannot select a safe seed artifact root: " + reasons
+        )
+    if len(compatible) == len(located):
+        base_log = paths.seed_log_root(seed)
+        return base_log, paths.seed_checkpoint_root(seed), True
+
+    compatible_roots = {item.run_root for item in compatible}
+    if len(compatible_roots) > 1:
+        roots = ", ".join(
+            str(path.resolve()) for path in sorted(compatible_roots)
+        )
+        raise RuntimeError(
+            "Compatible partial results span multiple artifact roots: "
+            + roots
+        )
+    if compatible_roots:
+        log_root = compatible_roots.pop()
+        checkpoint_root = _checkpoint_root_for_log_root(
+            paths,
+            seed,
+            log_root,
+        )
+        return log_root, checkpoint_root, False
+
+    has_stale_completion = any(
+        item.existing_paths for item in located
+    )
+    if has_stale_completion:
+        config_identity = _config_hash(scoped_config)
+        return (
+            paths.seed_log_root(seed, config_identity),
+            paths.seed_checkpoint_root(seed, config_identity),
+            False,
+        )
+    return (
+        paths.seed_log_root(seed),
+        paths.seed_checkpoint_root(seed),
+        False,
+    )
 
 
 def _is_recoverable_trial_failure(exc: Exception) -> bool:
@@ -236,6 +492,116 @@ def _hpo_scope_root(root: Path, scope: str) -> Path:
     if scope == "multitask":
         return root / "hpo" / "multitask"
     return root / "hpo" / "datasets" / scope
+
+
+def _read_sqlite_studies(storage_path: Path) -> list[Dict[str, Any]]:
+    """Read Optuna study status using a read-only SQLite connection.
+
+    Parameters
+    ----------
+    storage_path : pathlib.Path
+        Existing Optuna SQLite database.
+
+    Returns
+    -------
+    list[dict[str, Any]]
+        Study names, terminal-state counts, and best complete trial metadata.
+
+    Raises
+    ------
+    RuntimeError
+        If the database schema cannot be read.
+    """
+    if not storage_path.is_file():
+        return []
+    uri = f"file:{storage_path.resolve()}?mode=ro"
+    try:
+        connection = sqlite3.connect(uri, uri=True)
+        connection.row_factory = sqlite3.Row
+        studies = connection.execute(
+            "SELECT study_id, study_name FROM studies ORDER BY study_id"
+        ).fetchall()
+        records: list[Dict[str, Any]] = []
+        for study in studies:
+            state_rows = connection.execute(
+                "SELECT state, COUNT(*) AS count FROM trials "
+                "WHERE study_id = ? GROUP BY state",
+                (study["study_id"],),
+            ).fetchall()
+            state_counts = {
+                row["state"]: int(row["count"])
+                for row in state_rows
+            }
+            direction_row = connection.execute(
+                "SELECT direction FROM study_directions "
+                "WHERE study_id = ? AND objective = 0",
+                (study["study_id"],),
+            ).fetchone()
+            distribution_rows = connection.execute(
+                "SELECT trial_params.param_name AS name, "
+                "trial_params.distribution_json AS distribution "
+                "FROM trial_params JOIN trials ON "
+                "trial_params.trial_id = trials.trial_id "
+                "WHERE trials.study_id = ? ORDER BY trial_params.param_id",
+                (study["study_id"],),
+            ).fetchall()
+            distributions: Dict[str, Any] = {}
+            distributions_consistent = True
+            for row in distribution_rows:
+                parsed_distribution = json.loads(row["distribution"])
+                previous = distributions.get(row["name"])
+                if (
+                    previous is not None
+                    and previous != parsed_distribution
+                ):
+                    distributions_consistent = False
+                distributions[row["name"]] = parsed_distribution
+            direction = (
+                direction_row["direction"]
+                if direction_row is not None
+                else None
+            )
+            order = "ASC" if direction == "MINIMIZE" else "DESC"
+            best_row = connection.execute(
+                "SELECT trials.number AS number, "
+                "trial_values.value AS value "
+                "FROM trials JOIN trial_values ON "
+                "trials.trial_id = trial_values.trial_id "
+                "WHERE trials.study_id = ? "
+                "AND trials.state = 'COMPLETE' "
+                "AND trial_values.objective = 0 "
+                f"ORDER BY trial_values.value {order} LIMIT 1",
+                (study["study_id"],),
+            ).fetchone()
+            records.append({
+                "study_name": study["study_name"],
+                "storage_path": str(storage_path.resolve()),
+                "direction": direction,
+                "distributions": distributions,
+                "distributions_consistent": distributions_consistent,
+                "complete": state_counts.get("COMPLETE", 0),
+                "pruned": state_counts.get("PRUNED", 0),
+                "failed": state_counts.get("FAIL", 0),
+                "running": state_counts.get("RUNNING", 0),
+                "best_trial": (
+                    int(best_row["number"])
+                    if best_row is not None
+                    else None
+                ),
+                "best_value": (
+                    float(best_row["value"])
+                    if best_row is not None
+                    else None
+                ),
+            })
+        return records
+    except (json.JSONDecodeError, sqlite3.Error) as exc:
+        raise RuntimeError(
+            f"Cannot audit Optuna storage at {storage_path.resolve()}: {exc}."
+        ) from exc
+    finally:
+        if "connection" in locals():
+            connection.close()
 
 
 def _study_progress(trials: list[Any]) -> tuple[int, int]:
@@ -276,6 +642,152 @@ def _study_progress(trials: list[Any]) -> tuple[int, int]:
     return budgeted, consecutive_failures
 
 
+def _expected_trial_distributions(
+    hpo_config: HpoConfig,
+) -> Dict[str, Any]:
+    """Build exact Optuna distributions for persisted-trial validation.
+
+    Parameters
+    ----------
+    hpo_config : HpoConfig
+        Current semantic HPO configuration.
+
+    Returns
+    -------
+    dict[str, Any]
+        Optuna distributions keyed by dotted search path.
+    """
+    import optuna
+
+    expected: Dict[str, Any] = {}
+    for path, distribution in hpo_config.search_space.items():
+        if distribution.distribution == "float":
+            expected[path] = optuna.distributions.FloatDistribution(
+                low=float(distribution.low),
+                high=float(distribution.high),
+                log=distribution.log,
+                step=distribution.step,
+            )
+        elif distribution.distribution == "int":
+            step = (
+                1
+                if distribution.step is None
+                else int(distribution.step)
+            )
+            expected[path] = optuna.distributions.IntDistribution(
+                low=int(distribution.low),
+                high=int(distribution.high),
+                log=distribution.log,
+                step=step,
+            )
+        else:
+            choices = tuple(
+                f"choice_{index:04d}"
+                for index in range(len(distribution.choices or []))
+            )
+            expected[path] = (
+                optuna.distributions.CategoricalDistribution(choices)
+            )
+    return expected
+
+
+def _serialized_trial_distributions(
+    hpo_config: HpoConfig,
+) -> Dict[str, Any]:
+    """Return JSON-compatible expected Optuna distributions.
+
+    Parameters
+    ----------
+    hpo_config : HpoConfig
+        Current semantic HPO configuration.
+
+    Returns
+    -------
+    dict[str, Any]
+        Persisted Optuna distribution payloads by search path.
+    """
+    import optuna
+
+    return {
+        path: json.loads(optuna.distributions.distribution_to_json(value))
+        for path, value in _expected_trial_distributions(hpo_config).items()
+    }
+
+
+def _decoded_trial_parameters_match(
+    trial: Any,
+    hpo_config: HpoConfig,
+) -> bool:
+    """Return whether persisted decoded values match Optuna parameters.
+
+    Parameters
+    ----------
+    trial : Any
+        Persisted Optuna frozen trial.
+    hpo_config : HpoConfig
+        Current semantic HPO configuration.
+
+    Returns
+    -------
+    bool
+        Whether every winner-eligible trial has exact decoded values.
+        Nonterminal trials may omit decoded values.
+    """
+    decoded = trial.user_attrs.get("decoded_params")
+    if decoded is None:
+        return trial.state.name not in {"COMPLETE", "PRUNED"}
+    if not isinstance(decoded, dict):
+        return False
+    if set(decoded) != set(hpo_config.search_space):
+        return False
+    for path, distribution in hpo_config.search_space.items():
+        raw_value = trial.params.get(path)
+        if distribution.distribution != "categorical":
+            if decoded[path] != raw_value:
+                return False
+            continue
+        prefix = "choice_"
+        if not isinstance(raw_value, str) or not raw_value.startswith(prefix):
+            return False
+        try:
+            choice_index = int(raw_value[len(prefix):])
+            expected_value = (distribution.choices or [])[choice_index]
+        except (IndexError, ValueError):
+            return False
+        if decoded[path] != expected_value:
+            return False
+    return True
+
+
+def _trial_metadata_matches(
+    trials: list[Any],
+    hpo_config: HpoConfig,
+) -> bool:
+    """Return whether trials prove exact search-space compatibility.
+
+    Parameters
+    ----------
+    trials : list[Any]
+        Persisted Optuna frozen trials from one study.
+    hpo_config : HpoConfig
+        Current semantic HPO configuration.
+
+    Returns
+    -------
+    bool
+        Whether every parameterized trial uses the exact current metadata.
+    """
+    expected = _expected_trial_distributions(hpo_config)
+    parameterized = [trial for trial in trials if trial.distributions]
+    if not parameterized:
+        return False
+    return all(
+        trial.distributions == expected
+        and _decoded_trial_parameters_match(trial, hpo_config)
+        for trial in parameterized
+    )
+
+
 def _synchronize_micro_batch(micro_batch: int) -> int:
     """Select the smallest safe micro-batch across distributed ranks.
 
@@ -307,6 +819,20 @@ def _synchronize_micro_batch(micro_batch: int) -> int:
     return int(value.item())
 
 
+def _new_invocation_id() -> str:
+    """Return a collision-resistant local invocation identifier.
+
+    Returns
+    -------
+    str
+        UTC timestamp with microseconds followed by the process identifier.
+    """
+    timestamp = datetime.datetime.now(
+        datetime.timezone.utc
+    ).strftime("%Y%m%dT%H%M%S%fZ")
+    return f"{timestamp}-{os.getpid()}"
+
+
 class CampaignRunner:
     """Coordinate HPO, seed runs, failure policy, and summaries."""
 
@@ -320,19 +846,28 @@ class CampaignRunner:
         self.config_class = config_class
         self.base_dict = config.model_dump(mode="json")
         self.hpo_config = hpo_config
-        self.campaign_hash = get_campaign_hash(
-            self.base_dict,
-            hpo_config.model_dump(mode="json"),
-        )
-        self.paths = build_campaign_paths(
+        self.hpo_dict = hpo_config.model_dump(mode="json")
+        self.resolution: CampaignResolution = resolve_campaign(
             run_dir=self.base_dict["logging"]["run_dir"],
             model_type=self.base_dict["model_type"],
             experiment_name=(
                 self.base_dict["logging"]["experiment_name"]
             ),
-            campaign_hash=self.campaign_hash,
+            config=self.base_dict,
+            hpo=self.hpo_dict,
+        )
+        self.campaign_hash = self.resolution.campaign_identity
+        self.campaign_aliases = self.resolution.aliases
+        self.campaign_semantic_config = dict(
+            self.resolution.semantic_config
+        )
+        self.paths = self.resolution.paths
+        self.invocation_id = _new_invocation_id()
+        self.invocation_root = (
+            self.paths.log_root / "invocations" / self.invocation_id
         )
         self.distributed_initialized = False
+        self._active_study_runtime: Optional[StudyRuntime] = None
         self.adaptive_batch_cache: Dict[str, Dict[str, Any]] = {}
         self.last_adaptive_memory_profile: Dict[str, Any] = {}
 
@@ -597,44 +1132,180 @@ class CampaignRunner:
         self.distributed_initialized = True
         del trainer
 
+    def _identity_payload(self) -> Dict[str, Any]:
+        """Return immutable campaign identity metadata.
+
+        Returns
+        -------
+        dict[str, Any]
+            Version, full identity, and non-authoritative display prefix.
+        """
+        return {
+            "identity_version": IDENTITY_VERSION,
+            "campaign_identity": self.campaign_hash,
+            "display_id": short_identity(self.campaign_hash),
+        }
+
+    def _invocation_payload(self) -> Dict[str, Any]:
+        """Return the complete resolved invocation configuration.
+
+        Returns
+        -------
+        dict[str, Any]
+            Operational and semantic parameters for this invocation.
+        """
+        return {
+            "invocation_id": self.invocation_id,
+            "campaign_identity": self.campaign_hash,
+            "created_at": self.invocation_started_at,
+            "campaign_log_root": str(self.paths.log_root.resolve()),
+            "campaign_checkpoint_root": str(
+                self.paths.checkpoint_root.resolve()
+            ),
+            "model_config": copy.deepcopy(self.base_dict),
+            "hpo": copy.deepcopy(self.hpo_dict),
+        }
+
+    def _update_invocation_status(
+        self,
+        state: str,
+        invocation: Optional[Mapping[str, Any]] = None,
+        dataset_pairs: Optional[Mapping[str, int]] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        """Atomically update this invocation's compact lifecycle status.
+
+        Parameters
+        ----------
+        state : str
+            Current lifecycle state such as ``running`` or ``complete``.
+        invocation : Mapping[str, Any], optional
+            Seed lifecycle fields, default=None.
+        dataset_pairs : Mapping[str, int], optional
+            Expected and compatible pair counts, default=None.
+        error : str, optional
+            Normalized terminal error fingerprint, default=None.
+        """
+        if (
+            not get_is_master()
+            or not hasattr(self, "invocation_root")
+        ):
+            return
+        payload: Dict[str, Any] = {
+            "invocation_id": self.invocation_id,
+            "campaign_identity": self.campaign_hash,
+            "state": state,
+            "updated_at": datetime.datetime.now(
+                datetime.timezone.utc
+            ).isoformat(),
+        }
+        if invocation is not None:
+            payload["seeds"] = dict(invocation)
+        if dataset_pairs is not None:
+            payload["dataset_pairs"] = dict(dataset_pairs)
+        if error is not None:
+            payload["error_fingerprint"] = error
+        _atomic_json(self.invocation_root / "status.json", payload)
+
     def _save_campaign_config(self) -> None:
-        """Persist the source campaign configuration."""
+        """Persist immutable semantic and invocation metadata."""
         if not get_is_master():
             return
         self.paths.log_root.mkdir(parents=True, exist_ok=True)
         self.paths.checkpoint_root.mkdir(parents=True, exist_ok=True)
-        payload = copy.deepcopy(self.base_dict)
-        payload["hpo"] = self.hpo_config.model_dump(mode="json")
-        path = self.paths.log_root / "campaign.yaml"
-        _atomic_yaml(path, payload)
-        logger.info(
-            "Campaign log root: %s",
-            self.paths.log_root.resolve(),
+        campaign_path = self.paths.log_root / "campaign.yaml"
+        if not campaign_path.exists():
+            try:
+                _exclusive_yaml(
+                    campaign_path,
+                    self.campaign_semantic_config,
+                )
+            except FileExistsError:
+                stored = yaml.safe_load(
+                    campaign_path.read_text(encoding="utf-8")
+                )
+                if stored != self.campaign_semantic_config:
+                    raise RuntimeError(
+                        "A concurrent process created a mismatching campaign "
+                        f"manifest at {campaign_path.resolve()}."
+                    )
+        elif not self.resolution.legacy:
+            stored = yaml.safe_load(
+                campaign_path.read_text(encoding="utf-8")
+            )
+            if stored != self.campaign_semantic_config:
+                raise RuntimeError(
+                    "Refusing to overwrite a mismatching campaign manifest "
+                    f"at {campaign_path.resolve()}."
+                )
+        identity_path = self.paths.log_root / "identity.json"
+        identity_payload = self._identity_payload()
+        if identity_path.exists():
+            _validate_immutable_json(identity_path, identity_payload)
+        else:
+            try:
+                _exclusive_json(identity_path, identity_payload)
+            except FileExistsError:
+                _validate_immutable_json(
+                    identity_path,
+                    identity_payload,
+                )
+
+        self.invocation_started_at = datetime.datetime.now(
+            datetime.timezone.utc
+        ).isoformat()
+        self.invocation_root.mkdir(parents=True, exist_ok=False)
+        _exclusive_yaml(
+            self.invocation_root / "invocation.yaml",
+            self._invocation_payload(),
         )
+        self._update_invocation_status("running")
+        if self.resolution.legacy:
+            logger.info(
+                "Reusing semantically matching legacy campaign at %s.",
+                self.paths.log_root.resolve(),
+            )
+        logger.info("Campaign log root: %s", self.paths.log_root.resolve())
         logger.info(
             "Campaign checkpoint root: %s",
             self.paths.checkpoint_root.resolve(),
         )
         logger.info(
-            "Campaign layout: campaign.yaml, hpo/, logs/seed_<seed>/, "
-            "and summary/ under %s.",
+            "Campaign layout: campaign.yaml, identity.json, invocations/, "
+            "hpo/, logs/seed_<seed>/, and summary/ under %s.",
             self.paths.log_root.resolve(),
         )
 
-    def _create_study(self, scope: str):
-        """Create or resume one rank-zero Optuna study."""
-        try:
-            import optuna
-        except ImportError as exc:
-            raise ImportError(
-                "HPO requires Optuna. Install project requirements or run "
-                "'pip install optuna'."
-            ) from exc
+    def _study_identity(self, scope: str) -> tuple[str, Dict[str, Any]]:
+        """Return the semantic identity and payload for one HPO scope.
 
-        scope_root = _hpo_scope_root(self.paths.log_root, scope)
-        scope_root.mkdir(parents=True, exist_ok=True)
-        storage_path = (scope_root / "study.sqlite3").resolve()
-        storage = f"sqlite:///{storage_path}"
+        Parameters
+        ----------
+        scope : str
+            Dataset name or ``multitask``.
+
+        Returns
+        -------
+        tuple[str, dict[str, Any]]
+            Full SHA-256 study identity and its canonical payload.
+        """
+        payload = {
+            "identity_version": IDENTITY_VERSION,
+            "campaign_identity": self.campaign_hash,
+            "scope": scope,
+        }
+        return semantic_digest(payload), payload
+
+    def _study_sampler_and_pruner(self) -> tuple[Any, Any]:
+        """Construct the configured Optuna sampler and pruner.
+
+        Returns
+        -------
+        tuple[Any, Any]
+            Fresh TPE sampler and median pruner instances.
+        """
+        import optuna
+
         sampler = optuna.samplers.TPESampler(
             seed=self.hpo_config.sampler.seed,
             n_startup_trials=(
@@ -648,22 +1319,214 @@ class CampaignRunner:
             n_warmup_steps=self.hpo_config.pruner.n_warmup_epochs,
             interval_steps=self.hpo_config.pruner.interval_epochs,
         )
-        study_name = f"{self.campaign_hash}-{scope}"
-        study = optuna.create_study(
-            study_name=study_name,
-            storage=storage,
-            sampler=sampler,
-            pruner=pruner,
-            direction=self.hpo_config.objective.direction,
-            load_if_exists=True,
+        return sampler, pruner
+
+    def _legacy_study(
+        self,
+        storage_path: Path,
+        scope: str,
+        storage: str,
+    ) -> tuple[Optional[Any], tuple[str, ...]]:
+        """Select a unique compatible legacy study without touching others.
+
+        Parameters
+        ----------
+        storage_path : pathlib.Path
+            Existing legacy SQLite path.
+        scope : str
+            Dataset name or ``multitask``.
+        storage : str
+            Optuna SQLite storage URL.
+
+        Returns
+        -------
+        tuple[Any or None, tuple[str, ...]]
+            Selected study and preserved non-selected study names.
+
+        Raises
+        ------
+        RuntimeError
+            If multiple equally eligible legacy studies are compatible.
+        """
+        import optuna
+
+        if not storage_path.is_file():
+            return None, ()
+        summaries = optuna.study.get_all_study_summaries(storage=storage)
+        direction = self.hpo_config.objective.direction.upper()
+        compatible: list[tuple[Any, int, bool]] = []
+        all_names: list[str] = []
+        expected_names = {
+            f"{alias}-{scope}"
+            for alias in self.campaign_aliases
+        }
+        for summary in summaries:
+            all_names.append(summary.study_name)
+            if not summary.study_name.endswith(f"-{scope}"):
+                continue
+            if summary.direction.name != direction:
+                continue
+            sampler, pruner = self._study_sampler_and_pruner()
+            candidate = optuna.load_study(
+                study_name=summary.study_name,
+                storage=storage,
+                sampler=sampler,
+                pruner=pruner,
+            )
+            trials = candidate.get_trials(deepcopy=False)
+            if not _trial_metadata_matches(trials, self.hpo_config):
+                continue
+            budgeted, _ = _study_progress(trials)
+            compatible.append((
+                candidate,
+                budgeted,
+                summary.study_name in expected_names,
+            ))
+
+        complete = [
+            item for item in compatible
+            if item[1] >= self.hpo_config.n_trials
+        ]
+        matching_partial = [
+            item for item in compatible if item[2]
+        ]
+        if complete:
+            eligible = complete
+        elif matching_partial:
+            eligible = matching_partial
+        else:
+            eligible = compatible
+        if len(eligible) > 1:
+            names = ", ".join(
+                study.study_name for study, _, _ in eligible
+            )
+            raise RuntimeError(
+                f"Multiple compatible legacy HPO studies exist for scope "
+                f"'{scope}' in {storage_path.resolve()}: {names}."
+            )
+        selected = eligible[0][0] if eligible else None
+        selected_name = selected.study_name if selected is not None else None
+        duplicates = tuple(
+            name for name in all_names if name != selected_name
         )
-        for trial in study.get_trials(deepcopy=False):
-            if trial.state == optuna.trial.TrialState.RUNNING:
-                study.tell(
-                    trial.number,
-                    state=optuna.trial.TrialState.FAIL,
+        return selected, duplicates
+
+    def _create_study(self, scope: str) -> StudyRuntime:
+        """Create or resume one exclusively locked rank-zero Optuna study."""
+        try:
+            import optuna
+        except ImportError as exc:
+            raise ImportError(
+                "HPO requires Optuna. Install project requirements or run "
+                "'pip install optuna'."
+            ) from exc
+
+        study_identity, identity_payload = self._study_identity(scope)
+        scope_root = _hpo_scope_root(self.paths.log_root, scope)
+        artifact_root = scope_root / "studies" / study_identity
+        checkpoint_root = (
+            _hpo_scope_root(self.paths.checkpoint_root, scope)
+            / "studies"
+            / study_identity
+        )
+        artifact_root.mkdir(parents=True, exist_ok=True)
+        checkpoint_root.mkdir(parents=True, exist_ok=True)
+        lock_path = artifact_root / ".study.lock"
+        lock_file = lock_path.open("a+b")
+        try:
+            fcntl.flock(
+                lock_file.fileno(),
+                fcntl.LOCK_EX | fcntl.LOCK_NB,
+            )
+        except BlockingIOError as exc:
+            lock_file.close()
+            raise RuntimeError(
+                "Another process is already writing semantic HPO study "
+                f"{study_identity} at {artifact_root.resolve()}."
+            ) from exc
+
+        legacy_path = (scope_root / "study.sqlite3").resolve()
+        legacy_storage = f"sqlite:///{legacy_path}"
+        try:
+            study, duplicates = self._legacy_study(
+                legacy_path,
+                scope,
+                legacy_storage,
+            )
+            legacy = study is not None
+            if legacy:
+                storage_path = legacy_path
+            else:
+                storage_path = (artifact_root / "study.sqlite3").resolve()
+                storage = f"sqlite:///{storage_path}"
+                sampler, pruner = self._study_sampler_and_pruner()
+                study = optuna.create_study(
+                    study_name=study_identity,
+                    storage=storage,
+                    sampler=sampler,
+                    pruner=pruner,
+                    direction=self.hpo_config.objective.direction,
+                    load_if_exists=True,
                 )
-        return study
+                stored_payload = study.user_attrs.get("semantic_payload")
+                expected_payload = canonical_json(identity_payload)
+                if stored_payload is None:
+                    study.set_user_attr(
+                        "identity_version",
+                        IDENTITY_VERSION,
+                    )
+                    study.set_user_attr(
+                        "study_identity",
+                        study_identity,
+                    )
+                    study.set_user_attr(
+                        "semantic_payload",
+                        expected_payload,
+                    )
+                elif stored_payload != expected_payload:
+                    raise RuntimeError(
+                        "Study identity collision or corrupt semantic metadata "
+                        f"at {storage_path}."
+                    )
+            for trial in study.get_trials(deepcopy=False):
+                if trial.state == optuna.trial.TrialState.RUNNING:
+                    study.tell(
+                        trial.number,
+                        state=optuna.trial.TrialState.FAIL,
+                    )
+            if duplicates:
+                logger.warning(
+                    "Preserving non-selected HPO studies for scope %s in %s: "
+                    "%s.",
+                    scope,
+                    legacy_path,
+                    ", ".join(duplicates),
+                )
+            return StudyRuntime(
+                study=study,
+                study_identity=study_identity,
+                storage_path=storage_path,
+                artifact_root=artifact_root,
+                checkpoint_root=checkpoint_root,
+                legacy=legacy,
+                duplicate_names=duplicates,
+                lock_file=lock_file,
+            )
+        except Exception:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            lock_file.close()
+            raise
+
+    def _release_study(self, runtime: StudyRuntime) -> None:
+        """Release one study's process lock.
+
+        Parameters
+        ----------
+        runtime : StudyRuntime
+            Runtime whose lock is currently held.
+        """
+        fcntl.flock(runtime.lock_file.fileno(), fcntl.LOCK_UN)
+        runtime.lock_file.close()
 
     def _write_trial_status(
         self,
@@ -690,7 +1553,7 @@ class CampaignRunner:
             payload["objective_history"] = list(objective_history)
         if memory_information is not None:
             payload["memory_information"] = dict(memory_information)
-        _atomic_json(trial_root / "trial.json", payload)
+        _exclusive_json(trial_root / "trial.json", payload)
 
     def _run_hpo_scope(
         self,
@@ -701,7 +1564,20 @@ class CampaignRunner:
         import optuna
         self._configure_campaign_logging()
 
-        study = self._create_study(scope) if get_is_master() else None
+        runtime = self._create_study(scope) if get_is_master() else None
+        self._active_study_runtime = runtime
+        study = runtime.study if runtime is not None else None
+        study_identity, _ = self._study_identity(scope)
+        artifact_root = (
+            _hpo_scope_root(self.paths.log_root, scope)
+            / "studies"
+            / study_identity
+        )
+        checkpoint_study_root = (
+            _hpo_scope_root(self.paths.checkpoint_root, scope)
+            / "studies"
+            / study_identity
+        )
         if get_is_master():
             persisted_trials = study.get_trials(deepcopy=False)
             budgeted, consecutive_failures = _study_progress(
@@ -721,10 +1597,7 @@ class CampaignRunner:
         consecutive_failures = int(progress["consecutive_failures"])
         study_status = str(progress["study_status"])
         if get_is_master():
-            study_path = (
-                _hpo_scope_root(self.paths.log_root, scope)
-                / "study.sqlite3"
-            ).resolve()
+            study_path = runtime.storage_path
             logger.info(
                 "HPO scope %s: %s study, budget %d/%d at %s.",
                 scope,
@@ -765,14 +1638,18 @@ class CampaignRunner:
             _force_local_trial_logging(sampled)
 
             trial_root = (
-                _hpo_scope_root(self.paths.log_root, scope)
+                artifact_root
                 / "trials"
                 / f"trial_{trial_number:05d}"
             )
             if get_is_master():
-                _atomic_yaml(trial_root / "resolved_config.yaml", sampled)
+                trial_root.mkdir(parents=True, exist_ok=False)
+                _exclusive_yaml(
+                    trial_root / "resolved_config.yaml",
+                    sampled,
+                )
             checkpoint_root = (
-                _hpo_scope_root(self.paths.checkpoint_root, scope)
+                checkpoint_study_root
                 / f"trial_{trial_number:05d}"
             )
             best_value: Optional[float] = None
@@ -829,6 +1706,7 @@ class CampaignRunner:
                         checkpoint_dir=checkpoint_root,
                         campaign_hash=self.campaign_hash,
                         run_mode="hpo",
+                        campaign_aliases=self.campaign_aliases,
                         validation_callback=(
                             validation_callback
                             if get_is_master()
@@ -938,16 +1816,26 @@ class CampaignRunner:
                     else:
                         decoded[path] = encoded
             best_payload = {
+                "study_identity": study_identity,
                 "trial_number": best_trial.number,
                 "objective": best_trial.value,
                 "parameters": decoded,
             }
-            _atomic_json(
-                _hpo_scope_root(self.paths.log_root, scope) / "best.json",
+            best_path = (
+                artifact_root
+                / f"best_trial_{best_trial.number:05d}.json"
+            )
+            if best_path.exists():
+                _validate_immutable_json(best_path, best_payload)
+            else:
+                _exclusive_json(best_path, best_payload)
+            _exclusive_json(
+                self.invocation_root / "hpo" / f"{scope}.json",
                 best_payload,
             )
         else:
             best_payload = None
+            best_path = None
         best_payload = _broadcast_object(best_payload)
         if get_is_master():
             logger.info(
@@ -957,8 +1845,7 @@ class CampaignRunner:
                 best_payload["trial_number"],
                 best_payload["objective"],
                 json.dumps(best_payload["parameters"], sort_keys=True),
-                (_hpo_scope_root(self.paths.log_root, scope)
-                 / "best.json").resolve(),
+                best_path.resolve(),
             )
 
         selected = copy.deepcopy(dict(scope_config))
@@ -969,6 +1856,9 @@ class CampaignRunner:
             raise RuntimeError(
                 f"Selected HPO configuration for '{scope}' is invalid."
             )
+        if runtime is not None:
+            self._release_study(runtime)
+            self._active_study_runtime = None
         return selected
 
     def _run_hpo(self) -> Dict[str, Dict[str, Any]]:
@@ -982,10 +1872,16 @@ class CampaignRunner:
         for scope, scope_config in _study_scope_configs(
             self.base_dict
         ).items():
-            selected[scope] = self._run_hpo_scope(
-                scope,
-                scope_config,
-            )
+            try:
+                selected[scope] = self._run_hpo_scope(
+                    scope,
+                    scope_config,
+                )
+            finally:
+                runtime = self._active_study_runtime
+                if runtime is not None and get_is_master():
+                    self._release_study(runtime)
+                    self._active_study_runtime = None
         return selected
 
     def _fixed_scopes(self) -> Dict[str, Dict[str, Any]]:
@@ -1094,14 +1990,38 @@ class CampaignRunner:
         selected_configs: Mapping[str, Mapping[str, Any]],
     ) -> None:
         """Execute all selected configurations for one independent seed."""
-        seed_log_root = self.paths.seed_log_root(seed)
-        seed_checkpoint_root = self.paths.seed_checkpoint_root(seed)
         cloud_context = self._start_seed_cloud(seed)
         try:
             for selected in selected_configs.values():
                 trainer = None
                 try:
                     scoped = _scoped_config(selected, seed)
+                    (
+                        seed_log_root,
+                        seed_checkpoint_root,
+                        scope_complete,
+                    ) = _scope_artifact_roots(
+                        self.paths,
+                        self.campaign_hash,
+                        seed,
+                        scoped,
+                        campaign_aliases=self.campaign_aliases,
+                    )
+                    if scope_complete:
+                        continue
+                    base_seed_root = self.paths.seed_log_root(seed)
+                    if seed_log_root != base_seed_root:
+                        logger.warning(
+                            "Preserving stale seed artifacts under %s; "
+                            "the selected configuration will write to %s.",
+                            base_seed_root.resolve(),
+                            seed_log_root.resolve(),
+                        )
+                    logger.debug(
+                        "Seed %d selected artifact root %s.",
+                        seed,
+                        seed_log_root.resolve(),
+                    )
                     final_config = self.config_class.model_validate(scoped)
                     if not final_config.validate_config():
                         raise ValueError(
@@ -1125,6 +2045,7 @@ class CampaignRunner:
                                 checkpoint_dir=seed_checkpoint_root,
                                 campaign_hash=self.campaign_hash,
                                 run_mode="final",
+                                campaign_aliases=self.campaign_aliases,
                                 external_distributed=True,
                                 external_cloud=bool(cloud_context),
                             )
@@ -1141,6 +2062,7 @@ class CampaignRunner:
                             seed_checkpoint_root.resolve()
                         )
                         trainer.campaign_hash = self.campaign_hash
+                        trainer.campaign_aliases = self.campaign_aliases
                         trainer.external_cloud = bool(cloud_context)
                         trainer.run()
                 finally:
@@ -1171,6 +2093,9 @@ class CampaignRunner:
                 self.campaign_hash,
                 seed,
                 selected_configs,
+                campaign_aliases=tuple(
+                    getattr(self, "campaign_aliases", ())
+                ),
             ):
                 skipped.append(seed)
                 logger.info(
@@ -1220,6 +2145,8 @@ class CampaignRunner:
 
         invocation = {
             "attempted": attempted,
+            "id": getattr(self, "invocation_id", "unmanaged"),
+            "requested": seeds,
             "succeeded": succeeded,
             "failed": failed,
             "skipped": skipped,
@@ -1236,14 +2163,14 @@ class CampaignRunner:
 
     def _log_campaign_summary(
         self,
-        summary: Mapping[str, Any],
+        summary: CampaignSummaryResult,
     ) -> None:
         """Log compact final dataset metric summaries at INFO."""
         logger.info(
             "Campaign summary: %s",
             (self.paths.summary_root / "summary.json").resolve(),
         )
-        for row in summary["test_summary"]:
+        for row in summary.test_summary:
             message = (
                 "%s test %s: count=%d, mean=%.6g, median=%.6g"
             )
@@ -1262,7 +2189,7 @@ class CampaignRunner:
 
     def _update_cloud_summary(
         self,
-        summary: Mapping[str, Any],
+        summary: CampaignSummaryResult,
     ) -> None:
         """Update one stable cloud summary run after eligible execution."""
         logging_config = self.config.logging
@@ -1270,14 +2197,14 @@ class CampaignRunner:
             return
 
         metrics: Dict[str, float] = {}
-        for row in summary["test_summary"]:
+        for row in summary.test_summary:
             prefix = f"{row['dataset']}/test/{row['metric']}"
             for statistic in ("mean", "median", "std"):
                 if statistic in row:
                     metrics[f"{prefix}/{statistic}"] = row[statistic]
         metrics["summary/completed_seed_count"] = len({
             row["seed"]
-            for row in summary["test_runs"]
+            for row in summary.test_runs
         })
 
         backend = logging_config.cloud_backend.lower()
@@ -1303,7 +2230,9 @@ class CampaignRunner:
                 tags=list(logging_config.tags) + ["summary"],
             )
             run.log(metrics)
-            run.summary["invocation"] = summary["invocation"]
+            run.summary["invocation"] = summary.status[
+                "latest_invocation"
+            ]
             run.finish()
 
         if backend in {"comet", "both"}:
@@ -1355,9 +2284,221 @@ class CampaignRunner:
             experiment.log_metrics(metrics)
             experiment.log_other(
                 "invocation",
-                json.dumps(summary["invocation"], sort_keys=True),
+                json.dumps(
+                    summary.status["latest_invocation"],
+                    sort_keys=True,
+                ),
             )
             experiment.end()
+
+    def _audit_hpo_scope(
+        self,
+        scope: str,
+        scope_config: Mapping[str, Any],
+    ) -> tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+        """Audit one HPO scope without opening writable Optuna storage.
+
+        Parameters
+        ----------
+        scope : str
+            Dataset name or ``multitask``.
+        scope_config : Mapping[str, Any]
+            Base configuration before applying the persisted winner.
+
+        Returns
+        -------
+        tuple[dict[str, Any], dict[str, Any] or None]
+            Study-selection report and reconstructed selected configuration.
+        """
+        scope_root = _hpo_scope_root(self.paths.log_root, scope)
+        study_identity, _ = self._study_identity(scope)
+        storage_paths = [scope_root / "study.sqlite3"]
+        studies_root = scope_root / "studies"
+        if studies_root.is_dir():
+            storage_paths.extend(
+                sorted(studies_root.glob("*/study.sqlite3"))
+            )
+        records: list[Dict[str, Any]] = []
+        for storage_path in storage_paths:
+            records.extend(_read_sqlite_studies(storage_path))
+        expected_names = {
+            study_identity,
+            *(f"{alias}-{scope}" for alias in self.campaign_aliases),
+        }
+        expected_distributions = _serialized_trial_distributions(
+            self.hpo_config
+        )
+        compatible = [
+            record for record in records
+            if (
+                record["study_name"] == study_identity
+                or record["study_name"].endswith(f"-{scope}")
+            )
+            and str(record["direction"]).lower()
+            == self.hpo_config.objective.direction
+            and record["distributions_consistent"]
+            and record["distributions"]
+            == expected_distributions
+        ]
+        complete = [
+            record for record in compatible
+            if record["complete"] + record["pruned"]
+            >= self.hpo_config.n_trials
+        ]
+        matching_partial = [
+            record for record in compatible
+            if record["study_name"] in expected_names
+        ]
+        if complete:
+            eligible = complete
+        elif matching_partial:
+            eligible = matching_partial
+        else:
+            eligible = compatible
+        report: Dict[str, Any] = {
+            "scope": scope,
+            "study_identity": study_identity,
+            "studies": records,
+            "duplicates": [],
+        }
+        if len(eligible) > 1:
+            report["status"] = "ambiguous"
+            report["duplicates"] = [
+                record["study_name"] for record in eligible
+            ]
+            return report, None
+        if not eligible:
+            report["status"] = "missing"
+            return report, None
+
+        selected_record = eligible[0]
+        report["status"] = "selected"
+        report["selected"] = selected_record
+        report["duplicates"] = [
+            record["study_name"]
+            for record in records
+            if record is not selected_record
+        ]
+        storage_path = Path(selected_record["storage_path"])
+        legacy_path = (scope_root / "study.sqlite3").resolve()
+        if storage_path == legacy_path:
+            best_path = scope_root / "best.json"
+        else:
+            trial_number = selected_record["best_trial"]
+            best_path = (
+                storage_path.parent
+                / f"best_trial_{trial_number:05d}.json"
+            )
+        report["best_path"] = str(best_path.resolve())
+        if not best_path.is_file():
+            report["status"] = "winner_artifact_missing"
+            return report, None
+        try:
+            best_payload = json.loads(
+                best_path.read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            report["status"] = "winner_artifact_invalid"
+            report["error"] = str(exc)
+            return report, None
+        if best_payload.get("trial_number") != selected_record["best_trial"]:
+            report["status"] = "winner_artifact_mismatch"
+            return report, None
+        parameters = best_payload.get("parameters")
+        if not isinstance(parameters, dict):
+            report["status"] = "winner_parameters_invalid"
+            return report, None
+        selected = copy.deepcopy(dict(scope_config))
+        for path, value in parameters.items():
+            set_dotted_value(selected, path, value)
+        report["parameters"] = parameters
+        return report, selected
+
+    def audit(self) -> Dict[str, Any]:
+        """Return a read-only campaign, study, and completion audit.
+
+        Returns
+        -------
+        dict[str, Any]
+            Absolute roots, semantic identity, study selection, duplicates,
+            and pair-level completion compatibility.
+        """
+        hpo_enabled = (
+            self.hpo_config.enabled
+            and self.base_dict["model_type"] not in DETERMINISTIC_MODELS
+        )
+        studies: Dict[str, Any] = {}
+        selected: Dict[str, Dict[str, Any]] = {}
+        if hpo_enabled:
+            validate_search_space(
+                self.base_dict,
+                self.hpo_config,
+                self.config_class,
+            )
+            for scope, scope_config in _study_scope_configs(
+                self.base_dict
+            ).items():
+                study_report, selected_config = self._audit_hpo_scope(
+                    scope,
+                    scope_config,
+                )
+                studies[scope] = study_report
+                if selected_config is not None:
+                    selected[scope] = selected_config
+        else:
+            selected = self._fixed_scopes()
+
+        completions: Dict[str, list[Dict[str, Any]]] = {
+            "accepted": [],
+            "missing": [],
+            "rejected": [],
+        }
+        discovered_seeds = set(self.base_dict["seeds"])
+        logs_root = self.paths.log_root / "logs"
+        if logs_root.is_dir():
+            for seed_root in logs_root.glob("seed_*"):
+                try:
+                    discovered_seeds.add(
+                        int(seed_root.name.removeprefix("seed_"))
+                    )
+                except ValueError:
+                    continue
+        for seed in sorted(discovered_seeds):
+            if not selected:
+                break
+            for dataset_name, config in _expected_configs(
+                selected,
+                seed,
+            ).items():
+                located = locate_completion(
+                    self.paths.log_root,
+                    self.campaign_hash,
+                    seed,
+                    dataset_name,
+                    config,
+                    campaign_aliases=self.campaign_aliases,
+                )
+                result = located.compatibility
+                key = "accepted" if result.compatible else result.mode
+                completions[key].append({
+                    "seed": seed,
+                    "dataset": dataset_name,
+                    "path": str(located.path.resolve()),
+                    "mode": result.mode,
+                    "reason": result.reason,
+                })
+        return {
+            "identity_version": IDENTITY_VERSION,
+            "campaign_identity": self.campaign_hash,
+            "campaign_aliases": sorted(self.campaign_aliases),
+            "legacy_root": self.resolution.legacy,
+            "campaign_log_root": str(self.paths.log_root.resolve()),
+            "campaign_checkpoint_root": str(
+                self.paths.checkpoint_root.resolve()
+            ),
+            "studies": studies,
+            "completions": completions,
+        }
 
     def run(self) -> Dict[str, Any]:
         """Run HPO if enabled, then execute independent configured seeds."""
@@ -1381,8 +2522,10 @@ class CampaignRunner:
             if hpo_enabled
             else self.base_dict["seeds"][0]
         )
-        self._initialize_distributed(initialization_seed)
+        invocation: Optional[Dict[str, Any]] = None
+        status_recorded = False
         try:
+            self._initialize_distributed(initialization_seed)
             selected = (
                 self._run_hpo()
                 if hpo_enabled
@@ -1390,7 +2533,7 @@ class CampaignRunner:
             )
             invocation, summary_eligible = self._run_seeds(selected)
             self._configure_campaign_logging()
-            summary = None
+            summary_result: Optional[CampaignSummaryResult] = None
             if summary_eligible and get_is_master():
                 compatible_configs: Dict[
                     tuple[int, str],
@@ -1410,15 +2553,36 @@ class CampaignRunner:
                     expected = _expected_configs(selected, seed)
                     for dataset_name, config in expected.items():
                         compatible_configs[(seed, dataset_name)] = config
-                summary = write_campaign_summary(
+                summary_result = write_campaign_summary(
                     self.paths,
                     self.campaign_hash,
                     invocation,
                     compatible_configs,
+                    campaign_aliases=self.campaign_aliases,
                 )
-                if summary is not None:
-                    self._log_campaign_summary(summary)
-                    self._update_cloud_summary(summary)
+                if summary_result.written:
+                    self._log_campaign_summary(summary_result)
+                    self._update_cloud_summary(summary_result)
+
+            if invocation["failed"]:
+                state = (
+                    "partial"
+                    if invocation["succeeded"]
+                    else "failed"
+                )
+            else:
+                state = "complete"
+            pair_status = (
+                summary_result.status["dataset_pairs"]
+                if summary_result is not None
+                else None
+            )
+            self._update_invocation_status(
+                state,
+                invocation=invocation,
+                dataset_pairs=pair_status,
+            )
+            status_recorded = True
             if invocation["failed"]:
                 raise CampaignExecutionError(
                     "One or more seed executions failed. See campaign "
@@ -1428,8 +2592,20 @@ class CampaignRunner:
                 "campaign_hash": self.campaign_hash,
                 "selected_configs": selected,
                 "invocation": invocation,
-                "summary": summary,
+                "summary": (
+                    dict(summary_result.status)
+                    if summary_result is not None
+                    else None
+                ),
             }
+        except Exception as exc:
+            if not status_recorded:
+                self._update_invocation_status(
+                    "failed",
+                    invocation=invocation,
+                    error=failure_fingerprint(exc),
+                )
+            raise
         finally:
             if self.distributed_initialized:
                 clean_torch_distributed()

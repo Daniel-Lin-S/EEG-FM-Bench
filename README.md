@@ -382,7 +382,7 @@ hpo:
 Float, integer, and categorical distributions are supported at dotted configuration paths. Categorical choices may be lists. A parameter not present in `search_space` is unchanged. The total study budget can be overridden from either the local or SLURM command interface:
 
 ```bash
-python baseline_main.py conf_file=baseline/brainomni/brainomni_unified.local.yaml model_type=brainomni hpo.n_trials=100
+python baseline_main.py conf_file=<local-config>.local.yaml model_type=brainomni hpo.n_trials=100
 ```
 
 Optuna studies use SQLite and resume automatically. `n_trials` counts complete
@@ -397,24 +397,28 @@ The HPO identity excludes `hpo.n_trials` and `hpo.max_consecutive_failed_trials`
 allowing either operational limit to be changed while resuming an existing
 study.
 
-When a resumed study already has at least `n_trials` complete-or-pruned trials, it constructs no trainer and performs no adaptive calibration. The winner is loaded from SQLite, validated, and used to regenerate `best.json` only when needed. Increasing `n_trials` runs only the missing budget.
+When a resumed study already has at least `n_trials` complete-or-pruned trials, it constructs no trainer and performs no adaptive calibration. The winner is loaded from SQLite and validated. Increasing `n_trials` runs only the missing budget.
 
-HPO artifacts are local and organized by study scope:
+Every HPO scope has a full semantic study identity. New SQLite, trial, checkpoint, and winner artifacts are namespaced by that identity, and an exclusive per-study lock prevents concurrent writers from corrupting one study. Different campaign or dataset scopes may still run concurrently.
 
 ```text
 <campaign>/
 └── hpo/
     ├── datasets/<dataset>/
-    │   ├── study.sqlite3
-    │   ├── best.json
-    │   └── trials/trial_<number>/
+    │   └── studies/<full-study-identity>/
+    │       ├── study.sqlite3
+    │       ├── best_trial_<number>.json
+    │       └── trials/trial_<number>/
     └── multitask/
-        ├── study.sqlite3
-        ├── best.json
-        └── trials/trial_<number>/
+        └── studies/<full-study-identity>/
+            ├── study.sqlite3
+            ├── best_trial_<number>.json
+            └── trials/trial_<number>/
 ```
 
 Each trial directory contains its resolved configuration, decoded parameters, objective history, status, and epoch-level validation CSV.
+
+Legacy shared SQLite studies are inspected using the canonical campaign configuration, exact persisted Optuna distributions and decoded parameter metadata, objective direction, and completed budget. A directory suffix or study-name hash is never sufficient. A unique completed study is reused in place. Incomplete duplicate studies are reported and preserved, while all newly written trial and winner files use the namespaced layout.
 
 ##### Multi-seed training and aggregation
 
@@ -427,7 +431,7 @@ seeds: [42, 43, 44]
 The seed list can also be overridden from either the local or SLURM command interface:
 
 ```bash
-python baseline_main.py conf_file=baseline/brainomni/brainomni_unified.local.yaml model_type=brainomni seeds=[42,43,44]
+python baseline_main.py conf_file=<local-config>.local.yaml model_type=brainomni seeds=[42,43,44]
 ```
 
 The default is `seeds: [42]` (single-seed).
@@ -438,7 +442,6 @@ The campaign identity excludes the seed list, so later invocations can add compa
 
 ```text
 <campaign>/
-├── campaign.yaml
 ├── logs/
 │   ├── seed_42/
 │   │   ├── configs/
@@ -448,15 +451,34 @@ The campaign identity excludes the seed list, so later invocations can add compa
 │   │   └── datasets/<dataset>/completion.json
 │   └── seed_43/
 └── summary/
-    ├── compatibility_report.json
     ├── test_runs.csv
     ├── test_summary.csv
     └── summary.json
 ```
 
-Summaries aggregate every compatible dataset×seed pair from current and earlier invocations. `summary.json` records accepted, missing, and rejected pairs and marks incomplete collections as partial.
+When a larger HPO budget selects a different final configuration, existing seed artifacts remain untouched. The changed configuration writes below `logs/seed_<seed>/configurations/<full-final-identity>/`, with the same relative layout and a mirrored checkpoint namespace. Completion discovery and aggregation inspect both this namespace and the legacy seed location; multiple compatible copies are rejected as ambiguous instead of being selected implicitly.
 
-If no compatible pair remains, the invocation writes a non-empty `compatibility_report.json`, warns with its absolute path, and leaves previous local and cloud summaries unchanged.
+##### Campaign identity and invocation records
+
+Campaign identity is derived from a versioned, type-preserving semantic configuration and compared using the full SHA-256 digest. The short suffix in a directory name is only a display label. `conf_file`, `master_port`, `seeds`, all `logging` fields, `hpo.n_trials`, and `hpo.max_consecutive_failed_trials` are invocation settings and do not change campaign identity. Fixed numerical, data, model, training, objective, sampler, pruner, and search-space values remain semantic.
+
+`campaign.yaml` files contain semantic parameters only. Complete resolved invocation parameters and lifecycle status are kept separately:
+
+```text
+<campaign>/
+├── campaign.yaml
+├── identity.json
+└── invocations/<invocation-id>/
+    ├── invocation.yaml
+    ├── status.json
+    └── hpo/<scope>.json
+```
+
+Use the audit command to resolve identities, inspect legacy or duplicate studies, reconstruct persisted winners, and check completions without creating directories, changing SQLite state, or starting a trainer:
+
+```bash
+python baseline_main.py audit-campaign conf_file=<local-config>.local.yaml
+```
 
 #### Step 3: Analysis & Visualization
 ```bash

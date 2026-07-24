@@ -37,7 +37,9 @@ from baseline.feature_extractor.classifier import (
 )
 from baseline.feature_extractor.config import FeatureExtractorConfig
 from baseline.feature_extractor.pipeline import FeatureExtractionPipeline
+from baseline.hpo.artifacts import check_completion_compatibility
 from baseline.utils.common import seed_torch
+from baseline.utils.identity import IDENTITY_VERSION, short_identity
 from baseline.utils.run_artifacts import get_config_hash, save_resolved_config
 from common.distributed.env import get_is_master, get_world_size
 from common.log import setup_log
@@ -127,7 +129,9 @@ class FeatureExtractorTrainer(AbstractTrainer, ABC):
             log_path = self.log_dir_override
         else:
             config_hash = get_config_hash(config, multitask=False)
-            experiment_name = f"{args.experiment_name}-{config_hash}"
+            experiment_name = (
+                f"{args.experiment_name}-{short_identity(config_hash)}"
+            )
             log_path = Path(
                 args.run_dir,
                 "log",
@@ -157,9 +161,9 @@ class FeatureExtractorTrainer(AbstractTrainer, ABC):
                 file_path=file_path,
                 start_time=self.start_time.timestamp(),
                 name="baseline",
-                level="INFO",
+                level=self.cfg.logging.level.upper(),
             )
-            logger.info("log dir: %s", self.log_dir)
+            logger.debug("Log directory: %s", Path(self.log_dir).resolve())
 
     def _open_csv_writer(self, ds_name: str) -> None:
         """Open a CSV trace without neural-training coordinates."""
@@ -234,10 +238,13 @@ class FeatureExtractorTrainer(AbstractTrainer, ABC):
             return compatible
         return (
             compatible
-            and completion.get("campaign_hash") == self.campaign_hash
-            and completion.get("seed") == self.cfg.seed
-            and completion.get("config_hash")
-            == self._resolved_config_hash()
+            and check_completion_compatibility(
+                completion_path,
+                self.campaign_hash,
+                self.cfg.seed,
+                self.cfg.model_dump(mode="json"),
+                campaign_aliases=self.campaign_aliases,
+            ).compatible
         )
 
     def _write_completion(self, ds_name: str, ds_config: str) -> None:
@@ -254,7 +261,9 @@ class FeatureExtractorTrainer(AbstractTrainer, ABC):
         completion = {
             "status": "completed",
             "campaign_hash": self.campaign_hash,
+            "campaign_identity_version": IDENTITY_VERSION,
             "config_hash": self._resolved_config_hash(),
+            "config_hash_version": IDENTITY_VERSION,
             "seed": self.cfg.seed,
             "dataset_config": ds_config,
             "execution_id": self.execution_id,

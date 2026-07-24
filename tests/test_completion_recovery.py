@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -16,9 +17,13 @@ from baseline.brainomni.brainomni_config import BrainOmniConfig
 from baseline.hpo.artifacts import (
     CampaignPaths,
     check_completion_compatibility,
+    locate_completion,
     write_campaign_summary,
 )
-from baseline.hpo.orchestrator import _force_local_trial_logging
+from baseline.hpo.orchestrator import (
+    _force_local_trial_logging,
+    _scope_artifact_roots,
+)
 from baseline.utils.run_artifacts import get_config_hash
 from baseline.utils.run_artifacts import save_resolved_config
 
@@ -40,12 +45,18 @@ def _selected_config(batch_size: int = 128) -> dict:
     ).model_dump(mode="json")
 
 
-def _completion_path(root: Path) -> Path:
+def _completion_path(
+    root: Path,
+    config_identity: str | None = None,
+) -> Path:
     """Return the synthetic dataset completion path."""
+    seed_root = root / "logs" / f"seed_{SEED}"
+    if config_identity is not None:
+        seed_root = (
+            seed_root / "configurations" / config_identity
+        )
     return (
-        root
-        / "logs"
-        / f"seed_{SEED}"
+        seed_root
         / "datasets"
         / DATASET_NAME
         / "completion.json"
@@ -57,9 +68,10 @@ def _write_completion(
     config_hash: str,
     execution_id: str = "execution",
     metric: float = 0.75,
+    config_identity: str | None = None,
 ) -> Path:
     """Write one completion and its required checkpoint artifact."""
-    path = _completion_path(root)
+    path = _completion_path(root, config_identity)
     path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint = root / "checkpoints" / "best.pt"
     checkpoint.parent.mkdir(parents=True, exist_ok=True)
@@ -108,6 +120,134 @@ def test_exact_canonical_completion_is_compatible(tmp_path: Path) -> None:
 
     assert result.compatible is True
     assert result.mode == "exact_canonical_hash"
+
+
+def test_short_campaign_alias_requires_full_semantic_config(
+    tmp_path: Path,
+) -> None:
+    """A colliding display hash cannot decide completion compatibility."""
+    selected = _selected_config()
+    config_hash = get_config_hash(selected, multitask=False)
+    path = _write_completion(tmp_path, config_hash)
+    completion = json.loads(path.read_text(encoding="utf-8"))
+    completion["campaign_hash"] = "short-collision"
+    path.write_text(json.dumps(completion), encoding="utf-8")
+
+    rejected = check_completion_compatibility(
+        path,
+        CAMPAIGN_HASH,
+        SEED,
+        selected,
+        campaign_aliases=("short-collision",),
+    )
+
+    assert rejected.compatible is False
+    assert "resolved configuration does not exist" in rejected.reason
+
+    _save_legacy_config(tmp_path, selected)
+    accepted = check_completion_compatibility(
+        path,
+        CAMPAIGN_HASH,
+        SEED,
+        selected,
+        campaign_aliases=("short-collision",),
+    )
+
+    assert accepted.compatible is True
+    assert accepted.mode == "legacy_semantic_compatible"
+
+
+def test_namespaced_completion_is_discovered(
+    tmp_path: Path,
+) -> None:
+    """A full-identity namespace participates in centralized discovery."""
+    selected = _selected_config()
+    config_hash = get_config_hash(selected, multitask=False)
+    expected_path = _write_completion(
+        tmp_path,
+        config_hash,
+        config_identity=config_hash,
+    )
+
+    located = locate_completion(
+        tmp_path,
+        CAMPAIGN_HASH,
+        SEED,
+        DATASET_NAME,
+        selected,
+    )
+
+    assert located.compatibility.compatible is True
+    assert located.path == expected_path
+    summary = write_campaign_summary(
+        CampaignPaths(tmp_path, tmp_path / "checkpoints"),
+        CAMPAIGN_HASH,
+        {"attempted": [SEED], "complete": True},
+        {(SEED, DATASET_NAME): selected},
+    )
+    assert summary.written is True
+    assert summary.test_runs == [{
+        "dataset": DATASET_NAME,
+        "seed": SEED,
+        "metric": "acc",
+        "value": 0.75,
+
+    }]
+
+def test_duplicate_compatible_completions_are_ambiguous(
+    tmp_path: Path,
+) -> None:
+    """Two valid locations are rejected instead of chosen implicitly."""
+    selected = _selected_config()
+    config_hash = get_config_hash(selected, multitask=False)
+    _write_completion(tmp_path, config_hash)
+    _write_completion(
+        tmp_path,
+        config_hash,
+        config_identity=config_hash,
+    )
+
+    located = locate_completion(
+        tmp_path,
+        CAMPAIGN_HASH,
+        SEED,
+        DATASET_NAME,
+        selected,
+    )
+
+    assert located.compatibility.compatible is False
+    assert "multiple compatible completions" in (
+        located.compatibility.reason
+    )
+
+
+def test_changed_final_config_uses_namespace_without_overwrite(
+    tmp_path: Path,
+) -> None:
+    """A changed HPO winner never reuses a stale final artifact root."""
+    old_config = _selected_config()
+    old_hash = get_config_hash(old_config, multitask=False)
+    old_path = _write_completion(tmp_path, old_hash)
+    original = old_path.read_bytes()
+    selected = copy.deepcopy(old_config)
+    selected["model"]["classifier_head"]["hidden_dims"] = [64]
+    selected_hash = get_config_hash(selected, multitask=False)
+    paths = CampaignPaths(tmp_path, tmp_path / "checkpoints")
+
+    log_root, checkpoint_root, complete = _scope_artifact_roots(
+        paths,
+        CAMPAIGN_HASH,
+        SEED,
+        selected,
+    )
+
+    assert complete is False
+    assert log_root == paths.seed_log_root(SEED, selected_hash)
+    assert checkpoint_root == paths.seed_checkpoint_root(
+        SEED,
+        selected_hash,
+    )
+    assert old_path.read_bytes() == original
 
 
 def test_legacy_runtime_batch_is_recovered_read_only(
@@ -191,8 +331,18 @@ def test_completion_rejects_invalid_artifacts(
     assert result.compatible is False
 
 
-def test_partial_summary_records_pair_diagnostics(tmp_path: Path) -> None:
-    """A valid pair is retained when a sibling dataset is missing."""
+def test_partial_summary_is_compact_and_logs_pair_diagnostics(
+    tmp_path: Path,
+    caplog,
+    monkeypatch,
+) -> None:
+    """A valid pair is retained while missing details stay out of JSON."""
+    caplog.set_level(logging.WARNING)
+    monkeypatch.setattr(
+        logging.getLogger("baseline"),
+        "propagate",
+        True,
+    )
     selected = _selected_config()
     config_hash = get_config_hash(selected, multitask=False)
     _write_completion(tmp_path, config_hash)
@@ -209,33 +359,51 @@ def test_partial_summary_records_pair_diagnostics(tmp_path: Path) -> None:
         compatible,
     )
 
-    assert summary is not None
-    assert summary["status"] == "partial"
-    assert len(summary["compatibility"]["accepted"]) == 1
-    assert len(summary["compatibility"]["missing"]) == 1
+    assert summary.status["status"] == "partial"
+    assert summary.status["dataset_pairs"] == {
+        "expected": 2,
+        "completed": 1,
+        "missing": 1,
+        "rejected": 0,
+    }
+    persisted = json.loads(
+        (paths.summary_root / "summary.json").read_text(encoding="utf-8")
+    )
+    assert "compatibility" not in persisted
+    assert "test_runs" not in persisted
+    assert "dataset missing" in caplog.text
 
 
-def test_zero_row_summary_preserves_previous_summary(tmp_path: Path) -> None:
-    """No compatible rows produce diagnostics without replacing summaries."""
+def test_zero_row_summary_preserves_previous_without_report(
+    tmp_path: Path,
+    caplog,
+    monkeypatch,
+) -> None:
+    """No compatible rows log diagnostics without saving a report."""
+    caplog.set_level(logging.WARNING)
+    monkeypatch.setattr(
+        logging.getLogger("baseline"),
+        "propagate",
+        True,
+    )
     paths = CampaignPaths(tmp_path, tmp_path / "checkpoints")
     previous_path = paths.summary_root / "summary.json"
     previous_path.parent.mkdir(parents=True, exist_ok=True)
     previous_path.write_text("previous", encoding="utf-8")
 
-    with pytest.warns(UserWarning, match="left unchanged"):
-        summary = write_campaign_summary(
-            paths,
-            CAMPAIGN_HASH,
-            {"attempted": [SEED]},
-            {(SEED, DATASET_NAME): _selected_config()},
-        )
+    summary = write_campaign_summary(
+        paths,
+        CAMPAIGN_HASH,
+        {"attempted": [SEED]},
+        {(SEED, DATASET_NAME): _selected_config()},
+    )
 
-    assert summary is None
+    assert summary.written is False
     assert previous_path.read_text(encoding="utf-8") == "previous"
     report_path = paths.summary_root / "compatibility_report.json"
-    report = json.loads(report_path.read_text(encoding="utf-8"))
-    assert report["status"] == "no_compatible_results"
-    assert report["compatibility"]["missing"]
+    assert not report_path.exists()
+    assert "completion.json does not exist" in caplog.text
+    assert "left unchanged" in caplog.text
 
 
 def test_hpo_trial_text_logs_follow_debug_verbosity() -> None:

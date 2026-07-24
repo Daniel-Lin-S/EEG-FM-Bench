@@ -2,6 +2,8 @@
 
 import sys
 import types
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -10,6 +12,7 @@ from baseline.catch22.catch22_config import Catch22Config
 from baseline.catch22.catch22_trainer import Catch22Trainer
 import baseline.catch22.extractor as catch22_extractor_module
 import baseline.feature_extractor.classifier as classifier_module
+import baseline.feature_extractor.trainer as trainer_module
 from baseline.catch22.extractor import (
     CATCH22_TRIAL_CHUNKSIZE,
     Catch22FeatureExtractor,
@@ -53,6 +56,33 @@ def make_config(
         model=model or {},
         logging={"use_cloud": False, "outputs": ["csv"]},
     )
+
+
+def test_feature_extractor_logging_honors_configured_level(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Managed feature runs never reset verbosity to hard-coded INFO."""
+    config = make_config()
+    config.logging.level = "error"
+    trainer = MeanFeatureTrainer(config)
+    calls: dict[str, Any] = {}
+    monkeypatch.setattr(
+        trainer,
+        "get_train_io_path",
+        lambda _: (str(tmp_path.resolve()), ""),
+    )
+    monkeypatch.setattr(trainer_module, "get_is_master", lambda: True)
+
+    def record_setup(**kwargs: Any) -> None:
+        """Record the effective setup options."""
+        calls.update(kwargs)
+
+    monkeypatch.setattr(trainer_module, "setup_log", record_setup)
+
+    trainer.setup_logging()
+
+    assert calls["level"] == "ERROR"
 
 
 def test_catch22_concatenates_canonical_features(monkeypatch):

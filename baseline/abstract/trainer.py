@@ -17,6 +17,7 @@ from typing import (
     Any,
     Callable,
     Dict,
+    Iterable,
     List,
     Mapping,
     Optional,
@@ -42,6 +43,7 @@ from baseline.adaptive_batching import (
     profile_payload,
 )
 from baseline.hpo.artifacts import check_completion_compatibility
+from baseline.utils.identity import IDENTITY_VERSION, short_identity
 from baseline.utils.lora import (
     inject_lora, get_lora_state_dict, load_lora_state_dict, get_model_lora_targets
 )
@@ -52,7 +54,7 @@ from data.processor.wrapper import get_dataset_n_class, get_dataset_category, ge
 from common.distributed.env import get_is_master, get_global_rank, get_local_rank, get_world_size, get_master_addr, \
     get_master_port, clean_torch_distributed
 from common.distributed.loader import DistributedGroupBatchSampler
-COMPLETION_CONFIG_HASH_VERSION = 2
+COMPLETION_CONFIG_HASH_VERSION = IDENTITY_VERSION
 
 
 logger = logging.getLogger("baseline")
@@ -172,6 +174,7 @@ class AbstractTrainer(ABC):
         self.latest_eval_counts: Dict[str, int] = {}
         self.run_mode = "legacy"
         self.campaign_hash: Optional[str] = None
+        self.campaign_aliases: frozenset[str] = frozenset()
         self.log_dir_override: Optional[Path] = None
         self.ckpt_dir_override: Optional[Path] = None
         self.validation_callback: Optional[Callable[..., bool]] = None
@@ -275,6 +278,7 @@ class AbstractTrainer(ABC):
         checkpoint_dir: Path,
         campaign_hash: str,
         run_mode: str,
+        campaign_aliases: Optional[Iterable[str]] = None,
         validation_callback: Optional[Callable[..., bool]] = None,
         external_distributed: bool = False,
         external_cloud: bool = False,
@@ -285,6 +289,9 @@ class AbstractTrainer(ABC):
         self.log_dir_override = log_dir.resolve()
         self.ckpt_dir_override = checkpoint_dir.resolve()
         self.campaign_hash = campaign_hash
+        self.campaign_aliases = frozenset(
+            campaign_aliases or ()
+        )
         self.run_mode = run_mode
         self.validation_callback = validation_callback
         self.external_distributed = external_distributed
@@ -526,7 +533,9 @@ class AbstractTrainer(ABC):
             ckpt_path = self.ckpt_dir_override
         else:
             config_hash = get_config_hash(config, self.multitask)
-            experiment_name = f"{args.experiment_name}-{config_hash}"
+            experiment_name = (
+                f"{args.experiment_name}-{short_identity(config_hash)}"
+            )
             if self.multitask:
                 experiment_name = (
                     f"{experiment_name}-{self.execution_id}"
@@ -594,6 +603,7 @@ class AbstractTrainer(ABC):
             self.campaign_hash,
             self.cfg.seed,
             self.cfg.model_dump(mode="json"),
+            campaign_aliases=self.campaign_aliases,
         ).compatible
 
     def _reset_dataset_outputs(self, ds_name: str) -> None:
@@ -677,6 +687,7 @@ class AbstractTrainer(ABC):
         content = {
             'status': 'completed',
             'campaign_hash': self.campaign_hash,
+            'campaign_identity_version': IDENTITY_VERSION,
             'config_hash': self._resolved_config_hash(),
             'seed': self.cfg.seed,
             'config_hash_version': COMPLETION_CONFIG_HASH_VERSION,

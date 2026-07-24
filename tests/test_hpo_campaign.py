@@ -7,6 +7,7 @@ import math
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from omegaconf import OmegaConf
@@ -300,6 +301,7 @@ def make_failure_runner(
         checkpoint_root=tmp_path / "ckpt",
     )
     runner.campaign_hash = "campaign"
+    runner.campaign_aliases = frozenset()
     monkeypatch.setattr(
         orchestrator_module,
         "_seed_scope_is_complete",
@@ -383,7 +385,7 @@ def test_skipped_seed_does_not_become_first_attempt(
     monkeypatch.setattr(
         orchestrator_module,
         "_seed_scope_is_complete",
-        lambda paths, campaign_hash, seed, selected: seed == 42,
+        lambda *args, **kwargs: args[2] == 42,
     )
     invocation, eligible = runner._run_seeds({"fixed": {}})
     assert invocation["skipped"] == [42]
@@ -495,19 +497,24 @@ def test_optuna_sqlite_study_resumes_existing_trials(
         checkpoint_root=tmp_path / "ckpt",
     )
     runner.campaign_hash = "campaign"
+    runner.campaign_aliases = frozenset()
     runner.hpo_config = make_hpo_config()
 
-    first = runner._create_study("alpha")
-    first.optimize(lambda trial: 1.0, n_trials=1)
-    second = runner._create_study("alpha")
+    first_runtime = runner._create_study("alpha")
+    first_runtime.study.optimize(lambda trial: 1.0, n_trials=1)
+    runner._release_study(first_runtime)
+    second_runtime = runner._create_study("alpha")
 
-    assert len(second.trials) == 1
+    assert len(second_runtime.study.trials) == 1
+    runner._release_study(second_runtime)
     assert (
         tmp_path
         / "log"
         / "hpo"
         / "datasets"
         / "alpha"
+        / "studies"
+        / first_runtime.study_identity
         / "study.sqlite3"
     ).is_file()
 
@@ -523,6 +530,7 @@ def test_completed_hpo_budget_reuses_winner_without_trainer(
         checkpoint_root=tmp_path / "ckpt",
     )
     runner.campaign_hash = "campaign"
+    runner.campaign_aliases = frozenset()
     runner.hpo_config = make_hpo_config().model_copy(
         update={"n_trials": 1}
     )
@@ -530,10 +538,14 @@ def test_completed_hpo_budget_reuses_winner_without_trainer(
     runner.base_dict = scope_config
     runner.config_class = BrainOmniConfig
 
-    study = runner._create_study("alpha")
-    trial = study.ask()
+    runner.invocation_root = tmp_path / "log" / "invocations" / "test"
+    runner.invocation_root.mkdir(parents=True)
+    runner._active_study_runtime = None
+    runtime = runner._create_study("alpha")
+    trial = runtime.study.ask()
     trial.set_user_attr("decoded_params", {})
-    study.tell(trial, 1.0)
+    runtime.study.tell(trial, 1.0)
+    runner._release_study(runtime)
 
     def reject_training(*args, **kwargs):
         del args, kwargs
@@ -550,8 +562,126 @@ def test_completed_hpo_budget_reuses_winner_without_trainer(
         / "hpo"
         / "datasets"
         / "alpha"
-        / "best.json"
+        / "studies"
+        / runtime.study_identity
+        / "best_trial_00000.json"
     ).is_file()
+
+
+def _study_test_runner(tmp_path: Path) -> CampaignRunner:
+    """Return a minimal runner for study storage and lock tests."""
+    runner = CampaignRunner.__new__(CampaignRunner)
+    runner.paths = CampaignPaths(
+        log_root=tmp_path / "log",
+        checkpoint_root=tmp_path / "ckpt",
+    )
+    runner.campaign_hash = "campaign"
+    runner.campaign_aliases = frozenset()
+    runner.hpo_config = make_hpo_config().model_copy(
+        update={"n_trials": 1}
+    )
+    return runner
+
+
+def test_semantic_study_lock_rejects_second_writer(
+    tmp_path: Path,
+) -> None:
+    """Only one process handle may mutate one semantic study."""
+    runner = _study_test_runner(tmp_path)
+    runtime = runner._create_study("alpha")
+    try:
+        with pytest.raises(RuntimeError, match="already writing"):
+            runner._create_study("alpha")
+    finally:
+        runner._release_study(runtime)
+
+
+def test_legacy_study_prefers_completed_alias_and_preserves_duplicate(
+    tmp_path: Path,
+) -> None:
+    """A completed legacy alias wins while an accidental study is untouched."""
+    import optuna
+
+    runner = _study_test_runner(tmp_path)
+    runner.campaign_aliases = frozenset({"accidental"})
+    scope_root = _hpo_scope_root(runner.paths.log_root, "alpha")
+    scope_root.mkdir(parents=True)
+    storage_path = (scope_root / "study.sqlite3").resolve()
+    storage = f"sqlite:///{storage_path}"
+    scope_config = BrainOmniConfig(
+        data={"datasets": {"alpha": "finetune"}},
+    ).model_dump(mode="json")
+
+    def objective(trial: Any) -> float:
+        """Persist exact configured distributions and decoded parameters."""
+        _, decoded = sample_config(
+            scope_config,
+            runner.hpo_config,
+            trial,
+        )
+        trial.set_user_attr("decoded_params", decoded)
+        return 1.0
+
+    selected = optuna.create_study(
+        study_name="legacy-alpha",
+        storage=storage,
+        direction="minimize",
+    )
+    selected.optimize(objective, n_trials=1)
+    duplicate = optuna.create_study(
+        study_name="accidental-alpha",
+        storage=storage,
+        direction="minimize",
+    )
+    duplicate.ask()
+
+    runtime = runner._create_study("alpha")
+    try:
+        assert runtime.legacy is True
+        assert runtime.study.study_name == "legacy-alpha"
+        assert runtime.duplicate_names == ("accidental-alpha",)
+    finally:
+        runner._release_study(runtime)
+
+    untouched = optuna.load_study(
+        study_name="accidental-alpha",
+        storage=storage,
+    )
+    assert untouched.trials[0].state.name == "RUNNING"
+
+
+def test_legacy_study_rejects_mismatched_trial_distributions(
+    tmp_path: Path,
+) -> None:
+    """A hash-like name cannot override persisted search semantics."""
+    import optuna
+
+    runner = _study_test_runner(tmp_path)
+    runner.campaign_aliases = frozenset({"legacy"})
+    scope_root = _hpo_scope_root(runner.paths.log_root, "alpha")
+    scope_root.mkdir(parents=True)
+    storage_path = (scope_root / "study.sqlite3").resolve()
+    storage = f"sqlite:///{storage_path}"
+    wrong = optuna.create_study(
+        study_name="legacy-alpha",
+        storage=storage,
+        direction="minimize",
+    )
+    wrong.optimize(
+        lambda trial: trial.suggest_float(
+            "training.max_lr",
+            0.1,
+            0.2,
+        ),
+        n_trials=1,
+    )
+
+    runtime = runner._create_study("alpha")
+    try:
+        assert runtime.legacy is False
+        assert runtime.duplicate_names == ("legacy-alpha",)
+    finally:
+        runner._release_study(runtime)
 
 
 def test_failed_trials_do_not_consume_resumed_hpo_budget() -> None:
