@@ -21,6 +21,7 @@ def get_config_hash(config: dict[str, Any], multitask: bool) -> str:
     """Return a stable experiment hash for a resolved configuration."""
     identity = json.loads(json.dumps(config, sort_keys=True))
     identity["logging"].pop("run_dir", None)
+    identity["logging"].pop("level", None)
     if not multitask:
         identity["data"].pop("datasets", None)
     encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"))

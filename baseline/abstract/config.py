@@ -323,6 +323,9 @@ class BaseLoggingArgs(BaseModel):
     log_step_interval : int
         Number of optimizer steps between training-metric log events.
         Default: 1
+    level : {"debug", "info", "warning", "error"}, optional, default="info"
+        Minimum standard logging level emitted to console and selected text
+        logs. Values are case-insensitive.
     use_tensorboard : bool
         Whether to write scalar training and evaluation metrics to TensorBoard
         event files in ``<run log directory>/tensorboard``. Default: False.
@@ -346,12 +349,24 @@ class BaseLoggingArgs(BaseModel):
     tags: List[str] = Field(default_factory=lambda: [])
 
     log_step_interval: int = 1
+    level: Literal['debug', 'info', 'warning', 'error'] = 'info'
     ckpt_interval: int = 1
     use_tensorboard: bool = False
 
     outputs: List[Literal['log', 'tensorboard', 'csv']] = Field(
         default_factory=lambda: ['csv']
     )
+
+    @field_validator('level', mode='before')
+    @classmethod
+    def normalize_level(cls, level: object) -> object:
+        """Normalize a case-insensitive standard logging level."""
+        if not isinstance(level, str):
+            raise ValueError(
+                "logging.level must be one of debug, info, warning, or "
+                f"error, but got {level!r}."
+            )
+        return level.lower()
 
     @field_validator('outputs')
     @classmethod

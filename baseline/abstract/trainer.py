@@ -41,6 +41,7 @@ from baseline.adaptive_batching import (
     estimate_fixed_training_bytes,
     profile_payload,
 )
+from baseline.hpo.artifacts import check_completion_compatibility
 from baseline.utils.lora import (
     inject_lora, get_lora_state_dict, load_lora_state_dict, get_model_lora_targets
 )
@@ -51,6 +52,8 @@ from data.processor.wrapper import get_dataset_n_class, get_dataset_category, ge
 from common.distributed.env import get_is_master, get_global_rank, get_local_rank, get_world_size, get_master_addr, \
     get_master_port, clean_torch_distributed
 from common.distributed.loader import DistributedGroupBatchSampler
+COMPLETION_CONFIG_HASH_VERSION = 2
+
 
 logger = logging.getLogger("baseline")
 
@@ -175,6 +178,7 @@ class AbstractTrainer(ABC):
         self.external_distributed = False
         self.external_cloud = False
         self.training_result: Dict[str, Any] = {}
+        self.runtime_world_size = 1
         self.requested_global_batch_size = cfg.data.batch_size
         self.micro_batch_size = cfg.data.batch_size
         self.accumulation_steps = 1
@@ -317,9 +321,9 @@ class AbstractTrainer(ABC):
         self.requested_global_batch_size = global_batch_size
         self.micro_batch_size = micro_batch_size
         self.accumulation_steps = global_batch_size // denominator
-        self.cfg.data.batch_size = micro_batch_size
         if self.dataloader_factory is not None:
             self.dataloader_factory.batch_size = micro_batch_size
+        self.runtime_world_size = world_size
         self._runtime_batch_configured = True
         self.adaptive_batch_profile.update({
             "requested_global_batch_size": global_batch_size,
@@ -585,13 +589,12 @@ class AbstractTrainer(ABC):
         )
         if self.campaign_hash is None:
             return compatible
-        return (
-            compatible
-            and completion.get("campaign_hash") == self.campaign_hash
-            and completion.get("seed") == self.cfg.seed
-            and completion.get("config_hash")
-            == self._resolved_config_hash()
-        )
+        return check_completion_compatibility(
+            completion_path,
+            self.campaign_hash,
+            self.cfg.seed,
+            self.cfg.model_dump(mode="json"),
+        ).compatible
 
     def _reset_dataset_outputs(self, ds_name: str) -> None:
         """Remove stale traces before retrying a dataset."""
@@ -676,12 +679,21 @@ class AbstractTrainer(ABC):
             'campaign_hash': self.campaign_hash,
             'config_hash': self._resolved_config_hash(),
             'seed': self.cfg.seed,
+            'config_hash_version': COMPLETION_CONFIG_HASH_VERSION,
             'dataset_config': ds_config,
             'execution_id': self.execution_id,
             'checkpoint_path': str(checkpoint_path.resolve()),
             'validation_metrics': validation_metrics,
             'test_metrics': metrics,
             'completed_at': datetime.datetime.now().isoformat(),
+            'batching': {
+                'requested_global_batch_size': (
+                    self.requested_global_batch_size
+                ),
+                'world_size': self.runtime_world_size,
+                'micro_batch_size': self.micro_batch_size,
+                'accumulation_steps': self.accumulation_steps,
+            },
         }
         temporary_path = completion_path.with_suffix('.tmp')
         temporary_path.write_text(json.dumps(content, indent=2),
@@ -706,16 +718,27 @@ class AbstractTrainer(ABC):
                     'logs',
                     f'{self.execution_id}.log',
                 )
+            log_level = self.cfg.logging.level
+            if self.run_mode == "hpo" and log_level != "debug":
+                log_level = "warning"
             setup_log(
                 file_path=file_path,
                 start_time=self.start_time.timestamp(),
                 name="baseline",
-                level="INFO"
+                level=log_level.upper(),
             )
-            logger.info(f"log dir: {self.log_dir}, checkpoint dir: {self.ckpt_dir}")
+            logger.debug(
+                "Log dir: %s, checkpoint dir: %s",
+                self.log_dir,
+                self.ckpt_dir,
+            )
 
-        logger.info(f"Starting {self.cfg.model_type} training with "
-                   f"{self.num_ds} dataset(s): {list(self.ds_conf.keys())}")
+        logger.debug(
+            "Starting %s training with %d dataset(s): %s",
+            self.cfg.model_type,
+            self.num_ds,
+            list(self.ds_conf),
+        )
 
     def init_cloud_logging(self):
         """Initialize cloud logging (wandb, comet, etc.)."""
@@ -748,7 +771,7 @@ class AbstractTrainer(ABC):
         if self.multitask:
             tensorboard_dir = Path(self.log_dir, 'tensorboard')
             self.tensorboard_writer = SummaryWriter(log_dir=tensorboard_dir)
-            logger.info('TensorBoard logging enabled: %s', tensorboard_dir)
+            logger.debug('TensorBoard logging enabled: %s', tensorboard_dir)
 
     def _open_dataset_tensorboard(self, ds_name: str) -> None:
         """Open an overwriteable TensorBoard writer for one dataset."""
@@ -764,7 +787,7 @@ class AbstractTrainer(ABC):
         self.tensorboard_writers[ds_name] = writer
         if not self.multitask:
             self.tensorboard_writer = writer
-        logger.info('TensorBoard logging enabled: %s', tensorboard_dir)
+        logger.debug('TensorBoard logging enabled: %s', tensorboard_dir)
 
     def finish_tensorboard_logging(self):
         """Flush and close all local TensorBoard writers."""
@@ -851,7 +874,7 @@ class AbstractTrainer(ABC):
                 group = metric[:idx]
                 wandb.define_metric(f'{group}/*', step_metric=metric)
 
-            logger.info("Wandb logging enabled")
+            logger.debug("Wandb logging enabled")
         except Exception as e:
             logger.warning(f"Failed to initialize wandb: {e}")
 
@@ -884,7 +907,7 @@ class AbstractTrainer(ABC):
             self.comet_experiment.log_parameters(self.cfg.model_dump())
             self.comet_experiment.add_tags(self.cfg.logging.tags)
 
-            logger.info("Comet.ml logging enabled")
+            logger.debug("Comet.ml logging enabled")
         except Exception as e:
             logger.warning(f"Failed to initialize comet.ml: {e}")
             self.comet_experiment = None
@@ -908,7 +931,7 @@ class AbstractTrainer(ABC):
         """Finish wandb logging."""
         try:
             wandb.finish()
-            logger.info("Wandb logging finished")
+            logger.debug("Wandb logging finished")
         except Exception as e:
             logger.warning(f"Error finishing wandb: {e}")
 
@@ -916,7 +939,7 @@ class AbstractTrainer(ABC):
         """Finish comet.ml logging."""
         try:
             self.comet_experiment.end()
-            logger.info("Comet.ml logging finished")
+            logger.debug("Comet.ml logging finished")
         except Exception as e:
             logger.warning(f"Error finishing comet.ml: {e}")
 
@@ -1066,7 +1089,13 @@ class AbstractTrainer(ABC):
 
     def collect_dataset_info(self, mixed: bool, ds_name: str = ''):
         """Collect information about datasets for model setup."""
-        logger.info(f"Collecting dataset information for {'multitask' if self.multitask else 'per dataset'} ...")
+        training_mode = (
+            "multitask" if self.multitask else "per dataset"
+        )
+        logger.debug(
+            "Collecting dataset information for %s ...",
+            training_mode,
+        )
 
         if mixed:
             self.ds_info = {}
@@ -1077,7 +1106,12 @@ class AbstractTrainer(ABC):
                     'category': get_dataset_category(dataset_name, dataset_config),
                     'shape_info': get_dataset_shape_info(dataset_name, dataset_config, self.cfg.fs),
                 }
-                logger.info(f"Dataset {dataset_name} - {dataset_config} for mixed set")
+                logger.debug(
+                    "Dataset %s - %s for mixed set",
+                    dataset_name,
+                    dataset_config,
+                )
+
         else:
             ds_conf = self.ds_conf[ds_name]
             self.ds_info = {
@@ -1087,7 +1121,7 @@ class AbstractTrainer(ABC):
                     'category': get_dataset_category(ds_name, ds_conf),
                     'shape_info': get_dataset_shape_info(ds_name, ds_conf, self.cfg.fs),
                 }}
-            logger.info(f"Dataset {ds_name} - {ds_conf} only")
+            logger.debug(f"Dataset {ds_name} - {ds_conf} only")
 
     def _gather_tensor(self, tensor: Tensor, max_length: int) -> Optional[list[Tensor]]:
         is_dist = torch.distributed.is_available() and torch.distributed.is_initialized()
@@ -1112,8 +1146,8 @@ class AbstractTrainer(ABC):
         return gather_list
 
     def _gather_result(self, logits: Tensor, targets: Tensor) -> tuple[Optional[Tensor], Optional[Tensor]]:
-        logits_list = self._gather_tensor(logits, self.cfg.data.batch_size)
-        target_list = self._gather_tensor(targets, self.cfg.data.batch_size)
+        logits_list = self._gather_tensor(logits, self.micro_batch_size)
+        target_list = self._gather_tensor(targets, self.micro_batch_size)
 
         if get_is_master():
             all_logits = torch.cat(logits_list, dim=0)
@@ -1138,7 +1172,7 @@ class AbstractTrainer(ABC):
         return grad_norm.detach().cpu().item()
 
     def create_dataloader(self, split: datasets.NamedSplit = datasets.Split.TRAIN):
-        logger.info("Creating main training dataloader...")
+        logger.debug("Creating main training dataloader...")
         mixed = (split == datasets.Split.TRAIN and self.cfg.multitask)
 
         dataloaders, samplers = self.dataloader_factory.create_dataloader(
@@ -1153,7 +1187,7 @@ class AbstractTrainer(ABC):
         return dataloaders, samplers
 
     def create_single_dataloader(self, ds_name: str, ds_config: str, split: datasets.NamedSplit = datasets.Split.TRAIN):
-        logger.info("Creating single main training dataloader...")
+        logger.debug("Creating single main training dataloader...")
 
         dataloader, sampler = self.dataloader_factory.create_dataloader(
             datasets_config={ds_name: ds_config},
@@ -1254,10 +1288,15 @@ class AbstractTrainer(ABC):
         if not lora_cfg.use_lora:
             return model
         
-        logger.info(f"Applying LoRA with r={lora_cfg.lora_r}, alpha={lora_cfg.lora_alpha}, scope={lora_cfg.lora_scope}")
+        logger.debug(
+            "Applying LoRA with r=%d, alpha=%d, scope=%s",
+            lora_cfg.lora_r,
+            lora_cfg.lora_alpha,
+            lora_cfg.lora_scope,
+        )
         
         target_modules = self.get_lora_target_modules()
-        logger.info(f"LoRA target modules: {target_modules}")
+        logger.debug(f"LoRA target modules: {target_modules}")
         
         model, injected_modules = inject_lora(
             model=model,
@@ -1315,10 +1354,18 @@ class AbstractTrainer(ABC):
             head_param_count = sum(p.numel() for p in head_params)
             frozen_param_count = sum(p.numel() for p in encoder_params)
             
-            logger.info(f"LoRA training mode:")
-            logger.info(f"  - LoRA params: {lora_param_count:,} (lr={lora_lr:.2e})")
-            logger.info(f"  - Head params: {head_param_count:,} (lr={self.cfg.training.max_lr:.2e})")
-            logger.info(f"  - Frozen encoder params: {frozen_param_count:,}")
+            logger.debug(f"LoRA training mode:")
+            logger.debug(
+                "  - LoRA params: %s (lr=%.2e)",
+                f"{lora_param_count:,}",
+                lora_lr,
+            )
+            logger.debug(
+                "  - Head params: %s (lr=%.2e)",
+                f"{head_param_count:,}",
+                self.cfg.training.max_lr,
+            )
+            logger.debug(f"  - Frozen encoder params: {frozen_param_count:,}")
         else:
             # Original logic
             if not self.cfg.training.freeze_encoder:
@@ -1328,7 +1375,7 @@ class AbstractTrainer(ABC):
                 # Freeze encoder parameters
                 for param in encoder_params:
                     param.requires_grad = False
-                logger.info("Encoder parameters frozen")
+                logger.debug("Encoder parameters frozen")
 
         return params
 
@@ -1385,7 +1432,7 @@ class AbstractTrainer(ABC):
     def debug_params_grad(self):
         for name, param in self.model.named_parameters():
             if get_is_master() and param.grad is not None:
-                logger.info(
+                logger.debug(
                     f"{name} "
                     f"Range: [{param.grad.min():.8f}, {param.grad.max():.8f}], "
                     f"Scale: {param.grad.abs().mean():.8f}")
@@ -1712,7 +1759,7 @@ class AbstractTrainer(ABC):
 
         """
         self.cfg.logging.use_cloud = False
-        logger.info("Analysis mode: cloud logging disabled")
+        logger.debug("Analysis mode: cloud logging disabled")
 
     # ===========================================
     # Fine-tuning Training Interface
@@ -1807,7 +1854,7 @@ class AbstractTrainer(ABC):
             self._log_to_cloud(log_data)
         self._log_to_tensorboard(log_data, self.current_step)
         self._write_csv_metrics(log_data, self.current_step)
-        logger.info(format_console_log_dict(log_data, prefix="train"))
+        logger.debug(format_console_log_dict(log_data, prefix="train"))
 
     def _run_accumulated_epoch(
         self,
@@ -1903,7 +1950,7 @@ class AbstractTrainer(ABC):
         """Evaluate one epoch and return metrics."""
         is_dist = torch.distributed.is_available() and torch.distributed.is_initialized()
         if get_is_master():
-            logger.info(f"Starting {prefix} evaluation...")
+            logger.debug("Starting %s evaluation.", prefix)
 
         self.model.eval()
 
@@ -1981,7 +2028,7 @@ class AbstractTrainer(ABC):
                     log_dict = log_dict | metrics
                     metric_results[ds_name] = metrics
                     log_console = format_console_log_dict(metrics, prefix=f"{ds_name}/{prefix}")
-                    logger.info(log_console)
+                    logger.debug(log_console)
 
             if get_is_master() and self.cfg.logging.use_cloud:
                 log_cloud = self._create_ft_cloud_log_data(log_dict, prefix, overall_metrics)
@@ -2021,7 +2068,7 @@ class AbstractTrainer(ABC):
             logger.warning("LoRA is not enabled, skipping LoRA checkpoint loading")
             return
         
-        logger.info(f"Loading LoRA checkpoint from {lora_checkpoint_path}")
+        logger.debug(f"Loading LoRA checkpoint from {lora_checkpoint_path}")
         lora_state_dict = torch.load(lora_checkpoint_path, map_location=self.device, weights_only=True)
         
         missing_keys, unexpected_keys = load_lora_state_dict(
@@ -2033,7 +2080,7 @@ class AbstractTrainer(ABC):
         if unexpected_keys:
             logger.warning(f"Unexpected LoRA keys: {unexpected_keys}")
         
-        logger.info("LoRA checkpoint loaded successfully")
+        logger.debug("LoRA checkpoint loaded successfully")
     
     def save_checkpoint(self, ds_name: Optional[str] = None, is_milestone: bool = False, **kwargs):
         """Save checkpoint with unified path management."""
@@ -2067,7 +2114,7 @@ class AbstractTrainer(ABC):
         checkpoint_path = checkpoint_dir / f'{self.model_type}_{ds_name}_{suffix}.pt'
         torch.save(checkpoint, checkpoint_path)
 
-        logger.info(f"Checkpoint saved: {ds_name}: {checkpoint_path}")
+        logger.debug("Checkpoint saved for %s: %s", ds_name, checkpoint_path)
 
         # Save LoRA weights separately if LoRA is enabled
         if self.cfg.training.lora.use_lora:
@@ -2096,7 +2143,11 @@ class AbstractTrainer(ABC):
         torch.save(lora_state_dict, lora_checkpoint_path)
         
         lora_param_count = sum(v.numel() for v in lora_state_dict.values())
-        logger.info(f"LoRA checkpoint saved: {lora_checkpoint_path} ({lora_param_count:,} params)")
+        logger.debug(
+            "LoRA checkpoint saved: %s (%s params)",
+            lora_checkpoint_path,
+            f"{lora_param_count:,}",
+        )
 
 
     def _training_checkpoint_path(
@@ -2340,7 +2391,7 @@ class AbstractTrainer(ABC):
                 and epochs_without_improvement >= stopping.patience
             )
             if self._broadcast_bool(should_stop):
-                logger.info(
+                logger.debug(
                     "Early stopping at epoch %d after %d epochs without "
                     "improvement.",
                     epoch,

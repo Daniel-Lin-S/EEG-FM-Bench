@@ -83,6 +83,7 @@ training:
 
 # Logging configuration
 logging:
+  level: info
   experiment_name: brainomni-base
 
   ckpt_interval: 10

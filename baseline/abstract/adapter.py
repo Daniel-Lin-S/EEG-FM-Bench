@@ -95,18 +95,27 @@ class AbstractDatasetAdapter(Dataset, ABC):
 
                     self.montage_mappings[montage_key] = mapping_info
 
-                    logger.info(f"Added montage {montage_key} for dataset {dataset_name}: {len(available_channels)} channels")
+                    logger.debug(
+                        "Added montage %s for dataset %s: %d channels",
+                        montage_key,
+                        dataset_name,
+                        len(available_channels),
+                    )
+
                 else:
                     logger.warning(f"No compatible channels found for montage {montage_key} in dataset {dataset_name}")
 
 
     def _log_adapter_info(self):
         """Log adapter initialization information."""
-        logger.info(f"{self.model_name}: Dataset Adapter analysis complete:")
-        logger.info(f"  - Total samples: {len(self.dataset)}")
-        logger.info(f"  - Available montages: {list(self.montage_mappings.keys())}")
+        logger.debug(f"{self.model_name}: Dataset Adapter analysis complete:")
+        logger.debug(f"  - Total samples: {len(self.dataset)}")
+        logger.debug(
+            "  - Available montages: %s",
+            list(self.montage_mappings),
+        )
         for montage, info in self.montage_mappings.items():
-            logger.info(f"  - {montage}: {len(info['chs'])} channels")
+            logger.debug(f"  - {montage}: {len(info['chs'])} channels")
 
 
     def _process_sample(self, sample: Dict[str, Any]) -> Dict[str, Union[torch.Tensor, str, List[str], int]]:

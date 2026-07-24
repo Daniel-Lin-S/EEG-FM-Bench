@@ -12,9 +12,14 @@ import json
 import math
 import re
 import statistics
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional
+
+import yaml
+
+from baseline.utils.run_artifacts import get_config_hash
 
 
 CONFIG_HASH_LENGTH = 12
@@ -30,8 +35,6 @@ VOLATILE_NUMBER_PATTERN = re.compile(
     r"(?:\d+(?:\.\d*)?|\.\d+)"
     r"(?:[eE][-+]?\d+)?"
 )
-
-
 @dataclass(frozen=True)
 class CampaignPaths:
     """Resolved log and checkpoint locations for one campaign."""
@@ -53,6 +56,28 @@ class CampaignPaths:
         return self.log_root / "summary"
 
 
+@dataclass(frozen=True)
+class CompletionCompatibility:
+    """Compatibility result for one dataset completion.
+
+    Parameters
+    ----------
+    compatible : bool
+        Whether the completion may be reused.
+    mode : str
+        Compatibility rule that accepted or rejected the completion.
+    reason : str
+        Human-readable diagnostic for rejection or recovery.
+    completion : Mapping[str, Any], optional, default=None
+        Parsed completion metadata when valid JSON was available.
+    """
+
+    compatible: bool
+    mode: str
+    reason: str
+    completion: Optional[Mapping[str, Any]] = None
+
+
 def get_campaign_hash(
     config: Mapping[str, Any],
     hpo: Optional[Mapping[str, Any]],
@@ -63,6 +88,7 @@ def get_campaign_hash(
     logging_config = identity.get("logging")
     if isinstance(logging_config, dict):
         logging_config.pop("run_dir", None)
+        logging_config.pop("level", None)
 
     hpo_identity: Dict[str, Any] = {}
     if hpo and hpo.get("enabled"):
@@ -127,111 +153,364 @@ def _write_csv(
     temporary.replace(path)
 
 
+def _normalized_identity(config: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return a JSON-safe config without operational verbosity."""
+    normalized = json.loads(json.dumps(config, sort_keys=True))
+    logging_config = normalized.get("logging")
+    if isinstance(logging_config, dict):
+        logging_config.pop("level", None)
+    return normalized
+
+
+def _config_identity_hash(config: Mapping[str, Any]) -> str:
+    """Return the resolved identity hash for one configuration."""
+    return get_config_hash(config, bool(config.get("multitask")))
+
+
+def _completion_artifact_error(
+    path: Path,
+    completion: Mapping[str, Any],
+    campaign_hash: str,
+    seed: int,
+) -> Optional[str]:
+    """Return a validation error for common completion artifacts."""
+    if completion.get("status") != "completed":
+        return "completion status is not 'completed'"
+    if completion.get("campaign_hash") != campaign_hash:
+        return "campaign hash does not match"
+    if completion.get("seed") != seed:
+        return "seed does not match"
+
+    metrics = completion.get("test_metrics")
+    if not isinstance(metrics, dict):
+        return "test_metrics is not a mapping"
+    numeric_count = 0
+    for metric_key, value in metrics.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        numeric_count += 1
+        if not math.isfinite(float(value)):
+            return (
+                f"test metric '{metric_key}' is not finite at "
+                f"{path.resolve()}"
+            )
+    if numeric_count == 0:
+        return "test_metrics contains no numeric values"
+
+    checkpoint = completion.get("checkpoint_path")
+    if completion.get("has_checkpoint") is not False:
+        if not isinstance(checkpoint, str) or not Path(checkpoint).is_file():
+            return "checkpoint_path is missing or does not exist"
+    return None
+
+
+def _compatibility_failure(
+    reason: str,
+    completion: Optional[Mapping[str, Any]] = None,
+) -> CompletionCompatibility:
+    """Return one standardized rejected compatibility result."""
+    return CompletionCompatibility(
+        compatible=False,
+        mode="rejected",
+        reason=reason,
+        completion=completion,
+    )
+
+
+def _legacy_runtime_batch_compatibility(
+    path: Path,
+    completion: Mapping[str, Any],
+    expected_config: Mapping[str, Any],
+) -> CompletionCompatibility:
+    """Validate a historical config whose batch was runtime-mutated."""
+    execution_id = completion.get("execution_id")
+    if (
+        not isinstance(execution_id, str)
+        or not execution_id
+        or Path(execution_id).name != execution_id
+    ):
+        return _compatibility_failure(
+            "execution_id is missing or invalid",
+            completion,
+        )
+
+    config_path = (
+        path.parents[2]
+        / "configs"
+        / f"{execution_id}.yaml"
+    )
+    if not config_path.is_file():
+        return _compatibility_failure(
+            f"resolved configuration does not exist at {config_path}",
+            completion,
+        )
+    try:
+        saved_config = yaml.safe_load(
+            config_path.read_text(encoding="utf-8")
+        )
+    except (OSError, yaml.YAMLError) as exc:
+        return _compatibility_failure(
+            f"resolved configuration is invalid: {exc}",
+            completion,
+        )
+    if not isinstance(saved_config, dict):
+        return _compatibility_failure(
+            "resolved configuration is not a mapping",
+            completion,
+        )
+
+    try:
+        saved_hash = _config_identity_hash(saved_config)
+    except (KeyError, TypeError, ValueError) as exc:
+        return _compatibility_failure(
+            f"resolved configuration cannot be hashed: {exc}",
+            completion,
+        )
+    if completion.get("config_hash") != saved_hash:
+        return _compatibility_failure(
+            "stored config hash does not match the resolved configuration",
+            completion,
+        )
+
+    adaptive = saved_config.get("training", {}).get(
+        "adaptive_batching",
+        {},
+    )
+    if not isinstance(adaptive, dict) or not adaptive.get("enabled"):
+        return _compatibility_failure(
+            "resolved configuration did not enable adaptive batching",
+            completion,
+        )
+    saved_data = saved_config.get("data")
+    expected_data = expected_config.get("data")
+    if not isinstance(saved_data, dict) or not isinstance(
+        expected_data,
+        dict,
+    ):
+        return _compatibility_failure(
+            "data configuration is missing or invalid",
+            completion,
+        )
+    stored_batch = saved_data.get("batch_size")
+    requested_batch = expected_data.get("batch_size")
+    if (
+        isinstance(stored_batch, bool)
+        or not isinstance(stored_batch, int)
+        or stored_batch <= 0
+        or isinstance(requested_batch, bool)
+        or not isinstance(requested_batch, int)
+        or requested_batch <= 0
+        or requested_batch % stored_batch != 0
+    ):
+        return _compatibility_failure(
+            "stored batch is not a positive divisor of the requested batch",
+            completion,
+        )
+
+    normalized_saved = _normalized_identity(saved_config)
+    normalized_expected = _normalized_identity(expected_config)
+    normalized_saved["data"]["batch_size"] = requested_batch
+    if normalized_saved != normalized_expected:
+        return _compatibility_failure(
+            "resolved configuration differs beyond the runtime batch",
+            completion,
+        )
+    return CompletionCompatibility(
+        compatible=True,
+        mode="legacy_runtime_batch_compatible",
+        reason=(
+            "accepted historical completion with runtime-mutated batch"
+        ),
+        completion=completion,
+    )
+
+
+def check_completion_compatibility(
+    path: Path,
+    campaign_hash: str,
+    seed: int,
+    expected_config: Mapping[str, Any] | str,
+) -> CompletionCompatibility:
+    """Validate one completion against its selected semantic config."""
+    if not path.is_file():
+        return CompletionCompatibility(
+            compatible=False,
+            mode="missing",
+            reason="completion.json does not exist",
+        )
+    try:
+        completion = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return _compatibility_failure(
+            f"completion metadata is invalid: {exc}"
+        )
+    if not isinstance(completion, dict):
+        return _compatibility_failure(
+            "completion metadata is not a mapping"
+        )
+
+    artifact_error = _completion_artifact_error(
+        path,
+        completion,
+        campaign_hash,
+        seed,
+    )
+    if artifact_error is not None:
+        return _compatibility_failure(artifact_error, completion)
+
+    if isinstance(expected_config, str):
+        expected_hash = expected_config
+    else:
+        try:
+            expected_hash = _config_identity_hash(expected_config)
+        except (KeyError, TypeError, ValueError) as exc:
+            return _compatibility_failure(
+                f"selected configuration cannot be hashed: {exc}",
+                completion,
+            )
+        expected_datasets = expected_config.get("data", {}).get(
+            "datasets",
+            {},
+        )
+        expected_dataset_config = expected_datasets.get(path.parent.name)
+        if completion.get("dataset_config") != expected_dataset_config:
+            return _compatibility_failure(
+                "dataset configuration does not match",
+                completion,
+            )
+
+    if completion.get("config_hash") == expected_hash:
+        return CompletionCompatibility(
+            compatible=True,
+            mode="exact_canonical_hash",
+            reason="canonical configuration hash matches",
+            completion=completion,
+        )
+    if isinstance(expected_config, str):
+        return _compatibility_failure(
+            "configuration hash does not match",
+            completion,
+        )
+    return _legacy_runtime_batch_compatibility(
+        path,
+        completion,
+        expected_config,
+    )
+
+
+def _append_metric_rows(
+    rows: list[Dict[str, Any]],
+    completion: Mapping[str, Any],
+    dataset_name: str,
+    seed: int,
+) -> None:
+    """Append numeric metrics from one validated completion."""
+    metrics = completion["test_metrics"]
+    for metric_key, value in sorted(metrics.items()):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        rows.append({
+            "dataset": dataset_name,
+            "seed": seed,
+            "metric": metric_key.rsplit("/", maxsplit=1)[-1],
+            "value": float(value),
+        })
+
+
+def collect_test_rows_with_diagnostics(
+    campaign_root: Path,
+    campaign_hash: str,
+    compatible_configs: Mapping[
+        tuple[int, str],
+        Mapping[str, Any] | str,
+    ],
+) -> tuple[list[Dict[str, Any]], Dict[str, list[Dict[str, Any]]]]:
+    """Collect compatible dataset-seed pairs and their diagnostics."""
+    rows: list[Dict[str, Any]] = []
+    diagnostics: Dict[str, list[Dict[str, Any]]] = {
+        "accepted": [],
+        "missing": [],
+        "rejected": [],
+    }
+    for (seed, dataset_name), expected in sorted(
+        compatible_configs.items()
+    ):
+        completion_path = (
+            campaign_root
+            / "logs"
+            / f"seed_{seed}"
+            / "datasets"
+            / dataset_name
+            / "completion.json"
+        )
+        result = check_completion_compatibility(
+            completion_path,
+            campaign_hash,
+            seed,
+            expected,
+        )
+        diagnostic = {
+            "seed": seed,
+            "dataset": dataset_name,
+            "path": str(completion_path.resolve()),
+            "reason": result.reason,
+        }
+        if not result.compatible:
+            diagnostics[result.mode].append(diagnostic)
+            continue
+        diagnostic["mode"] = result.mode
+        diagnostics["accepted"].append(diagnostic)
+        if result.completion is None:
+            raise RuntimeError(
+                "Compatible completion result has no parsed metadata."
+            )
+        _append_metric_rows(
+            rows,
+            result.completion,
+            dataset_name,
+            seed,
+        )
+    return rows, diagnostics
+
+
 def collect_test_rows(
     campaign_root: Path,
     campaign_hash: str,
     compatible_config_hashes: Optional[
-        Mapping[tuple[int, str], str]
+        Mapping[tuple[int, str], Mapping[str, Any] | str]
     ] = None,
 ) -> list[Dict[str, Any]]:
     """Collect compatible numeric test metrics from completed seed runs."""
-    logs_root = campaign_root / "logs"
-    rows: list[Dict[str, Any]] = []
-    if not logs_root.is_dir():
-        return rows
-
-    for seed_root in sorted(logs_root.iterdir()):
-        match = SEED_DIRECTORY_PATTERN.match(seed_root.name)
-        if match is None or not seed_root.is_dir():
-            continue
-        seed = int(match.group(1))
-        datasets_root = seed_root / "datasets"
-        if not datasets_root.is_dir():
-            continue
-
-        if compatible_config_hashes is None:
-            completion_paths = sorted(
-                datasets_root.glob("*/completion.json")
+    if compatible_config_hashes is None:
+        compatible_config_hashes = {}
+        logs_root = campaign_root / "logs"
+        for completion_path in sorted(
+            logs_root.glob("seed_*/datasets/*/completion.json")
+        ):
+            match = SEED_DIRECTORY_PATTERN.match(
+                completion_path.parents[2].name
             )
-        else:
-            expected = {
-                dataset_name: config_hash
-                for (expected_seed, dataset_name), config_hash
-                in compatible_config_hashes.items()
-                if expected_seed == seed
-            }
-            if not expected:
+            if match is None:
                 continue
-            completion_paths = [
-                datasets_root / dataset_name / "completion.json"
-                for dataset_name in sorted(expected)
-            ]
-            seed_is_complete = all(
-                path.is_file()
-                and _completion_matches(
-                    path,
-                    campaign_hash,
-                    seed,
-                    expected[path.parent.name],
+            try:
+                completion = json.loads(
+                    completion_path.read_text(encoding="utf-8")
                 )
-                for path in completion_paths
-            )
-            if not seed_is_complete:
+            except (OSError, json.JSONDecodeError):
                 continue
-
-        for completion_path in completion_paths:
-            completion = json.loads(
-                completion_path.read_text(encoding="utf-8")
-            )
-            if (
-                completion.get("status") != "completed"
-                or completion.get("campaign_hash") != campaign_hash
-                or completion.get("seed") != seed
-            ):
+            config_hash = completion.get("config_hash")
+            if not isinstance(config_hash, str):
                 continue
-            dataset_name = completion_path.parent.name
-            metrics = completion.get("test_metrics")
-            if not isinstance(metrics, dict):
-                raise ValueError(
-                    f"Expected test_metrics mapping at {completion_path}."
-                )
-            for metric_key, value in sorted(metrics.items()):
-                if isinstance(value, bool) or not isinstance(
-                    value,
-                    (int, float),
-                ):
-                    continue
-                if not math.isfinite(float(value)):
-                    raise ValueError(
-                        f"Test metric '{metric_key}' is not finite at "
-                        f"{completion_path.resolve()}: {value}."
-                    )
-                rows.append({
-                    "dataset": dataset_name,
-                    "seed": seed,
-                    "metric": metric_key.rsplit("/", maxsplit=1)[-1],
-                    "value": float(value),
-                })
+            compatible_config_hashes[
+                (int(match.group(1)), completion_path.parent.name)
+            ] = config_hash
+    rows, _ = collect_test_rows_with_diagnostics(
+        campaign_root,
+        campaign_hash,
+        compatible_config_hashes,
+    )
     return rows
 
-
-def _completion_matches(
-    path: Path,
-    campaign_hash: str,
-    seed: int,
-    config_hash: str,
-) -> bool:
-    """Return whether one completion belongs to the selected seed config."""
-    try:
-        completion = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-    return bool(
-        completion.get("status") == "completed"
-        and completion.get("campaign_hash") == campaign_hash
-        and completion.get("seed") == seed
-        and completion.get("config_hash") == config_hash
-    )
 
 
 def summarize_test_rows(
@@ -262,21 +541,40 @@ def write_campaign_summary(
     paths: CampaignPaths,
     campaign_hash: str,
     invocation: Mapping[str, Any],
-    compatible_config_hashes: Optional[
-        Mapping[tuple[int, str], str]
-    ] = None,
-) -> Dict[str, Any]:
-    """Regenerate local test summaries from all compatible completed seeds."""
-    test_rows = collect_test_rows(
+    compatible_configs: Mapping[
+        tuple[int, str],
+        Mapping[str, Any] | str,
+    ],
+) -> Optional[Dict[str, Any]]:
+    """Regenerate summaries, preserving old summaries when none match."""
+    test_rows, diagnostics = collect_test_rows_with_diagnostics(
         paths.log_root,
         campaign_hash,
-        compatible_config_hashes,
+        compatible_configs,
     )
     if not test_rows:
-        raise ValueError(
-            f"No compatible completed seed results exist under "
-            f"{paths.log_root.resolve()}."
+        report_path = (
+            paths.summary_root / "compatibility_report.json"
         )
+        report = {
+            "campaign_hash": campaign_hash,
+            "invocation": dict(invocation),
+            "compatibility": diagnostics,
+            "status": "no_compatible_results",
+        }
+        _atomic_write_text(
+            report_path,
+            json.dumps(report, indent=2, sort_keys=True),
+        )
+        warnings.warn(
+            "No compatible completed seed results were found. "
+            "Previous summaries were left unchanged; see "
+            f"{report_path.resolve()}.",
+            UserWarning,
+            stacklevel=2,
+        )
+        return None
+
     summary_rows = summarize_test_rows(test_rows)
     include_std = any("std" in row for row in summary_rows)
     summary_fields = [
@@ -299,9 +597,15 @@ def write_campaign_summary(
         summary_fields,
         summary_rows,
     )
+    partial = (
+        not bool(invocation.get("complete", True))
+        or bool(diagnostics["missing"] or diagnostics["rejected"])
+    )
     payload = {
         "campaign_hash": campaign_hash,
         "invocation": dict(invocation),
+        "status": "partial" if partial else "complete",
+        "compatibility": diagnostics,
         "test_runs": test_rows,
         "test_summary": summary_rows,
     }

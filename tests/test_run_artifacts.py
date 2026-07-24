@@ -17,6 +17,20 @@ def test_outputs_default_and_validation() -> None:
     with pytest.raises(ValueError, match='at least one trace type'):
         BrainOmniLoggingArgs(outputs=[])
 
+def test_logging_level_is_normalized_and_not_part_of_identity() -> None:
+    """Operational verbosity is validated without invalidating artifacts."""
+    assert BrainOmniLoggingArgs().level == 'info'
+    assert BrainOmniLoggingArgs(level='DEBUG').level == 'debug'
+    with pytest.raises(ValueError, match='Input should be'):
+        BrainOmniLoggingArgs(level='trace')
+
+    config = BrainOmniConfig().model_dump(mode='json')
+    original = get_config_hash(config, multitask=False)
+    config['logging']['level'] = 'debug'
+
+    assert get_config_hash(config, multitask=False) == original
+
+
 
 def test_single_task_hash_ignores_dataset_selection() -> None:
     """Single-task experiment identity remains stable as datasets are added."""

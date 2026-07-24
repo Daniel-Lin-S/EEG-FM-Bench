@@ -312,6 +312,20 @@ batch, selected micro-batch, accumulation steps, allocator limit, analytical
 fixed-memory estimate, measured CUDA peak, and retry count. Deterministic
 feature-extractor baselines do not use adaptive CUDA batching.
 
+##### Campaign logging verbosity
+
+Console and optional text-log verbosity are controlled independently of metric artifacts:
+
+```yaml
+logging:
+  level: info  # debug, info, warning, or error; case-insensitive
+```
+
+`info` is the default. It reports campaign, HPO, seed, and dataset lifecycle milestones; absolute artifact locations; reused or newly selected HPO winners; and final dataset summaries. Optimizer steps, epoch validation details, adaptive calibration, model and loader setup, checkpoint chatter, and individual HPO trial progress require `debug`. CSV, TensorBoard, and cloud metrics are recorded regardless of this console level.
+
+At normal verbosity, Optuna's per-trial console messages are suppressed and HPO trial directories do not contain text logs. Structured trial JSON, validation CSV, and SQLite study state remain available. Existing terminal progress bars are unchanged and wrapper logs continue to omit carriage-return redraws. Changing `logging.level` does not change campaign, HPO, or resolved training identities.
+
+
 ##### Hyperparameter optimization
 
 Hyperparameter optimization uses validation performance to select values from `hpo.search_space`. It uses `hpo.seed` for trial training and `hpo.sampler.seed` for TPE sampling. For `multitask: false`, every dataset gets its own study and winner. For `multitask: true`, one joint study selects a shared winner.
@@ -381,7 +395,11 @@ warning.
 
 The HPO identity excludes `hpo.n_trials` and `hpo.max_consecutive_failed_trials`,
 allowing either operational limit to be changed while resuming an existing
-study. HPO artifacts are local and organized by study scope:
+study.
+
+When a resumed study already has at least `n_trials` complete-or-pruned trials, it constructs no trainer and performs no adaptive calibration. The winner is loaded from SQLite, validated, and used to regenerate `best.json` only when needed. Increasing `n_trials` runs only the missing budget.
+
+HPO artifacts are local and organized by study scope:
 
 ```text
 <campaign>/
@@ -430,12 +448,15 @@ The campaign identity excludes the seed list, so later invocations can add compa
 │   │   └── datasets/<dataset>/completion.json
 │   └── seed_43/
 └── summary/
+    ├── compatibility_report.json
     ├── test_runs.csv
     ├── test_summary.csv
     └── summary.json
 ```
 
-Summaries aggregate all fully completed compatible seed directories from current and earlier invocations. They contain every numeric test metric, individual values, count, mean, median, and sample standard deviation when at least two seeds are available.
+Summaries aggregate every compatible dataset×seed pair from current and earlier invocations. `summary.json` records accepted, missing, and rejected pairs and marks incomplete collections as partial.
+
+If no compatible pair remains, the invocation writes a non-empty `compatibility_report.json`, warns with its absolute path, and leaves previous local and cloud summaries unchanged.
 
 #### Step 3: Analysis & Visualization
 ```bash

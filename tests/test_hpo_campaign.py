@@ -172,6 +172,7 @@ def test_campaign_identity_excludes_seeds_and_trial_budget() -> None:
     base["seeds"] = [42, 43, 44]
     hpo["n_trials"] = 100
     hpo["max_consecutive_failed_trials"] = 9
+    base["logging"]["level"] = "debug"
     assert get_campaign_hash(base, hpo) == original
 
     hpo["search_space"]["training.max_lr"]["high"] = 2e-3
@@ -414,6 +415,7 @@ def _write_completion(
             "campaign_hash": "campaign",
             "config_hash": config_hash,
             "seed": seed,
+            "has_checkpoint": False,
             "test_metrics": {
                 f"{dataset_name}/test/acc": value,
             },
@@ -422,10 +424,10 @@ def _write_completion(
     )
 
 
-def test_summary_excludes_partial_and_stale_seed_results(
+def test_summary_accepts_compatible_dataset_seed_pairs(
     tmp_path: Path,
 ) -> None:
-    """Only fully completed seeds matching the selected winner are read."""
+    """Compatible pairs survive missing or stale sibling datasets."""
     _write_completion(tmp_path, 42, "alpha", "alpha-42", 0.1)
     _write_completion(tmp_path, 43, "alpha", "alpha-43", 0.2)
     _write_completion(tmp_path, 43, "beta", "beta-43", 0.3)
@@ -442,8 +444,15 @@ def test_summary_excludes_partial_and_stale_seed_results(
 
     rows = collect_test_rows(tmp_path, "campaign", compatible)
 
-    assert {row["seed"] for row in rows} == {43}
-    assert {row["dataset"] for row in rows} == {"alpha", "beta"}
+    assert {
+        (row["seed"], row["dataset"])
+        for row in rows
+    } == {
+        (42, "alpha"),
+        (43, "alpha"),
+        (43, "beta"),
+        (44, "beta"),
+    }
 
 
 def test_single_task_and_multitask_hpo_scopes_and_paths(
@@ -500,6 +509,48 @@ def test_optuna_sqlite_study_resumes_existing_trials(
         / "datasets"
         / "alpha"
         / "study.sqlite3"
+    ).is_file()
+
+
+def test_completed_hpo_budget_reuses_winner_without_trainer(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A complete persisted budget selects its winner without calibration."""
+    runner = CampaignRunner.__new__(CampaignRunner)
+    runner.paths = CampaignPaths(
+        log_root=tmp_path / "log",
+        checkpoint_root=tmp_path / "ckpt",
+    )
+    runner.campaign_hash = "campaign"
+    runner.hpo_config = make_hpo_config().model_copy(
+        update={"n_trials": 1}
+    )
+    scope_config = BrainOmniConfig().model_dump(mode="json")
+    runner.base_dict = scope_config
+    runner.config_class = BrainOmniConfig
+
+    study = runner._create_study("alpha")
+    trial = study.ask()
+    trial.set_user_attr("decoded_params", {})
+    study.tell(trial, 1.0)
+
+    def reject_training(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("trainer must not be constructed")
+
+    monkeypatch.setattr(runner, "_run_adaptive_trainer", reject_training)
+
+    selected = runner._run_hpo_scope("alpha", scope_config)
+
+    assert selected == scope_config
+    assert (
+        tmp_path
+        / "log"
+        / "hpo"
+        / "datasets"
+        / "alpha"
+        / "best.json"
     ).is_file()
 
 

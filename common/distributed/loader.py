@@ -176,10 +176,17 @@ class DistributedGroupBatchSampler(Sampler):
             all_batches.extend(indices_list)
 
         if len(all_batches) != self.n_total_batches:
-            logger.info(f'All batches num {len(all_batches)}, used batches num {self.n_total_batches}')
-            logger.info(f'Last {len(all_batches) - self.n_total_batches} will be dropped.')
+            logger.debug(
+                'All batches num %d, used batches num %d',
+                len(all_batches),
+                self.n_total_batches,
+            )
+            logger.debug(
+                'Last %d will be dropped.',
+                len(all_batches) - self.n_total_batches,
+            )
         else:
-            logger.info(f'All batches num {len(all_batches)}')
+            logger.debug(f'All batches num {len(all_batches)}')
 
         self.all_batches = all_batches[:self.n_total_batches]
 

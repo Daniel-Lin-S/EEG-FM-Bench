@@ -8,6 +8,7 @@ optimizer update without creating datasets or campaign artifacts.
 from __future__ import annotations
 
 from typing import Any
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -154,6 +155,29 @@ def test_adaptive_configuration_validation_and_defaults() -> None:
                 },
             },
         )
+
+
+def test_runtime_micro_batch_does_not_mutate_requested_config() -> None:
+    """All adaptive candidates retain one canonical resolved identity."""
+    config = BrainOmniConfig(
+        seeds=[7],
+        data={"batch_size": 8},
+    )
+    trainer = DummyTrainer(config)
+    trainer.dataloader_factory = SimpleNamespace(batch_size=8)
+    original_hash = trainer._resolved_config_hash()
+
+    trainer.configure_runtime_batching(
+        global_batch_size=8,
+        micro_batch_size=2,
+        world_size=1,
+    )
+
+    assert config.data.batch_size == 8
+    assert trainer.dataloader_factory.batch_size == 2
+    assert trainer.micro_batch_size == 2
+    assert trainer.accumulation_steps == 4
+    assert trainer._resolved_config_hash() == original_hash
 
 
 def test_accumulation_normalizes_by_samples() -> None:

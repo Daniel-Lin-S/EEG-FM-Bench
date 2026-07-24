@@ -32,6 +32,7 @@ from baseline.abstract.factory import ModelRegistry
 from baseline.hpo.artifacts import (
     CampaignPaths,
     build_campaign_paths,
+    check_completion_compatibility,
     failure_fingerprint,
     get_campaign_hash,
     write_campaign_summary,
@@ -50,6 +51,7 @@ from common.distributed.env import (
     get_is_master,
     get_world_size,
 )
+from common.log import setup_log
 
 
 logger = logging.getLogger("baseline")
@@ -69,6 +71,14 @@ class CampaignExecutionError(RuntimeError):
 
 def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
     """Atomically write one JSON mapping."""
+    if path.is_file():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            existing = None
+        if existing == dict(payload):
+            return
+
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(
@@ -117,6 +127,8 @@ def _force_local_trial_logging(config: Dict[str, Any]) -> None:
     logging_config = config["logging"]
     logging_config["use_cloud"] = False
     outputs = list(logging_config.get("outputs", []))
+    if logging_config.get("level", "info") != "debug":
+        outputs = [output for output in outputs if output != "log"]
     if "csv" not in outputs:
         outputs.append("csv")
     logging_config["outputs"] = outputs
@@ -148,22 +160,23 @@ def _config_hash(config: Mapping[str, Any]) -> str:
     )
 
 
-def _expected_config_hashes(
+def _expected_configs(
     selected_configs: Mapping[str, Mapping[str, Any]],
     seed: int,
-) -> Dict[str, str]:
-    """Return expected dataset configuration hashes for one seed."""
-    expected: Dict[str, str] = {}
+) -> Dict[str, Dict[str, Any]]:
+    """Return selected dataset configurations for one seed."""
+    expected: Dict[str, Dict[str, Any]] = {}
     for config in selected_configs.values():
         scoped = _scoped_config(config, seed)
         config_hash = _config_hash(scoped)
         for dataset_name in scoped["data"]["datasets"]:
-            previous = expected.setdefault(dataset_name, config_hash)
-            if previous != config_hash:
+            previous = expected.get(dataset_name)
+            if previous is not None and _config_hash(previous) != config_hash:
                 raise ValueError(
                     f"Dataset '{dataset_name}' has conflicting selected "
                     "configurations."
                 )
+            expected[dataset_name] = copy.deepcopy(scoped)
     if not expected:
         raise ValueError("Selected campaign configuration has no datasets.")
     return expected
@@ -176,39 +189,27 @@ def _seed_scope_is_complete(
     selected_configs: Mapping[str, Mapping[str, Any]],
 ) -> bool:
     """Return whether every selected dataset scope has matching completion."""
-    expected = _expected_config_hashes(selected_configs, seed)
-
-    for dataset_name, config_hash in expected.items():
+    expected = _expected_configs(selected_configs, seed)
+    for dataset_name, config in expected.items():
         completion_path = (
             paths.seed_log_root(seed)
             / "datasets"
             / dataset_name
             / "completion.json"
         )
-        if not completion_path.is_file():
-            return False
-        try:
-            completion = json.loads(
-                completion_path.read_text(encoding="utf-8")
+        result = check_completion_compatibility(
+            completion_path,
+            campaign_hash,
+            seed,
+            config,
+        )
+        if not result.compatible:
+            logger.debug(
+                "Seed %d dataset %s is incomplete: %s",
+                seed,
+                dataset_name,
+                result.reason,
             )
-        except (OSError, json.JSONDecodeError) as exc:
-            logger.warning(
-                "Ignoring invalid completion metadata at %s: %s",
-                completion_path.resolve(),
-                exc,
-            )
-            return False
-        if not (
-            completion.get("status") == "completed"
-            and completion.get("campaign_hash") == campaign_hash
-            and completion.get("seed") == seed
-            and completion.get("config_hash") == config_hash
-        ):
-            return False
-        checkpoint = completion.get("checkpoint_path")
-        if completion.get("has_checkpoint") is False:
-            continue
-        if not isinstance(checkpoint, str) or not Path(checkpoint).is_file():
             return False
     return True
 
@@ -334,6 +335,26 @@ class CampaignRunner:
         self.distributed_initialized = False
         self.adaptive_batch_cache: Dict[str, Dict[str, Any]] = {}
         self.last_adaptive_memory_profile: Dict[str, Any] = {}
+
+    def _configure_campaign_logging(self) -> None:
+        """Configure campaign console logging and Optuna verbosity."""
+        logging_config = self.base_dict.get("logging", {})
+        level = str(logging_config.get("level", "info")).upper()
+        setup_log(
+            start_time=None,
+            name="baseline",
+            level=level,
+        )
+        try:
+            import optuna
+        except ImportError:
+            return
+        optuna_level = (
+            optuna.logging.DEBUG
+            if level == "DEBUG"
+            else optuna.logging.WARNING
+        )
+        optuna.logging.set_verbosity(optuna_level)
 
     def _adaptive_signature(self, config: BaseModel) -> str:
         """Return an invocation-local memory-profile identity."""
@@ -594,6 +615,11 @@ class CampaignRunner:
             "Campaign checkpoint root: %s",
             self.paths.checkpoint_root.resolve(),
         )
+        logger.info(
+            "Campaign layout: campaign.yaml, hpo/, logs/seed_<seed>/, "
+            "and summary/ under %s.",
+            self.paths.log_root.resolve(),
+        )
 
     def _create_study(self, scope: str):
         """Create or resume one rank-zero Optuna study."""
@@ -673,6 +699,7 @@ class CampaignRunner:
     ) -> Dict[str, Any]:
         """Run or resume one HPO scope and return its selected config."""
         import optuna
+        self._configure_campaign_logging()
 
         study = self._create_study(scope) if get_is_master() else None
         if get_is_master():
@@ -680,15 +707,32 @@ class CampaignRunner:
             budgeted, consecutive_failures = _study_progress(
                 persisted_trials
             )
+            study_status = "resumed" if persisted_trials else "new"
         else:
             budgeted = 0
             consecutive_failures = 0
+            study_status = "new"
         progress = _broadcast_object({
             "budgeted": budgeted,
             "consecutive_failures": consecutive_failures,
+            "study_status": study_status,
         })
         budgeted = int(progress["budgeted"])
         consecutive_failures = int(progress["consecutive_failures"])
+        study_status = str(progress["study_status"])
+        if get_is_master():
+            study_path = (
+                _hpo_scope_root(self.paths.log_root, scope)
+                / "study.sqlite3"
+            ).resolve()
+            logger.info(
+                "HPO scope %s: %s study, budget %d/%d at %s.",
+                scope,
+                study_status,
+                budgeted,
+                self.hpo_config.n_trials,
+                study_path,
+            )
         failure_limit = self.hpo_config.max_consecutive_failed_trials
         if consecutive_failures >= failure_limit:
             raise RuntimeError(
@@ -767,6 +811,9 @@ class CampaignRunner:
                 })
                 trial.report(value, step=epoch)
                 return trial.should_prune()
+
+            if self.base_dict["logging"].get("level") != "debug":
+                logger.setLevel(logging.WARNING)
 
             try:
                 trial_config = self.config_class.model_validate(sampled)
@@ -869,6 +916,7 @@ class CampaignRunner:
                         "Correct the configuration or search space."
                     )
 
+        self._configure_campaign_logging()
         if get_is_master():
             try:
                 best_trial = study.best_trial
@@ -901,6 +949,17 @@ class CampaignRunner:
         else:
             best_payload = None
         best_payload = _broadcast_object(best_payload)
+        if get_is_master():
+            logger.info(
+                "HPO scope %s selected trial %d with objective %.8g; "
+                "best parameters: %s. Best artifact: %s.",
+                scope,
+                best_payload["trial_number"],
+                best_payload["objective"],
+                json.dumps(best_payload["parameters"], sort_keys=True),
+                (_hpo_scope_root(self.paths.log_root, scope)
+                 / "best.json").resolve(),
+            )
 
         selected = copy.deepcopy(dict(scope_config))
         for path, value in best_payload["parameters"].items():
@@ -1114,12 +1173,20 @@ class CampaignRunner:
                 selected_configs,
             ):
                 skipped.append(seed)
+                logger.info(
+                    "Seed %d is already complete and compatible; skipping.",
+                    seed,
+                )
                 continue
             pending.append(seed)
 
         for index, seed in enumerate(pending):
-
             attempted.append(seed)
+            logger.info(
+                "Starting seed %d; artifacts: %s.",
+                seed,
+                self.paths.seed_log_root(seed).resolve(),
+            )
             try:
                 self._run_seed(seed, selected_configs)
             except Exception as exc:
@@ -1142,6 +1209,11 @@ class CampaignRunner:
                     break
             else:
                 succeeded.append(seed)
+                logger.info(
+                    "Seed %d completed; artifacts: %s.",
+                    seed,
+                    self.paths.seed_log_root(seed).resolve(),
+                )
                 if first_attempt_succeeded is None:
                     first_attempt_succeeded = True
                 previous_failure = None
@@ -1161,6 +1233,32 @@ class CampaignRunner:
                 first_attempt_succeeded and succeeded
             )
         return invocation, summary_eligible
+
+    def _log_campaign_summary(
+        self,
+        summary: Mapping[str, Any],
+    ) -> None:
+        """Log compact final dataset metric summaries at INFO."""
+        logger.info(
+            "Campaign summary: %s",
+            (self.paths.summary_root / "summary.json").resolve(),
+        )
+        for row in summary["test_summary"]:
+            message = (
+                "%s test %s: count=%d, mean=%.6g, median=%.6g"
+            )
+            arguments: list[Any] = [
+                row["dataset"],
+                row["metric"],
+                row["count"],
+                row["mean"],
+                row["median"],
+            ]
+            if "std" in row:
+                message += ", std=%.6g"
+                arguments.append(row["std"])
+            logger.info(message, *arguments)
+
 
     def _update_cloud_summary(
         self,
@@ -1263,6 +1361,7 @@ class CampaignRunner:
 
     def run(self) -> Dict[str, Any]:
         """Run HPO if enabled, then execute independent configured seeds."""
+        self._configure_campaign_logging()
         self._save_campaign_config()
         hpo_enabled = self.hpo_config.enabled
         if (
@@ -1290,9 +1389,13 @@ class CampaignRunner:
                 else self._fixed_scopes()
             )
             invocation, summary_eligible = self._run_seeds(selected)
+            self._configure_campaign_logging()
             summary = None
             if summary_eligible and get_is_master():
-                compatible_hashes: Dict[tuple[int, str], str] = {}
+                compatible_configs: Dict[
+                    tuple[int, str],
+                    Dict[str, Any],
+                ] = {}
                 logs_root = self.paths.log_root / "logs"
                 discovered_seeds = set(self.base_dict["seeds"])
                 if logs_root.is_dir():
@@ -1304,18 +1407,18 @@ class CampaignRunner:
                         except ValueError:
                             continue
                 for seed in discovered_seeds:
-                    expected = _expected_config_hashes(selected, seed)
-                    for dataset_name, config_hash in expected.items():
-                        compatible_hashes[(seed, dataset_name)] = (
-                            config_hash
-                        )
+                    expected = _expected_configs(selected, seed)
+                    for dataset_name, config in expected.items():
+                        compatible_configs[(seed, dataset_name)] = config
                 summary = write_campaign_summary(
                     self.paths,
                     self.campaign_hash,
                     invocation,
-                    compatible_hashes,
+                    compatible_configs,
                 )
-                self._update_cloud_summary(summary)
+                if summary is not None:
+                    self._log_campaign_summary(summary)
+                    self._update_cloud_summary(summary)
             if invocation["failed"]:
                 raise CampaignExecutionError(
                     "One or more seed executions failed. See campaign "
