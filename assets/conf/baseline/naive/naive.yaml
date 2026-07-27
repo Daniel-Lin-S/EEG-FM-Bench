@@ -1,0 +1,20 @@
+# Label-only majority-class baseline across all available finetune datasets.
+seeds: [42]
+multitask: false
+model_type: naive
+
+data:
+  datasets:
+    bcic_2020_3: finetune
+    bcic_2a: finetune
+    # ...
+
+model:
+  tie_breaker: seeded_uniform
+
+logging:
+  experiment_name: naive
+  run_dir: assets/run
+  use_cloud: false
+  outputs:
+    - csv

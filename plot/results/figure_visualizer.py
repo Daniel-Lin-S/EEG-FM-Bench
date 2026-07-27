@@ -28,16 +28,16 @@ ANNOTATION_LINE_WIDTH = 1.4
 ANNOTATION_FONT_SIZE = 7.0
 DATASET_TICK_SIZE = 9.0
 MARKERS = ("o", "s", "^", "D", "P", "X", "v", "<", ">")
-GRAYSCALE_COLORS = (
-    "#1a1a1a",
-    "#4d4d4d",
-    "#737373",
-    "#969696",
-    "#252525",
-    "#636363",
-    "#8c8c8c",
-    "#525252",
-    "#bdbdbd",
+MODEL_COLORS = (
+    "#0072B2",
+    "#D55E00",
+    "#009E73",
+    "#CC79A7",
+    "#E69F00",
+    "#56B4E9",
+    "#F0E442",
+    "#000000",
+    "#999999",
 )
 JITTER_WIDTH = 0.07
 GROUP_WIDTH = 0.72
@@ -129,7 +129,7 @@ def _save_metric_figure(
         label_rows = [row for row in rows if row["artifact"] == label]
         if not label_rows:
             continue
-        color = GRAYSCALE_COLORS[label_index % len(GRAYSCALE_COLORS)]
+        color = MODEL_COLORS[label_index % len(MODEL_COLORS)]
         marker = MARKERS[label_index % len(MARKERS)]
         for dataset in datasets:
             group_values = [

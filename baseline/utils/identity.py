@@ -15,7 +15,7 @@ from typing import Any, Mapping, MutableMapping, Optional
 IDENTITY_VERSION = 2
 DISPLAY_ID_LENGTH = 12
 HPO_SEARCH_MARKER_KEY = "__hpo_search_parameter__"
-DETERMINISTIC_MODEL_TYPES = frozenset({"catch22", "minirocket"})
+DETERMINISTIC_MODEL_TYPES = frozenset({"catch22", "minirocket", "naive"})
 INVOCATION_CONFIG_FIELDS = frozenset({
     "conf_file",
     "logging",

@@ -27,6 +27,12 @@ _MODEL_SPECS = {
         "baseline.minirocket.minirocket_trainer.MiniRocketTrainer",
         "pip install -r requirements/feature_extractors.txt",
     ),
+    "naive": (
+        "baseline.naive.naive_config.NaiveConfig",
+        None,
+        "baseline.naive.naive_trainer.NaiveTrainer",
+        None,
+    ),
 }
 
 

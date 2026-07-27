@@ -165,7 +165,9 @@ def test_yaml_comparison_writes_read_only_source_outputs(
     markdown = output_dir.joinpath("tables", "performance.md").read_text(
         encoding="utf-8",
     )
-    assert "**0.8500 ± 0.0707**" in markdown
+    assert '<td rowspan="2" align="center"' in markdown
+    assert 'style="vertical-align: middle;">toy</td>' in markdown
+    assert "<strong>0.8500 ± 0.0707</strong>" in markdown
     assert "0.7500 ± 0.0707†" in markdown
     assert "0.7900" in markdown
     assert "not statistically distinguishable" in markdown
