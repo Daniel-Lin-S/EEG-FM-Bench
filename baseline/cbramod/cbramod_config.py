@@ -5,16 +5,54 @@ CBraMod Configuration that inherits from AbstractConfig.
 from typing import Dict, Optional, List
 from pydantic import Field
 
-from baseline.abstract.config import AbstractConfig, BaseDataArgs, BaseModelArgs, BaseTrainingArgs, BaseLoggingArgs
+from baseline.abstract.config import (
+    AbstractConfig,
+    BaseDataArgs,
+    BaseLoggingArgs,
+    BaseModelArgs,
+    BaseTrainingArgs,
+)
 
 
 class CBraModDataArgs(BaseDataArgs):
+    """CBraMod data-loader configuration.
+
+    Shared dataset and data-loader parameters are documented in
+    :class:`BaseDataArgs`.
+    """
     datasets: Dict[str, str] = Field(default_factory=lambda: {})
     batch_size: int = 32
     num_workers: int = 2
 
 
 class CBraModModelArgs(BaseModelArgs):
+    """CBraMod architecture and regularization configuration.
+
+    Shared model-loading, analysis, and classifier-head parameters are
+    documented in :class:`BaseModelArgs`.
+
+    Parameters
+    ----------
+    pretrained_path : str or None, optional, default=None
+        Optional path to a PyTorch checkpoint containing CBraMod encoder
+        weights. The trainer loads the checkpoint into the encoder with
+        non-strict matching and warns about missing or unexpected keys. If
+        omitted, training starts with a newly initialized encoder.
+    in_dim : int, optional, default=200
+        Number of input samples in each temporal patch.
+    out_dim : int, optional, default=200
+        Width of the encoder feature representation returned to the trainer.
+    d_model : int, optional, default=200
+        Transformer embedding width.
+    dim_ffn : int, optional, default=800
+        Hidden width of each transformer's feed-forward network.
+    n_layer : int, optional, default=12
+        Number of transformer encoder layers.
+    n_head : int, optional, default=8
+        Number of attention heads in each transformer layer.
+    dropout_rate : float, optional, default=0.1
+        Dropout probability used by the transformer encoder.
+    """
     # Pretrained model path
     pretrained_path: Optional[str] = None
 
@@ -31,6 +69,11 @@ class CBraModModelArgs(BaseModelArgs):
 
 
 class CBraModTrainingArgs(BaseTrainingArgs):
+    """CBraMod training defaults.
+
+    Shared optimizer, schedule, precision, freezing, and adaptation
+    parameters are documented in :class:`BaseTrainingArgs`.
+    """
     max_epochs: int = 50
 
     weight_decay: float = 0.01
@@ -50,6 +93,11 @@ class CBraModTrainingArgs(BaseTrainingArgs):
 
 
 class CBraModLoggingArgs(BaseLoggingArgs):
+    """CBraMod logging defaults.
+
+    Shared run-artifact, cloud-tracking, and checkpoint parameters are
+    documented in :class:`BaseLoggingArgs`.
+    """
     experiment_name: str = "cbramod"
     run_dir: str = "assets/run"
 
@@ -69,6 +117,13 @@ class CBraModLoggingArgs(BaseLoggingArgs):
 
 
 class CBraModConfig(AbstractConfig):
+    """Top-level CBraMod configuration.
+
+    Shared top-level parameters are documented in :class:`AbstractConfig`.
+    Shared nested parameters are documented in :class:`BaseDataArgs`,
+    :class:`BaseModelArgs`, :class:`BaseTrainingArgs`, and
+    :class:`BaseLoggingArgs`.
+    """
     model_type: str = "cbramod"
     fs: int = 200
     
@@ -91,4 +146,4 @@ class CBraModConfig(AbstractConfig):
         if self.training.lr_schedule not in ["onecycle", "cosine"]:
             return False
             
-        return True 
+        return True
