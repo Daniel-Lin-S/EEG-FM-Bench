@@ -26,8 +26,10 @@ DATASET_COLOR = "#eaf2f8"
 ROW_COLOR = "#f5f5f5"
 GRID_COLOR = "#c7c7c7"
 TABLE_BBOX = (0.0, 0.08, 1.0, 0.82)
-HEADER_WRAP_WIDTH = 22
+HEADER_WRAP_WIDTH = 12
 MIN_COLUMN_WEIGHT = 1.0
+DATASET_WRAP_WIDTH = 16
+METRIC_WRAP_WIDTH = 14
 CHARACTERS_PER_COLUMN_WEIGHT = 12
 FOOTNOTE = (
     "† Lower-ranked result was not statistically distinguishable from the "
@@ -107,7 +109,11 @@ def save_table_image(display: TableDisplay, path: Path) -> None:
     column_count = len(display.headers)
     row_count = len(display.rows)
     width = max(MIN_FIGURE_WIDTH, WIDTH_PER_COLUMN * column_count)
-    height = max(MIN_FIGURE_HEIGHT, HEIGHT_PER_ROW * (row_count + 4))
+    header_lines = _header_line_count(display.headers)
+    height = max(
+        MIN_FIGURE_HEIGHT,
+        HEIGHT_PER_ROW * (row_count + header_lines + 3),
+    )
     figure, axis = plt.subplots(figsize=(width, height))
     axis.set_axis_off()
     axis.set_xlim(0.0, 1.0)
@@ -172,8 +178,10 @@ def _draw_table(axis: plt.Axes, display: TableDisplay) -> None:
     """Draw a table with vertically merged, centered dataset cells."""
     left, bottom, _, table_height = TABLE_BBOX
     column_widths = _column_widths(display)
-    body_row_height = table_height / (len(display.rows) + 1)
-    header_bottom = bottom + table_height - body_row_height
+    header_lines = _header_line_count(display.headers)
+    body_row_height = table_height / (len(display.rows) + header_lines)
+    header_height = body_row_height * header_lines
+    header_bottom = bottom + table_height - header_height
     x_positions = [left]
     for width in column_widths:
         x_positions.append(x_positions[-1] + width)
@@ -184,28 +192,30 @@ def _draw_table(axis: plt.Axes, display: TableDisplay) -> None:
             x_positions[column_index],
             header_bottom,
             column_widths[column_index],
-            body_row_height,
+            header_height,
             textwrap.fill(header, HEADER_WRAP_WIDTH),
             HEADER_COLOR,
             bold=True,
         )
 
     for start_row, end_row in _dataset_row_groups(display.rows):
-        y_position = bottom + table_height - (end_row + 1) * body_row_height
+        y_position = (
+            bottom + table_height - header_height - end_row * body_row_height
+        )
         _draw_cell(
             axis,
             x_positions[0],
             y_position,
             column_widths[0],
             (end_row - start_row) * body_row_height,
-            display.rows[start_row][0],
+            textwrap.fill(display.rows[start_row][0], DATASET_WRAP_WIDTH),
             DATASET_COLOR,
         )
         for row_index in range(start_row, end_row):
             y_position = (
                 bottom
                 + table_height
-                - (row_index + 2) * body_row_height
+                - header_height - (row_index + 1) * body_row_height
             )
             row_color = ROW_COLOR if row_index % 2 else "white"
             for column_index, value in enumerate(
@@ -218,7 +228,10 @@ def _draw_table(axis: plt.Axes, display: TableDisplay) -> None:
                     y_position,
                     column_widths[column_index],
                     body_row_height,
-                    value,
+                    (
+                        textwrap.fill(value, METRIC_WRAP_WIDTH)
+                        if column_index == 1 else value
+                    ),
                     row_color,
                     bold=(row_index, column_index) in display.bold_cells,
                 )
@@ -239,6 +252,14 @@ def _column_widths(display: TableDisplay) -> list[float]:
     ]
     weight_total = sum(weights)
     return [TABLE_BBOX[2] * weight / weight_total for weight in weights]
+
+
+def _header_line_count(headers: list[str]) -> int:
+    """Return the number of lines required by the tallest table heading."""
+    return max(
+        len(textwrap.wrap(header, HEADER_WRAP_WIDTH))
+        for header in headers
+    )
 
 
 def _draw_cell(

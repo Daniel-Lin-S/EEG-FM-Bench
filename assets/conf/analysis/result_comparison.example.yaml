@@ -17,8 +17,42 @@ artifacts:
 metrics:
   - name: acc
     direction: maximize
+    display_name: Accuracy
+  - name: balanced_acc
+    direction: maximize
+    display_name: Balanced accuracy
+  - name: auroc
+    direction: maximize
+    display_name: AUROC
+  - name: auc_pr
+    direction: maximize
+    display_name: AUPRC
+  - name: cohen_kappa
+    direction: maximize
+    display_name: Cohen's kappa
   - name: f1
     direction: maximize
+    display_name: Weighted F1
+
+# Each dataset declares its classification task and optional display label.
+datasets:
+  - name: dataset_a
+    task: binary
+    display_name: Dataset A
+  - name: dataset_b
+    task: multiclass
+    display_name: Dataset B
+
+# Metrics are selected separately for binary and multiclass datasets.
+task_metrics:
+  binary: [balanced_acc, auroc, auc_pr]
+  multiclass: [balanced_acc, cohen_kappa, f1]
+
+plot:
+  # Set false to show only mean plus standard-deviation error bars.
+  show_individual_points: true
+  # Optional artifact label drawn as a dotted horizontal reference line.
+  naive_artifact: null
 
 # This directory is owned by result_vis.py. It must not be inside an artifact.
 output_dir: /replace/with/absolute/comparison_output_root

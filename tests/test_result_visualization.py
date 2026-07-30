@@ -93,16 +93,22 @@ def _write_comparison_config(
     metrics: list[dict[str, str]] | None = None,
 ) -> None:
     """Write one temporary local comparison YAML specification."""
+    selected_metrics = metrics or [
+        {"name": ACC_METRIC, "direction": "maximize"},
+        {"name": LOSS_METRIC, "direction": "minimize"},
+    ]
+    metric_names = [metric["name"] for metric in selected_metrics]
     payload = {
         "artifacts": [
             {"label": label, "root": str(root.resolve())}
             for label, root in artifacts
         ],
-        "metrics": metrics
-        or [
-            {"name": ACC_METRIC, "direction": "maximize"},
-            {"name": LOSS_METRIC, "direction": "minimize"},
-        ],
+        "metrics": selected_metrics,
+        "datasets": [{"name": "toy", "task": "binary"}],
+        "task_metrics": {
+            "binary": metric_names,
+            "multiclass": metric_names,
+        },
         "output_dir": str(output_dir.resolve()),
         "statistics": {
             "near_best_q_threshold": DEFAULT_Q_THRESHOLD,

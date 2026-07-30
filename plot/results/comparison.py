@@ -19,7 +19,7 @@ from typing import Any, Iterable, Mapping
 import numpy as np
 from scipy.stats import mannwhitneyu
 
-from plot.results.config import MetricConfig, ResultComparisonConfig
+from plot.results.config import ResultComparisonConfig
 from plot.results.table_visualizer import TableDisplay
 
 
@@ -203,21 +203,26 @@ def collect_comparison_result(
         Normalized, aggregate, pairwise, and diagnostic results.
     """
     validate_comparison_paths(config)
-    selected_metrics = {metric.name for metric in config.metrics}
     raw_rows: list[dict[str, Any]] = []
     for artifact in config.artifacts:
         rows = _read_artifact_rows(
             artifact.label,
             artifact.root,
-            selected_metrics,
+            config.selected_metric_names,
         )
         raw_rows.extend(rows)
-    _require_shared_dataset_metrics(raw_rows, config.metrics)
-    summary_rows = _summarize_rows(raw_rows)
-    statistic_rows, diagnostics = _build_statistics(raw_rows)
+    _require_configured_datasets(raw_rows, config)
+    display_rows = _select_display_rows(raw_rows, config)
+    if not display_rows:
+        raise ValueError(
+            "No configured dataset and task-metric pair has values from every "
+            "provided artifact."
+        )
+    summary_rows = _summarize_rows(display_rows)
+    statistic_rows, diagnostics = _build_statistics(display_rows)
     diagnostics.extend(_missing_dataset_metric_diagnostics(raw_rows, config))
     return ComparisonResult(
-        raw_rows=raw_rows,
+        raw_rows=display_rows,
         summary_rows=summary_rows,
         statistic_rows=statistic_rows,
         diagnostics=diagnostics,
@@ -249,7 +254,15 @@ def create_table_display(
         for row in result.summary_rows
     }
     pairs = _statistic_lookup(result.statistic_rows)
-    dataset_metrics = _ordered_dataset_metrics(result.raw_rows, config.metrics)
+    dataset_metrics = _ordered_dataset_metrics(result.raw_rows, config)
+    dataset_labels = {
+        dataset.name: dataset.display_name or dataset.name
+        for dataset in config.datasets
+    }
+    metric_labels = {
+        metric.name: metric.display_name or metric.name
+        for metric in config.metrics
+    }
     headers = ["Dataset", "Metric", *labels]
     rows: list[list[str]] = []
     bold_cells: set[tuple[int, int]] = set()
@@ -260,7 +273,7 @@ def create_table_display(
             if (label, dataset, metric) in summary_lookup
         }
         best_labels = _best_labels(values, directions[metric])
-        display_row = [dataset, metric]
+        display_row = [dataset_labels[dataset], metric_labels[metric]]
         for column_offset, label in enumerate(labels, start=2):
             summary = values.get(label)
             if summary is None:
@@ -383,13 +396,6 @@ def _read_artifact_rows(
             )
         seen.add(key)
         selected_rows.append(normalized)
-    found_metrics = {row["metric"] for row in selected_rows}
-    missing_metrics = sorted(selected_metrics - found_metrics)
-    if missing_metrics:
-        raise ValueError(
-            f"Artifact {label!r} lacks selected metrics {missing_metrics} "
-            f"in {test_runs_path.resolve()}."
-        )
     return selected_rows
 
 
@@ -472,27 +478,45 @@ def _normalize_test_row(
     }
 
 
-def _require_shared_dataset_metrics(
+def _require_configured_datasets(
     rows: Iterable[Mapping[str, Any]],
-    metrics: list[MetricConfig],
+    config: ResultComparisonConfig,
 ) -> None:
-    """Require every selected metric to compare at least two artifacts."""
+    """Require task metadata for every result dataset identifier."""
+    configured = {dataset.name for dataset in config.datasets}
+    observed = {str(row["dataset"]) for row in rows}
+    unknown = sorted(observed - configured)
+    if unknown:
+        raise ValueError(
+            "Result datasets require task metadata in datasets, but missing "
+            f"{unknown}."
+        )
+
+
+def _select_display_rows(
+    rows: Iterable[Mapping[str, Any]],
+    config: ResultComparisonConfig,
+) -> list[dict[str, Any]]:
+    """Keep configured task metrics present for every artifact label."""
+    rows_by_pair: dict[tuple[str, str], list[dict[str, Any]]] = {}
     labels_by_pair: dict[tuple[str, str], set[str]] = {}
     for row in rows:
+        normalized = dict(row)
         key = (str(row["dataset"]), str(row["metric"]))
+        rows_by_pair.setdefault(key, []).append(normalized)
         labels_by_pair.setdefault(key, set()).add(str(row["artifact"]))
-    unavailable = []
-    for metric in metrics:
-        if not any(
-            pair_metric == metric.name and len(labels) >= 2
-            for (_, pair_metric), labels in labels_by_pair.items()
-        ):
-            unavailable.append(metric.name)
-    if unavailable:
-        raise ValueError(
-            "Selected metrics have no dataset rows shared by at least two "
-            f"artifacts: {unavailable}."
-        )
+    required_labels = {artifact.label for artifact in config.artifacts}
+    task_metrics = {
+        "binary": set(config.task_metrics.binary),
+        "multiclass": set(config.task_metrics.multiclass),
+    }
+    selected_rows: list[dict[str, Any]] = []
+    for dataset in config.datasets:
+        for metric in task_metrics[dataset.task]:
+            key = (dataset.name, metric)
+            if labels_by_pair.get(key) == required_labels:
+                selected_rows.extend(rows_by_pair[key])
+    return selected_rows
 
 
 def _summarize_rows(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -641,12 +665,34 @@ def _missing_dataset_metric_diagnostics(
 
 def _ordered_dataset_metrics(
     rows: Iterable[Mapping[str, Any]],
-    metrics: list[MetricConfig],
+    config: ResultComparisonConfig,
 ) -> list[tuple[str, str]]:
-    """Order table rows by dataset name and YAML metric order."""
-    metric_order = {metric.name: index for index, metric in enumerate(metrics)}
+    """Order table rows by configured dataset and task-metric order."""
+    dataset_order = {
+        dataset.name: index for index, dataset in enumerate(config.datasets)
+    }
+    metric_order = {
+        ("binary", metric): index
+        for index, metric in enumerate(config.task_metrics.binary)
+    }
+    metric_order.update(
+        {
+            ("multiclass", metric): index
+            for index, metric in enumerate(config.task_metrics.multiclass)
+        }
+    )
+    dataset_tasks = {
+        dataset.name: dataset.task for dataset in config.datasets
+    }
     pairs = {(str(row["dataset"]), str(row["metric"])) for row in rows}
-    return sorted(pairs, key=lambda pair: (pair[0], metric_order[pair[1]]))
+    return sorted(
+        pairs,
+        key=lambda pair: (
+            dataset_order[pair[0]],
+            metric_order[(dataset_tasks[pair[0]], pair[1])],
+        ),
+    )
+
 
 
 def _best_labels(

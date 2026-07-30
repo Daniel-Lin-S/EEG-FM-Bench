@@ -52,9 +52,23 @@ def main() -> None:
     figure_paths = save_metric_figures(
         result.raw_rows,
         result.statistic_rows,
-        [metric.name for metric in config.metrics],
+        [
+            metric.name
+            for metric in config.metrics
+            if any(row["metric"] == metric.name for row in result.raw_rows)
+        ],
         [artifact.label for artifact in config.artifacts],
         figures_dir,
+        {
+            dataset.name: dataset.display_name or dataset.name
+            for dataset in config.datasets
+        },
+        {
+            metric.name: metric.display_name or metric.name
+            for metric in config.metrics
+        },
+        config.plot.show_individual_points,
+        config.plot.naive_artifact,
     )
     for figure_path in figure_paths:
         output.path(

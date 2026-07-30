@@ -1,8 +1,9 @@
 """Validate YAML input for cross-artifact result comparisons.
 
 The comparison YAML provides local artifact roots, user-defined labels,
-explicit metric directions, and a separate output root. It is intentionally
-local because artifact paths must not appear in public configuration files.
+task-specific metrics, dataset display metadata, and a separate output root.
+It is intentionally local because artifact paths must not appear in public
+configuration files.
 """
 
 from __future__ import annotations
@@ -18,6 +19,8 @@ FORBIDDEN_METRIC = "epoch"
 MIN_ARTIFACT_COUNT = 2
 MIN_Q_THRESHOLD = 0.0
 MAX_Q_THRESHOLD = 1.0
+
+TaskType = Literal["binary", "multiclass"]
 
 
 class ArtifactConfig(BaseModel):
@@ -64,10 +67,13 @@ class MetricConfig(BaseModel):
         Test-metric name from ``summary/test_runs.csv``.
     direction : {"maximize", "minimize"}
         Direction used to identify the numerically best mean.
+    display_name : str or None, optional, default=None
+        Label used in tables and metric figures. ``name`` is used when absent.
     """
 
     name: str
     direction: Literal["maximize", "minimize"]
+    display_name: str | None = None
 
     @field_validator("name")
     @classmethod
@@ -81,6 +87,86 @@ class MetricConfig(BaseModel):
                 "Metric 'epoch' is a training-loop coordinate and cannot "
                 "be compared."
             )
+        return normalized
+
+
+class DatasetConfig(BaseModel):
+    """One dataset's task type and optional display label.
+
+    Parameters
+    ----------
+    name : str
+        Dataset identifier in the artifact ``test_runs.csv`` files.
+    task : {"binary", "multiclass"}
+        Classification task that determines the displayed metric subset.
+    display_name : str or None, optional, default=None
+        Label used in tables and metric figures. ``name`` is used when absent.
+    """
+
+    name: str
+    task: TaskType
+    display_name: str | None = None
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        """Require a non-empty result dataset identifier."""
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("Dataset name must not be empty.")
+        return normalized
+
+
+class TaskMetricsConfig(BaseModel):
+    """Map binary and multiclass tasks to configured metric names.
+
+    Parameters
+    ----------
+    binary : list[str]
+        Metrics displayed for every configured binary dataset.
+    multiclass : list[str]
+        Metrics displayed for every configured multiclass dataset.
+    """
+
+    binary: list[str]
+    multiclass: list[str]
+
+    @field_validator("binary", "multiclass")
+    @classmethod
+    def validate_metric_names(cls, values: list[str]) -> list[str]:
+        """Require a non-empty, duplicate-free metric sequence."""
+        normalized = [value.strip() for value in values]
+        if not normalized or any(not value for value in normalized):
+            raise ValueError("Task metrics must contain non-empty names.")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("Task metric names must be unique per task.")
+        return normalized
+
+
+
+class PlotConfig(BaseModel):
+    """Optional figure-rendering settings.
+
+    Parameters
+    ----------
+    show_individual_points : bool, optional, default=True
+        Whether each seed value is plotted in addition to mean and error bars.
+    naive_artifact : str or None, optional, default=None
+        Artifact label rendered as a horizontal dotted baseline per dataset.
+    """
+
+    show_individual_points: bool = True
+    naive_artifact: str | None = None
+
+    @field_validator("naive_artifact")
+    @classmethod
+    def validate_naive_artifact(cls, value: str | None) -> str | None:
+        """Normalize an optional naive-artifact label."""
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("plot.naive_artifact must not be empty.")
         return normalized
 
 
@@ -108,16 +194,25 @@ class ResultComparisonConfig(BaseModel):
     artifacts : list[ArtifactConfig]
         At least two labelled source artifact roots.
     metrics : list[MetricConfig]
-        Explicit test metrics and their ranking directions.
+        Explicit metrics, ranking directions, and optional display labels.
+    task_metrics : TaskMetricsConfig
+        Metric subsets displayed for binary and multiclass datasets.
+    datasets : list[DatasetConfig]
+        Dataset task types and optional display labels.
     output_dir : pathlib.Path
         Absolute directory owned by this comparison workflow.
+    plot : PlotConfig, optional
+        Figure settings including seed dots and a naive-artifact reference.
     statistics : StatisticsConfig
         Required statistical display settings.
     """
 
     artifacts: list[ArtifactConfig]
     metrics: list[MetricConfig]
+    task_metrics: TaskMetricsConfig
+    datasets: list[DatasetConfig]
     output_dir: Path
+    plot: PlotConfig = Field(default_factory=PlotConfig)
     statistics: StatisticsConfig
 
     @field_validator("output_dir")
@@ -149,7 +244,42 @@ class ResultComparisonConfig(BaseModel):
         metric_names = [metric.name for metric in self.metrics]
         if len(metric_names) != len(set(metric_names)):
             raise ValueError("Selected metric names must be unique.")
+        task_metric_names = set(self.task_metrics.binary).union(
+            self.task_metrics.multiclass,
+        )
+        unknown_metrics = sorted(task_metric_names - set(metric_names))
+        if unknown_metrics:
+            raise ValueError(
+                "Task metrics must reference configured metrics, but got "
+                f"{unknown_metrics}."
+            )
+        unassigned_metrics = sorted(set(metric_names) - task_metric_names)
+        if unassigned_metrics:
+            raise ValueError(
+                "Every configured metric must be assigned to a task, but "
+                f"got {unassigned_metrics}."
+            )
+        if not self.datasets:
+            raise ValueError("Expected at least one configured dataset.")
+        dataset_names = [dataset.name for dataset in self.datasets]
+        if len(dataset_names) != len(set(dataset_names)):
+            raise ValueError("Configured dataset names must be unique.")
+        if (
+            self.plot.naive_artifact is not None
+            and self.plot.naive_artifact not in labels
+        ):
+            raise ValueError(
+                "plot.naive_artifact must match one artifact label, but got "
+                f"{self.plot.naive_artifact!r}."
+            )
         return self
+
+    @property
+    def selected_metric_names(self) -> set[str]:
+        """Return every metric referenced by one configured task."""
+        return set(self.task_metrics.binary).union(
+            self.task_metrics.multiclass,
+        )
 
 
 

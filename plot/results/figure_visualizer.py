@@ -50,6 +50,10 @@ def save_metric_figures(
     metric_names: Iterable[str],
     artifact_labels: list[str],
     output_dir: Path,
+    dataset_display_names: Mapping[str, str],
+    metric_display_names: Mapping[str, str],
+    show_individual_points: bool,
+    naive_artifact: str | None,
 ) -> list[Path]:
     """Save one annotated comparison figure for each requested metric.
 
@@ -91,6 +95,10 @@ def save_metric_figures(
             metric_statistics,
             artifact_labels,
             path,
+            dataset_display_names,
+            metric_display_names[metric],
+            show_individual_points,
+            naive_artifact,
         )
         saved_paths.append(path)
     return saved_paths
@@ -102,6 +110,10 @@ def _save_metric_figure(
     statistics: list[Mapping[str, Any]],
     artifact_labels: list[str],
     path: Path,
+    dataset_display_names: Mapping[str, str],
+    metric_display_name: str,
+    show_individual_points: bool,
+    naive_artifact: str | None,
 ) -> None:
     """Render one metric figure with raw values and pairwise annotations."""
     sns.set_theme(style="whitegrid", context="notebook")
@@ -126,6 +138,15 @@ def _save_metric_figure(
     }
     legend_labels: set[str] = set()
     for label_index, label in enumerate(artifact_labels):
+        if label == naive_artifact:
+            _draw_naive_reference(
+                axis,
+                rows,
+                datasets,
+                label,
+                legend_labels,
+            )
+            continue
         label_rows = [row for row in rows if row["artifact"] == label]
         if not label_rows:
             continue
@@ -140,18 +161,19 @@ def _save_metric_figure(
             if not group_values:
                 continue
             position = position_lookup[(dataset, label)]
-            jitter = _deterministic_jitter(len(group_values))
-            axis.scatter(
-                np.full(len(group_values), position) + jitter,
-                group_values,
-                color=color,
-                marker=marker,
-                s=POINT_SIZE,
-                alpha=0.75,
-                linewidths=0.6,
-                edgecolors="white",
-                zorder=3,
-            )
+            if show_individual_points:
+                jitter = _deterministic_jitter(len(group_values))
+                axis.scatter(
+                    np.full(len(group_values), position) + jitter,
+                    group_values,
+                    color=color,
+                    marker=marker,
+                    s=POINT_SIZE,
+                    alpha=0.75,
+                    linewidths=0.6,
+                    edgecolors="white",
+                    zorder=3,
+                )
             mean = float(np.mean(group_values))
             std = (
                 float(np.std(group_values, ddof=1))
@@ -185,11 +207,15 @@ def _save_metric_figure(
     )
     lower_padding = value_range * 0.08
     axis.set_ylim(minimum - lower_padding, upper_limit + lower_padding)
-    axis.set_xticks(range(len(datasets)), datasets, fontsize=DATASET_TICK_SIZE)
+    axis.set_xticks(
+        range(len(datasets)),
+        [dataset_display_names[dataset] for dataset in datasets],
+        fontsize=DATASET_TICK_SIZE,
+    )
     axis.set_xlabel("Dataset")
-    axis.set_ylabel(metric)
+    axis.set_ylabel(metric_display_name)
     title = textwrap.fill(
-        f"Cross-artifact comparison for test metric: {metric}",
+        f"Cross-artifact comparison for test metric: {metric_display_name}",
         width=70,
     )
     axis.set_title(title, pad=18.0)
@@ -228,6 +254,40 @@ def _deterministic_jitter(count: int) -> np.ndarray:
     if count == 1:
         return np.array([0.0])
     return np.linspace(-JITTER_WIDTH, JITTER_WIDTH, count)
+
+
+def _draw_naive_reference(
+    axis: plt.Axes,
+    rows: list[Mapping[str, Any]],
+    datasets: list[str],
+    naive_artifact: str,
+    legend_labels: set[str],
+) -> None:
+    """Draw the mean naive result as one dotted line per dataset group."""
+    for dataset_index, dataset in enumerate(datasets):
+        values = [
+            float(row["value"])
+            for row in rows
+            if row["artifact"] == naive_artifact
+            and row["dataset"] == dataset
+        ]
+        if not values:
+            continue
+        axis.hlines(
+            float(np.mean(values)),
+            dataset_index - GROUP_WIDTH / 2.0,
+            dataset_index + GROUP_WIDTH / 2.0,
+            color="#4d4d4d",
+            linestyle=":",
+            linewidth=ERROR_LINE_WIDTH,
+            label=(
+                naive_artifact
+                if naive_artifact not in legend_labels
+                else None
+            ),
+            zorder=2,
+        )
+        legend_labels.add(naive_artifact)
 
 
 def _add_statistic_annotations(
