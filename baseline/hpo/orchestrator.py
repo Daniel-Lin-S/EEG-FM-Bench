@@ -39,6 +39,7 @@ from baseline.hpo.artifacts import (
     CampaignPaths,
     CampaignResolution,
     CampaignSummaryResult,
+    build_invocation_summary,
     failure_fingerprint,
     locate_completion,
     resolve_campaign,
@@ -1487,6 +1488,7 @@ class CampaignRunner:
         self._active_study_runtime: Optional[StudyRuntime] = None
         self.selection_provenance: Dict[str, Dict[str, Any]] = {}
         self.checkpoint_cleanup_failures: list[str] = []
+        self.final_dataset_attempts: list[Dict[str, Any]] = []
         self._ignored_namespace_warnings: set[Path] = set()
         self.adaptive_batch_cache: Dict[str, Dict[str, Any]] = {}
         self.last_adaptive_memory_profile: Dict[str, Any] = {}
@@ -1865,7 +1867,8 @@ class CampaignRunner:
         identity_path = self.paths.log_root / "identity.json"
         identity_payload = self._identity_payload()
         if identity_path.exists():
-            _validate_immutable_json(identity_path, identity_payload)
+            if not self.resolution.legacy:
+                _validate_immutable_json(identity_path, identity_payload)
         else:
             try:
                 _exclusive_json(identity_path, identity_payload)
@@ -3025,6 +3028,12 @@ class CampaignRunner:
                             "Invalid final configuration for seed "
                             f"{seed}."
                         )
+                    for item in located:
+                        if not item.compatibility.compatible:
+                            self.final_dataset_attempts.append({
+                                "seed": seed,
+                                "dataset": item.path.parent.name,
+                            })
                     is_neural = (
                         self.base_dict["model_type"]
                         not in DETERMINISTIC_MODELS
@@ -3166,6 +3175,7 @@ class CampaignRunner:
         selected_configs: Mapping[str, Mapping[str, Any]],
     ) -> tuple[Dict[str, Any], bool]:
         """Run configured seeds with consecutive-error stopping."""
+        self.final_dataset_attempts = []
         seeds = list(self.base_dict["seeds"])
         attempted: list[int] = []
         succeeded: list[int] = []
@@ -3219,6 +3229,7 @@ class CampaignRunner:
 
         invocation = {
             "attempted": attempted,
+            "dataset_attempts": list(self.final_dataset_attempts),
             "id": getattr(self, "invocation_id", "unmanaged"),
             "requested": seeds,
             "succeeded": succeeded,
@@ -3235,14 +3246,19 @@ class CampaignRunner:
             )
         return invocation, summary_eligible
 
-    def _log_campaign_summary(
+    def _log_invocation_summary(
         self,
         summary: CampaignSummaryResult,
     ) -> None:
-        """Log compact final dataset metric summaries at INFO."""
+        """Log final metric summaries produced by this invocation only."""
+        pair_status = summary.status["dataset_pairs"]
         logger.info(
-            "Campaign summary: %s",
-            (self.paths.summary_root / "summary.json").resolve(),
+            "Invocation final dataset pairs: attempted=%d, completed=%d, "
+            "incomplete=%d, rejected=%d.",
+            pair_status["attempted"],
+            pair_status["completed"],
+            pair_status["incomplete"],
+            pair_status["rejected"],
         )
         for row in summary.test_summary:
             message = (
@@ -3265,7 +3281,7 @@ class CampaignRunner:
         self,
         summary: CampaignSummaryResult,
     ) -> None:
-        """Update one stable cloud summary run after eligible execution."""
+        """Update one stable cloud summary with current-invocation metrics."""
         logging_config = self.config.logging
         if not logging_config.use_cloud or not get_is_master():
             return
@@ -3614,38 +3630,26 @@ class CampaignRunner:
                 if hpo_enabled
                 else self._fixed_scopes()
             )
-            invocation, summary_eligible = self._run_seeds(selected)
+            invocation, _ = self._run_seeds(selected)
             self._configure_campaign_logging()
             summary_result: Optional[CampaignSummaryResult] = None
-            if summary_eligible and get_is_master():
-                compatible_configs: Dict[
-                    tuple[int, str],
-                    Dict[str, Any],
-                ] = {}
-                logs_root = self.paths.log_root / "logs"
-                discovered_seeds = set(self.base_dict["seeds"])
-                if logs_root.is_dir():
-                    for seed_root in logs_root.glob("seed_*"):
-                        try:
-                            discovered_seeds.add(
-                                int(seed_root.name.removeprefix("seed_"))
-                            )
-                        except ValueError:
-                            continue
-                for seed in discovered_seeds:
-                    expected = _expected_configs(selected, seed)
-                    for dataset_name, config in expected.items():
-                        compatible_configs[(seed, dataset_name)] = config
+            invocation_summary: Optional[CampaignSummaryResult] = None
+            if get_is_master() and hasattr(self, "paths"):
                 summary_result = write_campaign_summary(
                     self.paths,
                     self.campaign_hash,
                     invocation,
-                    compatible_configs,
                     campaign_aliases=self.campaign_aliases,
                 )
-                if summary_result.written:
-                    self._log_campaign_summary(summary_result)
-                    self._update_cloud_summary(summary_result)
+                invocation_summary = build_invocation_summary(
+                    self.paths,
+                    self.campaign_hash,
+                    invocation,
+                    campaign_aliases=self.campaign_aliases,
+                )
+                self._log_invocation_summary(invocation_summary)
+                if invocation_summary.written:
+                    self._update_cloud_summary(invocation_summary)
 
             if invocation["failed"]:
                 state = (
@@ -3656,8 +3660,8 @@ class CampaignRunner:
             else:
                 state = "complete"
             pair_status = (
-                summary_result.status["dataset_pairs"]
-                if summary_result is not None
+                invocation_summary.status["dataset_pairs"]
+                if invocation_summary is not None
                 else None
             )
             self._update_invocation_status(

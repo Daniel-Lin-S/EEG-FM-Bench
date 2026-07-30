@@ -212,6 +212,14 @@ def build_campaign_semantic_config(
             )
         for dotted_path in sorted(search_space):
             _replace_search_value(semantic, dotted_path)
+    if not semantic.get("multitask"):
+        data_config = semantic.get("data")
+        if not isinstance(data_config, dict):
+            raise ValueError(
+                "A separate-task campaign requires a data configuration "
+                "mapping."
+            )
+        data_config.pop("datasets", None)
     semantic["hpo"] = hpo_semantic
     return semantic
 

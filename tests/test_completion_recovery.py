@@ -16,6 +16,7 @@ import pytest
 from baseline.brainomni.brainomni_config import BrainOmniConfig
 from baseline.hpo.artifacts import (
     CampaignPaths,
+    build_invocation_summary,
     check_completion_compatibility,
     locate_completion,
     write_campaign_summary,
@@ -75,6 +76,7 @@ def _write_completion(
     execution_id: str = "execution",
     metric: float = 0.75,
     config_identity: str | None = None,
+    invocation_id: str | None = None,
 ) -> Path:
     """Write one completion and its required checkpoint artifact."""
     path = _completion_path(root, config_identity)
@@ -82,19 +84,19 @@ def _write_completion(
     checkpoint = root / "checkpoints" / "best.pt"
     checkpoint.parent.mkdir(parents=True, exist_ok=True)
     checkpoint.touch()
-    path.write_text(
-        json.dumps({
-            "status": "completed",
-            "campaign_hash": CAMPAIGN_HASH,
-            "config_hash": config_hash,
-            "seed": SEED,
-            "dataset_config": DATASET_CONFIG,
-            "execution_id": execution_id,
-            "checkpoint_path": str(checkpoint.resolve()),
-            "test_metrics": {f"{DATASET_NAME}/test/acc": metric},
-        }),
-        encoding="utf-8",
-    )
+    content = {
+        "status": "completed",
+        "campaign_hash": CAMPAIGN_HASH,
+        "config_hash": config_hash,
+        "seed": SEED,
+        "dataset_config": DATASET_CONFIG,
+        "execution_id": execution_id,
+        "checkpoint_path": str(checkpoint.resolve()),
+        "test_metrics": {f"{DATASET_NAME}/test/acc": metric},
+    }
+    if invocation_id is not None:
+        content["invocation_id"] = invocation_id
+    path.write_text(json.dumps(content), encoding="utf-8")
     return path
 
 
@@ -335,12 +337,12 @@ def test_completion_rejects_nonfinite_metrics(
     assert result.compatible is False
 
 
-def test_partial_summary_is_compact_and_logs_pair_diagnostics(
+def test_artifact_summary_includes_every_valid_direct_completion(
     tmp_path: Path,
     caplog,
     monkeypatch,
 ) -> None:
-    """A valid pair is retained while missing details stay out of JSON."""
+    """Artifact summary ignores the latest invocation's selected datasets."""
     caplog.set_level(logging.WARNING)
     monkeypatch.setattr(
         logging.getLogger("baseline"),
@@ -348,26 +350,20 @@ def test_partial_summary_is_compact_and_logs_pair_diagnostics(
         True,
     )
     selected = _selected_config()
-    config_hash = get_config_hash(selected, multitask=False)
+    config_hash = _save_legacy_config(tmp_path, selected)
     _write_completion(tmp_path, config_hash)
     paths = CampaignPaths(tmp_path, tmp_path / "checkpoints")
-    compatible = {
-        (SEED, DATASET_NAME): selected,
-        (SEED, "missing"): config_hash,
-    }
 
     summary = write_campaign_summary(
         paths,
         CAMPAIGN_HASH,
-        {"attempted": [SEED]},
-        compatible,
+        {"id": "invocation", "attempted": [SEED]},
     )
 
-    assert summary.status["status"] == "partial"
+    assert summary.status["status"] == "complete"
     assert summary.status["dataset_pairs"] == {
-        "expected": 2,
+        "discovered": 1,
         "completed": 1,
-        "missing": 1,
         "rejected": 0,
     }
     persisted = json.loads(
@@ -375,7 +371,7 @@ def test_partial_summary_is_compact_and_logs_pair_diagnostics(
     )
     assert "compatibility" not in persisted
     assert "test_runs" not in persisted
-    assert "dataset missing" in caplog.text
+    assert "compatibility rejected" not in caplog.text
 
 
 def test_zero_row_summary_preserves_previous_without_report(
@@ -399,15 +395,96 @@ def test_zero_row_summary_preserves_previous_without_report(
         paths,
         CAMPAIGN_HASH,
         {"attempted": [SEED]},
-        {(SEED, DATASET_NAME): _selected_config()},
     )
 
     assert summary.written is False
     assert previous_path.read_text(encoding="utf-8") == "previous"
     report_path = paths.summary_root / "compatibility_report.json"
     assert not report_path.exists()
-    assert "completion.json does not exist" in caplog.text
     assert "left unchanged" in caplog.text
+
+
+def test_invocation_summary_excludes_skipped_historic_results(
+    tmp_path: Path,
+) -> None:
+    """Only final pairs attempted now contribute to invocation metrics."""
+    selected = _selected_config()
+    config_hash = _save_legacy_config(tmp_path, selected)
+    invocation_id = "current-invocation"
+    _write_completion(
+        tmp_path,
+        config_hash,
+        invocation_id=invocation_id,
+    )
+    historic_seed = 43
+    historic_dataset = "bcic_1a"
+    historic_config = BrainOmniConfig(
+        seeds=[historic_seed],
+        data={"datasets": {historic_dataset: DATASET_CONFIG}},
+    ).model_dump(mode="json")
+    historic_config_path = (
+        tmp_path / "logs" / f"seed_{historic_seed}" / "configs"
+        / "historic.yaml"
+    )
+    save_resolved_config(historic_config, historic_config_path)
+    historic_path = (
+        tmp_path / "logs" / f"seed_{historic_seed}" / "datasets"
+        / historic_dataset / "completion.json"
+    )
+    historic_path.parent.mkdir(parents=True)
+    historic_path.write_text(
+        json.dumps({
+            "status": "completed",
+            "campaign_hash": CAMPAIGN_HASH,
+            "config_hash": get_config_hash(
+                historic_config,
+                multitask=False,
+            ),
+            "seed": historic_seed,
+            "dataset_config": DATASET_CONFIG,
+            "execution_id": "historic",
+            "test_metrics": {f"{historic_dataset}/test/acc": 0.8},
+        }),
+        encoding="utf-8",
+    )
+    paths = CampaignPaths(tmp_path, tmp_path / "checkpoints")
+
+    artifact_summary = write_campaign_summary(
+        paths,
+        CAMPAIGN_HASH,
+        {"id": invocation_id, "attempted": [SEED]},
+    )
+    assert {
+        (row["seed"], row["dataset"])
+        for row in artifact_summary.test_runs
+    } == {
+        (SEED, DATASET_NAME),
+        (historic_seed, historic_dataset),
+    }
+
+    summary = build_invocation_summary(
+        paths,
+        CAMPAIGN_HASH,
+        {
+            "id": invocation_id,
+            "complete": False,
+            "dataset_attempts": [
+                {"seed": SEED, "dataset": DATASET_NAME},
+                {"seed": SEED, "dataset": "failed_dataset"},
+            ],
+        },
+    )
+
+    assert summary.status["status"] == "partial"
+    assert summary.status["dataset_pairs"] == {
+        "attempted": 2,
+        "completed": 1,
+        "incomplete": 1,
+        "rejected": 0,
+    }
+    assert {(row["seed"], row["dataset"]) for row in summary.test_runs} == {
+        (SEED, DATASET_NAME),
+    }
 
 
 def test_hpo_trial_text_logs_follow_debug_verbosity() -> None:

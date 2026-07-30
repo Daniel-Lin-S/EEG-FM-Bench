@@ -13,6 +13,7 @@ from baseline.brainomni.brainomni_config import BrainOmniConfig
 from baseline.hpo.artifacts import get_campaign_hash, resolve_campaign
 from baseline.hpo.config import HpoConfig
 from baseline.hpo.orchestrator import CampaignRunner
+from baseline.utils.identity import build_campaign_semantic_config
 
 
 def _hpo_config() -> HpoConfig:
@@ -98,6 +99,22 @@ def test_campaign_identity_marks_searched_leaves_but_retains_semantics(
     assert get_campaign_hash(config, search_change) != original
 
 
+def test_separate_task_identity_excludes_dataset_membership(
+    tmp_path: Path,
+) -> None:
+    """Separate-task additions reuse the campaign while multitask does not."""
+    config = _model_config(tmp_path).model_dump(mode="json")
+    hpo = _hpo_config().model_dump(mode="json")
+    original = get_campaign_hash(config, hpo)
+
+    expanded = copy.deepcopy(config)
+    expanded["data"]["datasets"]["bcic_2a"] = "finetune"
+    assert get_campaign_hash(expanded, hpo) == original
+
+    expanded["multitask"] = True
+    assert get_campaign_hash(expanded, hpo) != original
+
+
 def _write_legacy_campaign(
     root: Path,
     config: dict,
@@ -149,6 +166,7 @@ def test_resolver_reuses_unique_legacy_root_without_rewriting(
     requested["conf_file"] = "/new/name.local.yaml"
     requested["master_port"] += 10
     requested["logging"]["experiment_name"] = "new-label"
+    requested["data"]["datasets"]["bcic_2a"] = "finetune"
     resolution = resolve_campaign(
         str(tmp_path),
         "brainomni",
@@ -161,6 +179,37 @@ def test_resolver_reuses_unique_legacy_root_without_rewriting(
     assert resolution.legacy is True
     assert "3f68277ec5ec" in resolution.aliases
     assert (legacy_root / "campaign.yaml").read_bytes() == original
+
+
+def test_resolver_prefers_existing_current_campaign_root(
+    tmp_path: Path,
+) -> None:
+    """Legacy discovery runs only after the canonical root is absent."""
+    config = _model_config(tmp_path).model_dump(mode="json")
+    hpo = _hpo_config().model_dump(mode="json")
+    campaign_hash = get_campaign_hash(config, hpo)
+    model_root = tmp_path / "log" / "baseline" / "brainomni"
+    current_root = model_root / f"brainomni-test-{campaign_hash[:12]}"
+    current_root.mkdir(parents=True)
+    (current_root / "campaign.yaml").write_text(
+        yaml.safe_dump(
+            build_campaign_semantic_config(config, hpo),
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    _write_legacy_campaign(model_root / "legacy-root", config, hpo)
+
+    resolution = resolve_campaign(
+        str(tmp_path),
+        "brainomni",
+        "brainomni-test",
+        config,
+        hpo,
+    )
+
+    assert resolution.paths.log_root == current_root
+    assert resolution.legacy is False
 
 
 def test_resolver_aborts_for_ambiguous_semantic_roots(
@@ -205,6 +254,36 @@ def test_legacy_manifest_remains_immutable_when_invocation_is_added(
     assert (legacy_root / "identity.json").is_file()
     assert (runner.invocation_root / "invocation.yaml").is_file()
     assert (runner.invocation_root / "status.json").is_file()
+
+
+def test_legacy_identity_remains_immutable_when_semantics_evolve(
+    tmp_path: Path,
+) -> None:
+    """Dataset-independent adoption does not replace legacy identity data."""
+    config = _model_config(tmp_path)
+    config_dict = config.model_dump(mode="json")
+    model_root = tmp_path / "log" / "baseline" / "brainomni"
+    legacy_root = model_root / "legacy-identity"
+    _write_legacy_campaign(
+        legacy_root,
+        config_dict,
+        HpoConfig().model_dump(mode="json"),
+    )
+    identity_path = legacy_root / "identity.json"
+    identity_path.write_text(
+        json.dumps({
+            "campaign_identity": "legacy-identity",
+            "identity_version": 2,
+        }),
+        encoding="utf-8",
+    )
+    original_identity = identity_path.read_bytes()
+    runner = CampaignRunner(config, HpoConfig(), BrainOmniConfig)
+
+    runner._save_campaign_config()
+
+    assert runner.resolution.legacy is True
+    assert identity_path.read_bytes() == original_identity
 
 
 def test_new_campaign_separates_semantic_and_invocation_parameters(

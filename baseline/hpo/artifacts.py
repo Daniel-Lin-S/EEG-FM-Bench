@@ -340,66 +340,81 @@ def resolve_campaign(
         experiment_name,
         campaign_identity,
     )
-    model_root = requested_paths.log_root.parent
-    matches: list[tuple[Path, bool]] = []
-    if model_root.is_dir():
-        for candidate in sorted(model_root.iterdir()):
-            manifest_path = candidate / "campaign.yaml"
-            if not candidate.is_dir() or not manifest_path.is_file():
-                continue
+    if requested_paths.log_root.exists():
+        manifest_path = requested_paths.log_root / "campaign.yaml"
+        if not manifest_path.is_file():
+            raise RuntimeError(
+                "The current campaign path exists without a manifest: "
+                f"{requested_paths.log_root.resolve()}."
+            )
+        manifest = _read_campaign_manifest(manifest_path)
+        if _manifest_semantic_config(manifest) != semantic_config:
+            raise RuntimeError(
+                "The current campaign path has different semantic "
+                f"parameters: {requested_paths.log_root.resolve()}."
+            )
+        identity_path = requested_paths.log_root / "identity.json"
+        if identity_path.is_file():
             try:
-                manifest = _read_campaign_manifest(manifest_path)
-                candidate_semantic = _manifest_semantic_config(manifest)
-            except ValueError as exc:
-                logger.warning("Ignoring invalid campaign candidate: %s", exc)
-                continue
-            if candidate_semantic != semantic_config:
-                continue
-            identity_path = candidate / "identity.json"
-            if identity_path.is_file():
-                try:
-                    identity_payload = json.loads(
-                        identity_path.read_text(encoding="utf-8")
-                    )
-                except (OSError, json.JSONDecodeError) as exc:
-                    raise RuntimeError(
-                        f"Identity metadata at {identity_path.resolve()} is "
-                        f"invalid: {exc}."
-                    ) from exc
-                stored_identity = identity_payload.get("campaign_identity")
-                if stored_identity != campaign_identity:
-                    raise RuntimeError(
-                        "Campaign semantic parameters match but identity "
-                        f"metadata conflicts at {identity_path.resolve()}."
-                    )
-            matches.append((candidate, manifest != semantic_config))
-
-    if len(matches) > 1:
-        candidates = ", ".join(
-            str(path.resolve()) for path, _ in matches
-        )
-        raise RuntimeError(
-            "Multiple campaign roots have the same semantic parameters: "
-            f"{candidates}. Resolve the ambiguity without deleting results."
-        )
-    if matches:
-        log_root, legacy = matches[0]
-        checkpoint_root = (
-            Path(run_dir).resolve()
-            / "ckpt"
-            / "baseline"
-            / model_type
-            / log_root.name
-        )
-        paths = CampaignPaths(log_root, checkpoint_root)
-    else:
+                identity_payload = json.loads(
+                    identity_path.read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    f"Identity metadata at {identity_path.resolve()} is "
+                    f"invalid: {exc}."
+                ) from exc
+            if identity_payload.get("campaign_identity") != campaign_identity:
+                raise RuntimeError(
+                    "The current campaign semantic parameters match but its "
+                    f"identity metadata conflicts at {identity_path.resolve()}."
+                )
         paths = requested_paths
         legacy = False
-        if paths.log_root.exists():
-            raise RuntimeError(
-                "The intended campaign path already exists without a matching "
-                f"semantic manifest: {paths.log_root.resolve()}."
+    else:
+        model_root = requested_paths.log_root.parent
+        matches: list[tuple[Path, bool]] = []
+        if model_root.is_dir():
+            for candidate in sorted(model_root.iterdir()):
+                manifest_path = candidate / "campaign.yaml"
+                if not candidate.is_dir() or not manifest_path.is_file():
+                    continue
+                try:
+                    manifest = _read_campaign_manifest(manifest_path)
+                    candidate_semantic = _manifest_semantic_config(manifest)
+                except ValueError as exc:
+                    logger.warning(
+                        "Ignoring invalid campaign candidate: %s",
+                        exc,
+                    )
+                    continue
+                if candidate_semantic == semantic_config:
+                    matches.append((candidate, manifest != semantic_config))
+
+        if len(matches) > 1:
+            candidates = ", ".join(
+                str(path.resolve()) for path, _ in matches
             )
+            raise RuntimeError(
+                "Multiple campaign roots, including legacy roots, have the "
+                "same semantic "
+                f"parameters: {candidates}. Resolve the ambiguity without "
+                "deleting results."
+            )
+        if matches:
+            log_root, legacy = matches[0]
+            checkpoint_root = (
+                Path(run_dir).resolve()
+                / "ckpt"
+                / "baseline"
+                / model_type
+                / log_root.name
+            )
+            paths = CampaignPaths(log_root, checkpoint_root)
+        else:
+            paths = requested_paths
+            legacy = False
+
     aliases = _campaign_aliases(
         paths.log_root,
         experiment_name,
@@ -510,48 +525,33 @@ def _compatibility_failure(
     )
 
 
-def _legacy_runtime_batch_compatibility(
+def _load_saved_completion_config(
     path: Path,
     completion: Mapping[str, Any],
-    expected_config: Mapping[str, Any],
-) -> CompletionCompatibility:
-    """Validate a historical config whose batch was runtime-mutated."""
+) -> dict[str, Any]:
+    """Load and validate the resolved configuration for one completion."""
     execution_id = completion.get("execution_id")
     if (
         not isinstance(execution_id, str)
         or not execution_id
         or Path(execution_id).name != execution_id
     ):
-        return _compatibility_failure(
-            "execution_id is missing or invalid",
-            completion,
-        )
-
-    config_path = (
-        path.parents[2]
-        / "configs"
-        / f"{execution_id}.yaml"
-    )
+        raise ValueError("execution_id is missing or invalid")
+    config_path = path.parents[2] / "configs" / f"{execution_id}.yaml"
     if not config_path.is_file():
-        return _compatibility_failure(
-            f"resolved configuration does not exist at {config_path}",
-            completion,
+        raise ValueError(
+            f"resolved configuration does not exist at {config_path}"
         )
     try:
         saved_config = yaml.safe_load(
             config_path.read_text(encoding="utf-8")
         )
     except (OSError, yaml.YAMLError) as exc:
-        return _compatibility_failure(
-            f"resolved configuration is invalid: {exc}",
-            completion,
-        )
+        raise ValueError(
+            f"resolved configuration is invalid: {exc}"
+        ) from exc
     if not isinstance(saved_config, dict):
-        return _compatibility_failure(
-            "resolved configuration is not a mapping",
-            completion,
-        )
-
+        raise ValueError("resolved configuration is not a mapping")
     try:
         multitask = bool(saved_config.get("multitask"))
         saved_hashes = {
@@ -559,13 +559,28 @@ def _legacy_runtime_batch_compatibility(
             get_legacy_run_hash(saved_config, multitask),
         }
     except (KeyError, TypeError, ValueError) as exc:
-        return _compatibility_failure(
-            f"resolved configuration cannot be hashed: {exc}",
-            completion,
-        )
+        raise ValueError(
+            f"resolved configuration cannot be hashed: {exc}"
+        ) from exc
     if completion.get("config_hash") not in saved_hashes:
+        raise ValueError(
+            "stored config hash does not match the resolved configuration"
+        )
+    return saved_config
+
+
+def _legacy_runtime_batch_compatibility(
+    path: Path,
+    completion: Mapping[str, Any],
+    expected_config: Mapping[str, Any],
+) -> CompletionCompatibility:
+    """Validate a historical config whose batch was runtime-mutated."""
+    try:
+        saved_config = _load_saved_completion_config(path, completion)
+        multitask = bool(saved_config.get("multitask"))
+    except ValueError as exc:
         return _compatibility_failure(
-            "stored config hash does not match the resolved configuration",
+            str(exc),
             completion,
         )
 
@@ -910,6 +925,145 @@ def collect_test_rows(
     return rows
 
 
+def _validate_artifact_completion_config(
+    path: Path,
+    completion: Mapping[str, Any],
+    seed: int,
+) -> None:
+    """Require saved configuration metadata to match one completion.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Direct dataset completion metadata path.
+    completion : Mapping[str, Any]
+        Parsed terminal completion metadata.
+    seed : int
+        Seed encoded by the completion's direct artifact directory.
+
+    Raises
+    ------
+    ValueError
+        If the resolved configuration cannot prove the completion provenance.
+    """
+    saved_config = _load_saved_completion_config(path, completion)
+    saved_seeds = saved_config.get("seeds")
+    if saved_seeds != [seed]:
+        raise ValueError(
+            "resolved configuration seed does not match the artifact path"
+        )
+    data_config = saved_config.get("data")
+    if not isinstance(data_config, dict):
+        raise ValueError("resolved configuration data is not a mapping")
+    datasets_config = data_config.get("datasets")
+    if not isinstance(datasets_config, dict):
+        raise ValueError(
+            "resolved configuration datasets are not a mapping"
+        )
+    dataset_name = path.parent.name
+    if completion.get("dataset_config") != datasets_config.get(dataset_name):
+        raise ValueError(
+            "dataset configuration does not match the resolved configuration"
+        )
+
+
+def collect_artifact_test_rows_with_diagnostics(
+    campaign_root: Path,
+    campaign_hash: str,
+    campaign_aliases: Iterable[str] = (),
+    invocation_id: Optional[str] = None,
+) -> tuple[list[Dict[str, Any]], Dict[str, list[Dict[str, Any]]]]:
+    """Collect every valid direct terminal result in one campaign artifact.
+
+    Parameters
+    ----------
+    campaign_root : pathlib.Path
+        Selected campaign log root.
+    campaign_hash : str
+        Canonical campaign identity.
+    campaign_aliases : Iterable[str], optional
+        Accepted historical campaign identifiers, default=().
+    invocation_id : str, optional
+        When provided, include only results written by this invocation.
+
+    Returns
+    -------
+    tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]
+        Metric rows and provenance diagnostics. Namespaced and archived
+        completions are not discovered.
+    """
+    rows: list[Dict[str, Any]] = []
+    diagnostics: Dict[str, list[Dict[str, Any]]] = {
+        "accepted": [],
+        "rejected": [],
+    }
+    campaign_identifiers = frozenset({campaign_hash, *campaign_aliases})
+    completion_paths = sorted(
+        campaign_root.glob("logs/seed_*/datasets/*/completion.json")
+    )
+    for completion_path in completion_paths:
+        seed_match = SEED_DIRECTORY_PATTERN.match(
+            completion_path.parents[2].name
+        )
+        if seed_match is None:
+            continue
+        seed = int(seed_match.group(1))
+        dataset_name = completion_path.parent.name
+        try:
+            completion = json.loads(
+                completion_path.read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            diagnostics["rejected"].append({
+                "seed": seed,
+                "dataset": dataset_name,
+                "path": str(completion_path.resolve()),
+                "reason": f"completion metadata is invalid: {exc}",
+            })
+            continue
+        if not isinstance(completion, dict):
+            diagnostics["rejected"].append({
+                "seed": seed,
+                "dataset": dataset_name,
+                "path": str(completion_path.resolve()),
+                "reason": "completion metadata is not a mapping",
+            })
+            continue
+        if (
+            invocation_id is not None
+            and completion.get("invocation_id") != invocation_id
+        ):
+            continue
+        artifact_error, _ = _completion_artifact_validation(
+            completion_path,
+            completion,
+            campaign_identifiers,
+            seed,
+        )
+        if artifact_error is None:
+            try:
+                _validate_artifact_completion_config(
+                    completion_path,
+                    completion,
+                    seed,
+                )
+            except ValueError as exc:
+                artifact_error = str(exc)
+        diagnostic = {
+            "seed": seed,
+            "dataset": dataset_name,
+            "path": str(completion_path.resolve()),
+            "reason": artifact_error or "artifact completion is valid",
+        }
+        if artifact_error is not None:
+            diagnostics["rejected"].append(diagnostic)
+            continue
+        diagnostic["mode"] = "artifact_self_consistent"
+        diagnostics["accepted"].append(diagnostic)
+        _append_metric_rows(rows, completion, dataset_name, seed)
+    return rows, diagnostics
+
+
 def summarize_test_rows(
     rows: Iterable[Mapping[str, Any]],
 ) -> list[Dict[str, Any]]:
@@ -975,6 +1129,7 @@ def _compact_invocation_status(
         "id",
         "requested",
         "attempted",
+        "dataset_attempts",
         "succeeded",
         "failed",
         "skipped",
@@ -991,13 +1146,9 @@ def write_campaign_summary(
     paths: CampaignPaths,
     campaign_hash: str,
     invocation: Mapping[str, Any],
-    compatible_configs: Mapping[
-        tuple[int, str],
-        Mapping[str, Any] | str,
-    ],
     campaign_aliases: Iterable[str] = (),
 ) -> CampaignSummaryResult:
-    """Regenerate metric CSVs and a compact status-only JSON summary.
+    """Regenerate artifact-wide metric CSVs and a status-only JSON summary.
 
     Parameters
     ----------
@@ -1007,8 +1158,6 @@ def write_campaign_summary(
         Full semantic campaign identity.
     invocation : Mapping[str, Any]
         Current invocation seed lifecycle status.
-    compatible_configs : Mapping[tuple[int, str], Mapping[str, Any] | str]
-        Expected configuration for every seed and dataset pair.
     campaign_aliases : Iterable[str], optional
         Validated historical campaign identifiers, default=().
 
@@ -1018,24 +1167,21 @@ def write_campaign_summary(
         Compact status plus in-memory rows for console and cloud reporting.
         ``written`` is false when no compatible metric row exists.
     """
-    test_rows, diagnostics = collect_test_rows_with_diagnostics(
+    test_rows, diagnostics = collect_artifact_test_rows_with_diagnostics(
         paths.log_root,
         campaign_hash,
-        compatible_configs,
         campaign_aliases=campaign_aliases,
     )
     _log_compatibility_problems(diagnostics)
     pair_status = {
-        "expected": len(compatible_configs),
+        "discovered": (
+            len(diagnostics["accepted"])
+            + len(diagnostics["rejected"])
+        ),
         "completed": len(diagnostics["accepted"]),
-        "missing": len(diagnostics["missing"]),
         "rejected": len(diagnostics["rejected"]),
     }
-    partial = (
-        not bool(invocation.get("complete", True))
-        or pair_status["missing"] > 0
-        or pair_status["rejected"] > 0
-    )
+    partial = pair_status["rejected"] > 0
     status_payload = {
         "campaign_identity_version": IDENTITY_VERSION,
         "campaign_identity": campaign_hash,
@@ -1081,4 +1227,95 @@ def write_campaign_summary(
         test_runs=test_rows,
         test_summary=summary_rows,
         written=True,
+    )
+
+
+def build_invocation_summary(
+    paths: CampaignPaths,
+    campaign_hash: str,
+    invocation: Mapping[str, Any],
+    campaign_aliases: Iterable[str] = (),
+) -> CampaignSummaryResult:
+    """Build a non-persisted summary of final scopes attempted now.
+
+    Parameters
+    ----------
+    paths : CampaignPaths
+        Selected campaign artifact roots.
+    campaign_hash : str
+        Full semantic campaign identity.
+    invocation : Mapping[str, Any]
+        Current invocation lifecycle and final scope attempts.
+    campaign_aliases : Iterable[str], optional
+        Validated historical campaign identifiers, default=().
+
+    Returns
+    -------
+    CampaignSummaryResult
+        Current-invocation metric rows and attempted-pair status without
+        writing any artifact-level summary files.
+    """
+    invocation_id = invocation.get("id")
+    if not isinstance(invocation_id, str) or not invocation_id:
+        raise ValueError("Invocation summary requires a non-empty ID.")
+    attempts = invocation.get("dataset_attempts", [])
+    if not isinstance(attempts, list):
+        raise ValueError("Invocation dataset_attempts must be a list.")
+    attempted_pairs: set[tuple[int, str]] = set()
+    for attempt in attempts:
+        if not isinstance(attempt, Mapping):
+            raise ValueError("Invocation dataset_attempts contains a non-map.")
+        seed = attempt.get("seed")
+        dataset_name = attempt.get("dataset")
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise ValueError("Invocation dataset attempt has an invalid seed.")
+        if not isinstance(dataset_name, str) or not dataset_name:
+            raise ValueError(
+                "Invocation dataset attempt has an invalid dataset name."
+            )
+        attempted_pairs.add((seed, dataset_name))
+    test_rows, diagnostics = collect_artifact_test_rows_with_diagnostics(
+        paths.log_root,
+        campaign_hash,
+        campaign_aliases=campaign_aliases,
+        invocation_id=invocation_id,
+    )
+    _log_compatibility_problems(diagnostics)
+    completed_pairs = {
+        (item["seed"], item["dataset"])
+        for item in diagnostics["accepted"]
+    }
+    unexpected_pairs = completed_pairs - attempted_pairs
+    if unexpected_pairs:
+        raise RuntimeError(
+            "Invocation completions were not recorded as final attempts: "
+            f"{sorted(unexpected_pairs)}."
+        )
+    pair_status = {
+        "attempted": len(attempted_pairs),
+        "completed": len(completed_pairs),
+        "incomplete": len(attempted_pairs - completed_pairs),
+        "rejected": len(diagnostics["rejected"]),
+    }
+    summary_rows = summarize_test_rows(test_rows)
+    status_payload = {
+        "campaign_identity_version": IDENTITY_VERSION,
+        "campaign_identity": campaign_hash,
+        "status": (
+            "complete"
+            if (
+                bool(invocation.get("complete", True))
+                and pair_status["incomplete"] == 0
+                and pair_status["rejected"] == 0
+            )
+            else "partial"
+        ),
+        "latest_invocation": _compact_invocation_status(invocation),
+        "dataset_pairs": pair_status,
+    }
+    return CampaignSummaryResult(
+        status=status_payload,
+        test_runs=test_rows,
+        test_summary=summary_rows,
+        written=bool(test_rows),
     )
