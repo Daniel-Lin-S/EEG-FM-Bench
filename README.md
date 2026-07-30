@@ -540,6 +540,18 @@ statistics:
   near_best_q_threshold: 0.05
 ```
 
+To add paper results without changing their workbook, declare a
+`spreadsheet_sources` entry and then add an `artifacts[].spreadsheet` item for
+each model column. Map the sheet's dataset labels to the benchmark identifiers,
+and map metrics separately for binary and multiclass tasks when a source column
+combines them (for example, `F1/AUROC`). `value_scale: 0.01` converts reported
+percentages to the run-artifact scale. A paper cell must contain a finite
+`mean ± standard deviation` value. These aggregates keep their reported
+standard deviations in tables and figures, but are never expanded into fake
+seeds or used for Mann-Whitney U, Cliff's delta, or near-best dagger marks.
+See `assets/conf/analysis/result_comparison.example.yaml` for the complete
+schema.
+
 The separate output root contains normalized CSVs, per-metric figures,
 Mann–Whitney U and Cliff's-delta statistics with per-metric BH-FDR q-values,
 and a copyable Markdown plus PNG performance table. Best mean values are bold;

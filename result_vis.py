@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Compare completed test summaries from multiple artifact directories.
+"""Compare completed test summaries and reported XLSX results.
 
-Input is one local YAML file with labelled absolute artifact roots, explicit
-metric directions, a separate output directory, and a q-value threshold. The
-workflow reads source artifacts only and writes normalized data, statistics,
-charts, and a copyable Markdown plus PNG summary table under ``output_dir``.
+Input is one local YAML file with labelled absolute artifact roots and optional
+reported XLSX model columns. It uses explicit metric directions, a separate
+output directory, and a q-value threshold. Reported aggregates retain their
+published standard deviations and are excluded from per-seed inference.
 
 Usage
 -----
@@ -36,7 +36,10 @@ TABLE_IMAGE_FILENAME = "tables/performance.png"
 def main() -> None:
     """Run one YAML-driven cross-artifact result comparison."""
     parser = argparse.ArgumentParser(
-        description="Compare completed test summaries from artifact roots.",
+        description=(
+            "Compare completed test summaries and configured XLSX paper "
+            "results."
+        ),
     )
     parser.add_argument(
         "comparison_config",

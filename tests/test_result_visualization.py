@@ -6,6 +6,7 @@ import csv
 import json
 import sys
 from pathlib import Path
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
 import yaml
@@ -17,6 +18,7 @@ from plot.results.comparison import (
     create_table_display,
 )
 from plot.results.config import load_result_comparison_config
+from plot.results.config import ResultComparisonConfig
 
 
 ACC_METRIC = "acc"
@@ -115,6 +117,112 @@ def _write_comparison_config(
         },
     }
     path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+
+def _write_xlsx(path: Path) -> None:
+    """Write a minimal XLSX workbook containing reported aggregate values."""
+    relationship_type = (
+        "http://schemas.openxmlformats.org/officeDocument/2006/"
+        "relationships/worksheet"
+    )
+    workbook = """<?xml version="1.0" encoding="UTF-8"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+ xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="Results" sheetId="1" r:id="rId1"/></sheets>
+</workbook>"""
+    relationships = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Relationships
+ xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1"
+   Type="{relationship_type}"
+   Target="worksheets/sheet1.xml"/>
+</Relationships>"""
+    worksheet = """<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="1">
+      <c r="A1" t="inlineStr"><is><t>Dataset</t></is></c>
+      <c r="B1" t="inlineStr"><is><t>Metric</t></is></c>
+      <c r="C1" t="inlineStr"><is><t>Paper A</t></is></c>
+      <c r="D1" t="inlineStr"><is><t>Paper B</t></is></c>
+    </row>
+    <row r="2">
+      <c r="A2" t="inlineStr"><is><t>Source A</t></is></c>
+      <c r="B2" t="inlineStr"><is><t>Reported score</t></is></c>
+      <c r="C2" t="inlineStr"><is><t>$50.0 \\pm 1.0$</t></is></c>
+      <c r="D2" t="inlineStr"><is><t>$40.0 \\pm 2.0$</t></is></c>
+    </row>
+  </sheetData>
+</worksheet>"""
+    with ZipFile(path, "w", compression=ZIP_DEFLATED) as archive:
+        archive.writestr("xl/workbook.xml", workbook)
+        archive.writestr("xl/_rels/workbook.xml.rels", relationships)
+        archive.writestr("xl/worksheets/sheet1.xml", worksheet)
+
+
+def test_spreadsheet_aggregates_keep_reported_std_without_inference(
+    tmp_path: Path,
+) -> None:
+    """XLSX means and standard deviations are not treated as synthetic seeds."""
+    workbook_path = tmp_path / "paper.xlsx"
+    _write_xlsx(workbook_path)
+    config = ResultComparisonConfig.model_validate(
+        {
+            "artifacts": [
+                {
+                    "label": "Paper A (full fine-tuning)",
+                    "spreadsheet": {
+                        "source": "paper",
+                        "model_column": "Paper A",
+                    },
+                },
+                {
+                    "label": "Paper B (full fine-tuning)",
+                    "spreadsheet": {
+                        "source": "paper",
+                        "model_column": "Paper B",
+                    },
+                },
+            ],
+            "spreadsheet_sources": [
+                {
+                    "name": "paper",
+                    "path": str(workbook_path),
+                    "sheet": "Results",
+                    "header_row": 1,
+                    "dataset_column": "Dataset",
+                    "metric_column": "Metric",
+                    "dataset_map": {"Source A": "toy"},
+                    "metric_map": {
+                        "Reported score": {
+                            "binary": ACC_METRIC,
+                            "multiclass": ACC_METRIC,
+                        },
+                    },
+                    "value_scale": 0.01,
+                },
+            ],
+            "metrics": [{"name": ACC_METRIC, "direction": "maximize"}],
+            "datasets": [{"name": "toy", "task": "binary"}],
+            "task_metrics": {
+                "binary": [ACC_METRIC],
+                "multiclass": [ACC_METRIC],
+            },
+            "output_dir": str((tmp_path / "output").resolve()),
+            "statistics": {
+                "near_best_q_threshold": DEFAULT_Q_THRESHOLD,
+            },
+        },
+    )
+
+    result = collect_comparison_result(config)
+
+    assert len(result.raw_rows) == 2
+    assert all(not row["inference_eligible"] for row in result.raw_rows)
+    assert result.summary_rows[0]["std"] == pytest.approx(0.01)
+    assert result.summary_rows[1]["std"] == pytest.approx(0.02)
+    assert result.statistic_rows == []
+    assert result.diagnostics[0]["kind"] == "reported_aggregate_excluded"
 
 
 def test_yaml_comparison_writes_read_only_source_outputs(

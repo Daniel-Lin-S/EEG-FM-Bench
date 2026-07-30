@@ -12,6 +12,37 @@ artifacts:
   - label: condition_b
     root: /replace/with/absolute/artifact_root_b
 
+# Optional: map a wide paper XLSX table into comparison rows. The column names,
+# sheet, and task-dependent metrics are configured here rather than hard-coded.
+# The reported standard deviations are retained for plots and tables, but these
+# rows are excluded from Mann-Whitney U and Cliff's-delta calculations because
+# per-seed values are unavailable.
+spreadsheet_sources:
+  - name: paper_full_fine_tuning
+    path: /replace/with/absolute/paper_results.xlsx
+    sheet: 0
+    header_row: 1
+    # A blank worksheet header is addressed by its Excel column letter, e.g. A.
+    dataset_column: Dataset
+    metric_column: Metric
+    dataset_map:
+      Source dataset: dataset_a
+    metric_map:
+      Balanced accuracy:
+        binary: balanced_acc
+        multiclass: balanced_acc
+      F1/AUROC:
+        binary: auroc
+        multiclass: f1
+    # Use 0.01 when values are reported as percentages.
+    value_scale: 1.0
+
+# Add one artifact for every desired model column in the spreadsheet source.
+# e.g., label: Paper model (full fine-tuning)
+#       spreadsheet:
+#         source: paper_full_fine_tuning
+#         model_column: Paper model
+
 # Select only test metrics to compare. epoch is intentionally forbidden.
 # Add loss only when it should be compared with direction: minimize.
 metrics:

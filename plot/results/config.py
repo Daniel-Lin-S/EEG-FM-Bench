@@ -1,9 +1,8 @@
 """Validate YAML input for cross-artifact result comparisons.
 
-The comparison YAML provides local artifact roots, user-defined labels,
-task-specific metrics, dataset display metadata, and a separate output root.
-It is intentionally local because artifact paths must not appear in public
-configuration files.
+The comparison YAML provides completed artifact roots and optionally XLSX
+paper-result sources. It is intentionally local because source paths must not
+appear in public configuration files.
 """
 
 from __future__ import annotations
@@ -23,20 +22,102 @@ MAX_Q_THRESHOLD = 1.0
 TaskType = Literal["binary", "multiclass"]
 
 
+class SpreadsheetMetricConfig(BaseModel):
+    """Map one source metric label to benchmark metrics by task type."""
+
+    binary: str
+    multiclass: str
+
+
+class SpreadsheetSourceConfig(BaseModel):
+    """One configurable wide XLSX paper-result source.
+
+    Parameters
+    ----------
+    name : str
+        Identifier referenced by spreadsheet artifacts.
+    path : pathlib.Path
+        Absolute XLSX path.
+    sheet : str or int, optional, default=0
+        Worksheet name or zero-based worksheet index.
+    header_row : int, optional, default=1
+        One-based row containing the source column headers.
+    dataset_column : str
+        Header containing a source dataset name.
+    metric_column : str
+        Header containing a source metric label.
+    dataset_map : dict[str, str]
+        Source dataset names mapped to configured benchmark identifiers.
+    metric_map : dict[str, SpreadsheetMetricConfig]
+        Source metric labels mapped separately for binary and multiclass tasks.
+    value_scale : float, optional, default=1.0
+        Multiplier applied to reported means and standard deviations.
+    """
+
+    name: str
+    path: Path
+    sheet: str | int = 0
+    header_row: int = Field(default=1, ge=1)
+    dataset_column: str
+    metric_column: str
+    dataset_map: dict[str, str]
+    metric_map: dict[str, SpreadsheetMetricConfig]
+    value_scale: float = Field(default=1.0, gt=0.0)
+
+    @field_validator("name", "dataset_column", "metric_column")
+    @classmethod
+    def validate_non_empty_text(cls, value: str) -> str:
+        """Normalize a required non-empty spreadsheet setting."""
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("Spreadsheet settings must not be empty.")
+        return normalized
+
+    @field_validator("path")
+    @classmethod
+    def validate_path(cls, value: Path) -> Path:
+        """Require an absolute spreadsheet source path."""
+        if not value.is_absolute():
+            raise ValueError(
+                "Spreadsheet source path must be absolute, but got "
+                f"{value}."
+            )
+        return value
+
+
+class SpreadsheetArtifactConfig(BaseModel):
+    """Select one model column from a configured XLSX source."""
+
+    source: str
+    model_column: str
+
+    @field_validator("source", "model_column")
+    @classmethod
+    def validate_non_empty_text(cls, value: str) -> str:
+        """Normalize one non-empty spreadsheet artifact setting."""
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("Spreadsheet artifact settings must not be empty.")
+        return normalized
+
+
 class ArtifactConfig(BaseModel):
-    """One explicitly labelled artifact root.
+    """One explicitly labelled artifact or spreadsheet model column.
 
     Parameters
     ----------
     label : str
         User-defined comparison label. It may describe a model or an
         experimental condition.
-    root : pathlib.Path
+    root : pathlib.Path or None, optional, default=None
         Absolute root containing ``summary/test_runs.csv``.
+    spreadsheet : SpreadsheetArtifactConfig or None, optional, default=None
+        Configured XLSX source and model column. Exactly one source is required.
     """
 
     label: str
-    root: Path
+    root: Path | None = None
+    spreadsheet: SpreadsheetArtifactConfig | None = None
 
     @field_validator("label")
     @classmethod
@@ -48,14 +129,25 @@ class ArtifactConfig(BaseModel):
 
     @field_validator("root")
     @classmethod
-    def validate_root(cls, value: Path) -> Path:
+    def validate_root(cls, value: Path | None) -> Path | None:
         """Require an absolute artifact root path."""
+        if value is None:
+            return value
         if not value.is_absolute():
             raise ValueError(
                 "Artifact root must be an absolute path, but got "
                 f"{value}."
             )
         return value
+
+    @model_validator(mode="after")
+    def validate_source(self) -> "ArtifactConfig":
+        """Require exactly one artifact-root or spreadsheet source."""
+        if (self.root is None) == (self.spreadsheet is None):
+            raise ValueError(
+                "Each artifact must define exactly one of root or spreadsheet."
+            )
+        return self
 
 
 class MetricConfig(BaseModel):
@@ -208,6 +300,9 @@ class ResultComparisonConfig(BaseModel):
     """
 
     artifacts: list[ArtifactConfig]
+    spreadsheet_sources: list[SpreadsheetSourceConfig] = Field(
+        default_factory=list,
+    )
     metrics: list[MetricConfig]
     task_metrics: TaskMetricsConfig
     datasets: list[DatasetConfig]
@@ -237,6 +332,28 @@ class ResultComparisonConfig(BaseModel):
         labels = [artifact.label for artifact in self.artifacts]
         if len(labels) != len(set(labels)):
             raise ValueError("Artifact labels must be unique.")
+        source_names = [source.name for source in self.spreadsheet_sources]
+        if len(source_names) != len(set(source_names)):
+            raise ValueError("Spreadsheet source names must be unique.")
+        sources = {source.name: source for source in self.spreadsheet_sources}
+        for artifact in self.artifacts:
+            if artifact.spreadsheet is None:
+                continue
+            source = sources.get(artifact.spreadsheet.source)
+            if source is None:
+                raise ValueError(
+                    "Spreadsheet artifact references an unknown source: "
+                    f"{artifact.spreadsheet.source!r}."
+                )
+            targets = set(source.dataset_map.values())
+            unknown_targets = sorted(
+                targets - {dataset.name for dataset in self.datasets}
+            )
+            if unknown_targets:
+                raise ValueError(
+                    "Spreadsheet dataset_map targets require configured "
+                    f"datasets, but missing {unknown_targets}."
+                )
         if not self.metrics:
             raise ValueError(
                 "Expected at least one explicitly selected metric."
@@ -280,6 +397,11 @@ class ResultComparisonConfig(BaseModel):
         return set(self.task_metrics.binary).union(
             self.task_metrics.multiclass,
         )
+
+    @property
+    def spreadsheet_source_lookup(self) -> dict[str, SpreadsheetSourceConfig]:
+        """Return spreadsheet source settings keyed by their unique name."""
+        return {source.name: source for source in self.spreadsheet_sources}
 
 
 

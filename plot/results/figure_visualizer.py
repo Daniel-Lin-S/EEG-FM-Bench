@@ -153,15 +153,20 @@ def _save_metric_figure(
         color = MODEL_COLORS[label_index % len(MODEL_COLORS)]
         marker = MARKERS[label_index % len(MARKERS)]
         for dataset in datasets:
-            group_values = [
-                float(row["value"])
+            group_rows = [
+                row
                 for row in label_rows
                 if row["dataset"] == dataset
             ]
-            if not group_values:
+            if not group_rows:
                 continue
+            group_values = [float(row["value"]) for row in group_rows]
             position = position_lookup[(dataset, label)]
-            if show_individual_points:
+            inference_eligible = all(
+                bool(row["inference_eligible"])
+                for row in group_rows
+            )
+            if show_individual_points and inference_eligible:
                 jitter = _deterministic_jitter(len(group_values))
                 axis.scatter(
                     np.full(len(group_values), position) + jitter,
@@ -175,10 +180,19 @@ def _save_metric_figure(
                     zorder=3,
                 )
             mean = float(np.mean(group_values))
+            reported_stds = [
+                row["reported_std"]
+                for row in group_rows
+                if row["reported_std"] is not None
+            ]
             std = (
-                float(np.std(group_values, ddof=1))
-                if len(group_values) > 1
-                else None
+                float(reported_stds[0])
+                if reported_stds
+                else (
+                    float(np.std(group_values, ddof=1))
+                    if len(group_values) > 1
+                    else None
+                )
             )
             error = None if std is None else std
             axis.errorbar(

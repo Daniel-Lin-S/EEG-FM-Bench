@@ -11,6 +11,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+import re
 from dataclasses import dataclass
 from itertools import combinations
 from pathlib import Path
@@ -19,12 +20,25 @@ from typing import Any, Iterable, Mapping
 import numpy as np
 from scipy.stats import mannwhitneyu
 
-from plot.results.config import ResultComparisonConfig
+from plot.results.config import (
+    ArtifactConfig,
+    ResultComparisonConfig,
+    SpreadsheetSourceConfig,
+)
+from plot.results.spreadsheet import read_xlsx_rows
 from plot.results.table_visualizer import TableDisplay
 
 
 TEST_RUN_FIELDS = ("dataset", "seed", "metric", "value")
-RAW_FIELDS = ("artifact",) + TEST_RUN_FIELDS
+RAW_FIELDS = (
+    "artifact",
+    "dataset",
+    "seed",
+    "metric",
+    "value",
+    "reported_std",
+    "inference_eligible",
+)
 SUMMARY_BASE_FIELDS = (
     "artifact",
     "dataset",
@@ -51,6 +65,11 @@ SUMMARY_STATUS_FILENAME = "summary.json"
 MANIFEST_FILENAME = "comparison_manifest.json"
 MIN_INFERENCE_SAMPLES = 2
 DISPLAY_PRECISION = 4
+REPORTED_SEED = 0
+REPORTED_VALUE_PATTERN = re.compile(
+    r"^\s*\$?\s*(?P<mean>[+-]?\d+(?:\.\d+)?)\s*"
+    r"(?:\\pm|±)\s*(?P<std>[+-]?\d+(?:\.\d+)?)\s*\$?\s*$"
+)
 
 
 @dataclass(frozen=True)
@@ -174,6 +193,18 @@ def validate_comparison_paths(config: ResultComparisonConfig) -> None:
     """
     output_dir = config.output_dir.resolve()
     for artifact in config.artifacts:
+        if artifact.spreadsheet is not None:
+            source = config.spreadsheet_source_lookup[
+                artifact.spreadsheet.source
+            ]
+            if not source.path.is_file():
+                raise ValueError(
+                    f"Spreadsheet source for {artifact.label!r} does not "
+                    f"exist: {source.path.resolve()}."
+                )
+            continue
+        if artifact.root is None:
+            raise ValueError(f"Artifact {artifact.label!r} has no root.")
         root = artifact.root.resolve()
         if not root.is_dir():
             raise ValueError(
@@ -205,11 +236,7 @@ def collect_comparison_result(
     validate_comparison_paths(config)
     raw_rows: list[dict[str, Any]] = []
     for artifact in config.artifacts:
-        rows = _read_artifact_rows(
-            artifact.label,
-            artifact.root,
-            config.selected_metric_names,
-        )
+        rows = _read_source_rows(artifact, config)
         raw_rows.extend(rows)
     _require_configured_datasets(raw_rows, config)
     display_rows = _select_display_rows(raw_rows, config)
@@ -358,10 +385,35 @@ def build_manifest_metadata(
     }
 
 
+def _read_source_rows(
+    artifact: ArtifactConfig,
+    config: ResultComparisonConfig,
+) -> list[dict[str, Any]]:
+    """Read selected rows from one configured source type."""
+    if artifact.root is not None:
+        return _read_artifact_rows(
+            artifact.label,
+            artifact.root,
+            config.selected_metric_names,
+            {dataset.name for dataset in config.datasets},
+        )
+    if artifact.spreadsheet is None:
+        raise ValueError(f"Artifact {artifact.label!r} has no readable source.")
+    source = config.spreadsheet_source_lookup[artifact.spreadsheet.source]
+    return _read_spreadsheet_rows(
+        artifact.label,
+        artifact.spreadsheet.model_column,
+        source,
+        {dataset.name: dataset.task for dataset in config.datasets},
+        config.selected_metric_names,
+    )
+
+
 def _read_artifact_rows(
     label: str,
     root: Path,
     selected_metrics: set[str],
+    selected_datasets: set[str],
 ) -> list[dict[str, Any]]:
     """Read selected canonical rows from one complete artifact summary."""
     summary_dir = root / SUMMARY_DIRECTORY
@@ -385,7 +437,8 @@ def _read_artifact_rows(
     seen: set[tuple[str, int, str]] = set()
     for row_index, row in enumerate(rows, start=2):
         metric = row["metric"]
-        if metric not in selected_metrics:
+        dataset = row["dataset"]
+        if metric not in selected_metrics or dataset not in selected_datasets:
             continue
         normalized = _normalize_test_row(row, label, test_runs_path, row_index)
         key = (normalized["dataset"], normalized["seed"], normalized["metric"])
@@ -397,6 +450,104 @@ def _read_artifact_rows(
         seen.add(key)
         selected_rows.append(normalized)
     return selected_rows
+
+
+def _read_spreadsheet_rows(
+    label: str,
+    model_column: str,
+    source: SpreadsheetSourceConfig,
+    dataset_tasks: Mapping[str, str],
+    selected_metrics: set[str],
+) -> list[dict[str, Any]]:
+    """Read one XLSX model column as reported mean and standard deviation.
+
+    Reported aggregates receive a reserved seed and are never eligible for
+    Mann-Whitney testing. The source data is not expanded into synthetic seeds.
+    """
+    source_rows = read_xlsx_rows(source.path, source.sheet, source.header_row)
+    required_columns = {
+        source.dataset_column,
+        source.metric_column,
+        model_column,
+    }
+    available_columns = set(source_rows[0])
+    missing_columns = sorted(required_columns - available_columns)
+    if missing_columns:
+        raise ValueError(
+            f"Spreadsheet source {source.name!r} is missing columns "
+            f"{missing_columns} at {source.path.resolve()}."
+        )
+    selected_rows = []
+    seen: set[tuple[str, str]] = set()
+    for row_index, row in enumerate(source_rows, start=source.header_row + 1):
+        source_dataset = row[source.dataset_column]
+        dataset = source.dataset_map.get(source_dataset)
+        if dataset is None:
+            continue
+        source_metric = row[source.metric_column]
+        metric_mapping = source.metric_map.get(source_metric)
+        if metric_mapping is None:
+            continue
+        task = dataset_tasks[dataset]
+        metric = getattr(metric_mapping, task)
+        if metric not in selected_metrics:
+            continue
+        value, reported_std = _parse_reported_value(
+            row[model_column],
+            source,
+            row_index,
+        )
+        key = (dataset, metric)
+        if key in seen:
+            raise ValueError(
+                f"Spreadsheet source {source.name!r} has duplicate result "
+                f"for {label!r}: {key}."
+            )
+        seen.add(key)
+        selected_rows.append(
+            {
+                "artifact": label,
+                "dataset": dataset,
+                "seed": REPORTED_SEED,
+                "metric": metric,
+                "value": value,
+                "reported_std": reported_std,
+                "inference_eligible": False,
+            }
+        )
+    if not selected_rows:
+        raise ValueError(
+            f"Spreadsheet source {source.name!r} produced no selected rows "
+            f"for {label!r}."
+        )
+    return selected_rows
+
+
+def _parse_reported_value(
+    text: str,
+    source: SpreadsheetSourceConfig,
+    row_index: int,
+) -> tuple[float, float]:
+    """Parse one configured XLSX mean-plus-standard-deviation cell."""
+    match = REPORTED_VALUE_PATTERN.fullmatch(text)
+    if match is None:
+        raise ValueError(
+            f"Expected mean ± standard deviation at {source.path.resolve()} "
+            f"row {row_index}, but got {text!r}."
+        )
+    mean = float(match.group("mean")) * source.value_scale
+    std = float(match.group("std")) * source.value_scale
+    if not math.isfinite(mean) or not math.isfinite(std):
+        raise ValueError(
+            f"Expected finite reported values at {source.path.resolve()} "
+            f"row {row_index}, but got {text!r}."
+        )
+    if std < 0.0:
+        raise ValueError(
+            f"Expected non-negative reported standard deviation at "
+            f"{source.path.resolve()} row {row_index}, but got {text!r}."
+        )
+    return mean, std
 
 
 def _require_complete_summary(label: str, summary_dir: Path) -> None:
@@ -475,6 +626,8 @@ def _normalize_test_row(
         "seed": seed,
         "metric": metric,
         "value": value,
+        "reported_std": None,
+        "inference_eligible": True,
     }
 
 
@@ -521,14 +674,29 @@ def _select_display_rows(
 
 def _summarize_rows(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Aggregate per-seed rows by artifact, dataset, and metric."""
-    grouped: dict[tuple[str, str, str], list[float]] = {}
+    grouped: dict[tuple[str, str, str], list[Mapping[str, Any]]] = {}
     for row in rows:
         key = (str(row["artifact"]), str(row["dataset"]), str(row["metric"]))
-        grouped.setdefault(key, []).append(float(row["value"]))
+        grouped.setdefault(key, []).append(row)
     summaries = []
-    for (artifact, dataset, metric), values in sorted(grouped.items()):
+    for (artifact, dataset, metric), group_rows in sorted(grouped.items()):
+        values = [float(row["value"]) for row in group_rows]
+        reported_stds = [
+            row["reported_std"]
+            for row in group_rows
+            if row["reported_std"] is not None
+        ]
+        if reported_stds and len(group_rows) != 1:
+            raise ValueError(
+                "Reported spreadsheet aggregates cannot be mixed with "
+                "per-seed values in one artifact, dataset, and metric."
+            )
         array = np.asarray(values, dtype=float)
-        std = float(np.std(array, ddof=1)) if len(array) > 1 else None
+        std = (
+            float(reported_stds[0])
+            if reported_stds
+            else (float(np.std(array, ddof=1)) if len(array) > 1 else None)
+        )
         summaries.append(
             {
                 "artifact": artifact,
@@ -547,22 +715,38 @@ def _build_statistics(
     rows: Iterable[Mapping[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Calculate eligible pairwise tests and non-fatal availability messages."""
-    grouped: dict[tuple[str, str, str], list[float]] = {}
+    grouped: dict[tuple[str, str, str], list[Mapping[str, Any]]] = {}
     by_dataset_metric: dict[tuple[str, str], set[str]] = {}
     for row in rows:
         artifact = str(row["artifact"])
         dataset = str(row["dataset"])
         metric = str(row["metric"])
-        grouped.setdefault((artifact, dataset, metric), []).append(
-            float(row["value"])
-        )
+        grouped.setdefault((artifact, dataset, metric), []).append(row)
         by_dataset_metric.setdefault((dataset, metric), set()).add(artifact)
     statistics: list[dict[str, Any]] = []
     diagnostics: list[dict[str, Any]] = []
     for (dataset, metric), labels in sorted(by_dataset_metric.items()):
         for artifact_a, artifact_b in combinations(sorted(labels), 2):
-            values_a = grouped[(artifact_a, dataset, metric)]
-            values_b = grouped[(artifact_b, dataset, metric)]
+            rows_a = grouped[(artifact_a, dataset, metric)]
+            rows_b = grouped[(artifact_b, dataset, metric)]
+            if not all(row["inference_eligible"] for row in rows_a + rows_b):
+                diagnostics.append(
+                    {
+                        "kind": "reported_aggregate_excluded",
+                        "dataset": dataset,
+                        "metric": metric,
+                        "artifact_a": artifact_a,
+                        "artifact_b": artifact_b,
+                        "message": (
+                            "Mann-Whitney U was unavailable because at least "
+                            "one result is a reported aggregate without "
+                            "per-seed values."
+                        ),
+                    }
+                )
+                continue
+            values_a = [float(row["value"]) for row in rows_a]
+            values_b = [float(row["value"]) for row in rows_b]
             if min(len(values_a), len(values_b)) < MIN_INFERENCE_SAMPLES:
                 diagnostics.append(
                     {
