@@ -520,6 +520,69 @@ def test_optuna_sqlite_study_resumes_existing_trials(
     ).is_file()
 
 
+def test_resuming_hpo_removes_failed_trials_and_their_artifacts(
+    tmp_path: Path,
+) -> None:
+    """Failed and stale trials are removed before the next trial is asked."""
+    import optuna
+
+    runner = _study_test_runner(tmp_path)
+    runner.hpo_config = make_hpo_config().model_copy(
+        update={"n_trials": 5}
+    )
+    first_runtime = runner._create_study("alpha")
+    for _ in range(2):
+        trial = first_runtime.study.ask()
+        first_runtime.study.tell(trial, 1.0)
+    failed_numbers = []
+    for _ in range(2):
+        trial = first_runtime.study.ask()
+        failed_numbers.append(trial.number)
+        first_runtime.study.tell(
+            trial,
+            state=optuna.trial.TrialState.FAIL,
+        )
+    running_trial = first_runtime.study.ask()
+    failed_numbers.append(running_trial.number)
+    for trial_number in failed_numbers:
+        artifact = (
+            first_runtime.artifact_root
+            / "trials"
+            / f"trial_{trial_number:05d}"
+        )
+        artifact.mkdir(parents=True)
+        (artifact / "trial.json").write_text("{}", encoding="utf-8")
+        checkpoint = (
+            first_runtime.checkpoint_root
+            / f"trial_{trial_number:05d}"
+        )
+        checkpoint.mkdir(parents=True)
+        (checkpoint / "checkpoint.pt").write_text("partial", encoding="utf-8")
+    runner._release_study(first_runtime)
+
+    second_runtime = runner._create_study("alpha")
+    try:
+        assert [trial.number for trial in second_runtime.study.trials] == [
+            0,
+            1,
+        ]
+        resumed_trial = second_runtime.study.ask()
+        assert resumed_trial.number == 2
+        second_runtime.study.tell(resumed_trial, 1.0)
+        for trial_number in failed_numbers:
+            assert not (
+                second_runtime.artifact_root
+                / "trials"
+                / f"trial_{trial_number:05d}"
+            ).exists()
+            assert not (
+                second_runtime.checkpoint_root
+                / f"trial_{trial_number:05d}"
+            ).exists()
+    finally:
+        runner._release_study(second_runtime)
+
+
 def test_completed_hpo_budget_reuses_winner_without_trainer(
     tmp_path: Path,
     monkeypatch,

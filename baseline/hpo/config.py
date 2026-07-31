@@ -211,8 +211,8 @@ class HpoConfig(BaseModel):
         This value is independent of top-level evaluation seeds.
     n_trials : int or None, optional, default=None
         Positive complete-or-pruned trial target for each study. This value is
-        required when ``enabled`` is true. Failed trials remain diagnostic and
-        do not consume the target when a SQLite study resumes.
+        required when ``enabled`` is true. Failed trials do not consume the
+        target; their rows and artifacts are removed before SQLite resumption.
     max_consecutive_failed_trials : int, optional, default=5
         Positive terminal-failure streak that aborts an invalid study. A
         complete or pruned trial resets the streak.

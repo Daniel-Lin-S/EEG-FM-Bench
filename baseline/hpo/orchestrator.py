@@ -78,6 +78,11 @@ OOM_MESSAGE_PARTS = (
     "out of memory",
     "cuda error: memory allocation",
 )
+UNBUDGETED_TRIAL_STATES = frozenset({
+    "FAIL",
+    "RUNNING",
+    "WAITING",
+})
 
 
 @dataclass
@@ -147,6 +152,8 @@ class StudyRuntime:
         Preserved non-selected study names found in legacy storage.
     lock_file : BinaryIO
         Open file whose advisory lock is held for this runtime.
+    removed_trial_numbers : tuple[int, ...], optional
+        Trial numbers removed before this runtime resumed, default=().
     """
 
     study: Any
@@ -157,6 +164,7 @@ class StudyRuntime:
     legacy: bool
     duplicate_names: tuple[str, ...]
     lock_file: BinaryIO
+    removed_trial_numbers: tuple[int, ...] = ()
 
 
 class CampaignExecutionError(RuntimeError):
@@ -511,6 +519,137 @@ def _remove_checkpoint_tree(path: Path, purpose: str) -> Optional[str]:
         return resolved
 
     return None
+
+
+def _remove_hpo_trial_artifact(path: Path, purpose: str) -> None:
+    """Remove one exact HPO trial artifact or raise a cleanup error."""
+    if not path.exists():
+        return
+    try:
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    except OSError as exc:
+        raise RuntimeError(
+            f"{purpose} cleanup failed at {path.resolve()}: {exc}."
+        ) from exc
+
+
+def _quote_sqlite_identifier(identifier: str) -> str:
+    """Quote one SQLite identifier for a schema inspection query."""
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def _cleanup_unbudgeted_hpo_trials(
+    storage_path: Path,
+    study_name: str,
+    artifact_roots: tuple[Path, ...],
+    checkpoint_roots: tuple[Path, ...],
+) -> tuple[int, ...]:
+    """Remove failed or stale HPO trials before study resumption.
+
+    Optuna does not expose a public trial-removal API. The SQLite storage is
+    therefore edited under the campaign study lock, deleting all rows that
+    reference each selected trial before deleting its parent row. Completed
+    and pruned trials are retained and continue to determine the next trial
+    number.
+
+    Parameters
+    ----------
+    storage_path : pathlib.Path
+        SQLite storage for the selected study.
+    study_name : str
+        Exact Optuna study name in the storage.
+    artifact_roots : tuple[pathlib.Path, ...]
+        Exact roots containing ``trials/trial_<number>`` directories.
+    checkpoint_roots : tuple[pathlib.Path, ...]
+        Exact roots containing ``trial_<number>`` checkpoint directories.
+
+    Returns
+    -------
+    tuple[int, ...]
+        Removed Optuna trial numbers in ascending order.
+
+    Raises
+    ------
+    RuntimeError
+        If the SQLite storage or an associated artifact cannot be cleaned.
+    """
+    if not storage_path.is_file():
+        return ()
+    connection: Optional[sqlite3.Connection] = None
+    try:
+        connection = sqlite3.connect(storage_path, timeout=30.0)
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("BEGIN IMMEDIATE")
+        study_row = connection.execute(
+            "SELECT study_id FROM studies WHERE study_name = ?",
+            (study_name,),
+        ).fetchone()
+        if study_row is None:
+            return ()
+        study_id = int(study_row[0])
+        trial_rows = connection.execute(
+            "SELECT trial_id, number, state FROM trials "
+            "WHERE study_id = ? AND state IN (?, ?, ?) "
+            "ORDER BY number",
+            (study_id, *sorted(UNBUDGETED_TRIAL_STATES)),
+        ).fetchall()
+        if not trial_rows:
+            return ()
+        trial_ids = [int(row[0]) for row in trial_rows]
+        trial_numbers = tuple(int(row[1]) for row in trial_rows)
+        placeholders = ",".join("?" for _ in trial_ids)
+        for trial_number in trial_numbers:
+            trial_name = f"trial_{trial_number:05d}"
+            for root in artifact_roots:
+                _remove_hpo_trial_artifact(
+                    root / "trials" / trial_name,
+                    f"HPO trial {trial_number} artifact",
+                )
+            for root in checkpoint_roots:
+                _remove_hpo_trial_artifact(
+                    root / trial_name,
+                    f"HPO trial {trial_number} checkpoint",
+                )
+        table_rows = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+        for table_row in table_rows:
+            table_name = str(table_row[0])
+            if table_name == "trials":
+                continue
+            columns = connection.execute(
+                "PRAGMA table_info("
+                f"{_quote_sqlite_identifier(table_name)})"
+            ).fetchall()
+            if not any(str(column[1]) == "trial_id" for column in columns):
+                continue
+            quoted_name = _quote_sqlite_identifier(table_name)
+            connection.execute(
+                f"DELETE FROM {quoted_name} "
+                f"WHERE trial_id IN ({placeholders})",
+                trial_ids,
+            )
+        connection.execute(
+            f"DELETE FROM trials WHERE trial_id IN ({placeholders})",
+            trial_ids,
+        )
+        connection.commit()
+        return trial_numbers
+    except (OSError, sqlite3.Error, RuntimeError) as exc:
+        if connection is not None:
+            connection.rollback()
+        if isinstance(exc, RuntimeError):
+            raise
+        raise RuntimeError(
+            f"Cannot clean unbudgeted HPO trials from "
+            f"{storage_path.resolve()}: {exc}."
+        ) from exc
+    finally:
+        if connection is not None:
+            connection.close()
 
 
 def _acquire_execution_locks(
@@ -2083,6 +2222,7 @@ class CampaignRunner:
             legacy = study is not None
             if legacy:
                 storage_path = legacy_path
+                storage = legacy_storage
             else:
                 storage_path = (artifact_root / "study.sqlite3").resolve()
                 storage = f"sqlite:///{storage_path}"
@@ -2115,12 +2255,40 @@ class CampaignRunner:
                         "Study identity collision or corrupt semantic metadata "
                         f"at {storage_path}."
                     )
-            for trial in study.get_trials(deepcopy=False):
-                if trial.state == optuna.trial.TrialState.RUNNING:
-                    study.tell(
-                        trial.number,
-                        state=optuna.trial.TrialState.FAIL,
-                    )
+            artifact_roots = (
+                (artifact_root, scope_root)
+                if legacy
+                else (artifact_root,)
+            )
+            checkpoint_scope_root = _hpo_scope_root(
+                self.paths.checkpoint_root,
+                scope,
+            )
+            checkpoint_roots = (
+                (checkpoint_root, checkpoint_scope_root)
+                if legacy
+                else (checkpoint_root,)
+            )
+            removed_trials = _cleanup_unbudgeted_hpo_trials(
+                storage_path,
+                study.study_name,
+                artifact_roots,
+                checkpoint_roots,
+            )
+            if removed_trials:
+                logger.warning(
+                    "Removed failed or stale HPO trials for scope %s before "
+                    "resume: %s.",
+                    scope,
+                    ", ".join(str(number) for number in removed_trials),
+                )
+                sampler, pruner = self._study_sampler_and_pruner()
+                study = optuna.load_study(
+                    study_name=study.study_name,
+                    storage=storage,
+                    sampler=sampler,
+                    pruner=pruner,
+                )
             if duplicates:
                 logger.warning(
                     "Preserving non-selected HPO studies for scope %s in %s: "
@@ -2138,6 +2306,7 @@ class CampaignRunner:
                 legacy=legacy,
                 duplicate_names=duplicates,
                 lock_file=lock_file,
+                removed_trial_numbers=removed_trials,
             )
         except Exception:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
@@ -2210,7 +2379,11 @@ class CampaignRunner:
             budgeted, consecutive_failures = _study_progress(
                 persisted_trials
             )
-            study_status = "resumed" if persisted_trials else "new"
+            study_status = (
+                "resumed"
+                if persisted_trials or runtime.removed_trial_numbers
+                else "new"
+            )
         else:
             budgeted = 0
             consecutive_failures = 0
