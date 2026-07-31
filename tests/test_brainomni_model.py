@@ -10,6 +10,27 @@ import pytest
 pytest.importorskip("torch")
 
 from baseline.brainomni import model as brainomni_model
+from baseline.brainomni.brainomni_config import BrainOmniConfig
+
+
+@pytest.mark.parametrize(
+	"field,value",
+	[
+		("signal_normalize_eps", float("nan")),
+		("signal_normalize_eps", float("inf")),
+		("position_normalize_eps", float("nan")),
+		("position_normalize_eps", float("inf")),
+	],
+)
+def test_config_rejects_nonfinite_normalization_epsilon(
+	field: str,
+	value: float,
+) -> None:
+	"""Normalization safeguards require finite positive epsilon values."""
+	config = BrainOmniConfig()
+	setattr(config.model, field, value)
+
+	assert config.validate_config() is False
 
 
 @pytest.mark.parametrize("lm_dim,lm_head", [(256, 8), (512, 16)])

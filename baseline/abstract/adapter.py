@@ -3,7 +3,7 @@ Abstract adapter base class for baseline models.
 """
 
 from abc import ABC, abstractmethod
-from typing import Dict, List, Union, Any
+from typing import Any, Dict, List, Mapping, Union
 import logging
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -196,6 +196,25 @@ class AbstractDataLoaderFactory(ABC):
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.seed = seed
+
+    def get_data_diagnostics(
+        self,
+        dataset_name: str,
+    ) -> Mapping[str, Any]:
+        """Return optional JSON diagnostics for one completed dataset.
+
+        Parameters
+        ----------
+        dataset_name : str
+            Dataset whose completion artifact is being written.
+
+        Returns
+        -------
+        Mapping[str, Any]
+            Provider-owned data diagnostics. The default is empty.
+        """
+        del dataset_name
+        return {}
     
     @abstractmethod
     def create_adapter(

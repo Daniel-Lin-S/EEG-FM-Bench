@@ -17,6 +17,12 @@ NEVER re-run experiments that already have artifacts -- complete waste of comput
 
 AVOID writing codes in a way that destroy or overwrite artifacts of already completed runs, unless necessary or requested.
 
+## Open-closed principle
+
+This benchmark integrates multiple models, datasets, and training schemes. Any code implementation should allow extension to any of the 3 dimensions WITHOUT causing cascading changes.
+
+NEVER implement a fix to a single model in a restricted way that only works for that model in a shared module. If you add anything in the shared module, it should be compatible to ALL related implementations -- models, datasets, or training schemes.
+
 ## Visualisations
 
 - Use `seaborn` whenever possible rather than `matplotib`

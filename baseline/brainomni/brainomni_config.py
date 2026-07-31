@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import List, Optional
 
 from pydantic import Field
@@ -176,7 +177,11 @@ class BrainOmniConfig(AbstractConfig):
 		bool
 			``True`` if configuration is valid.
 		"""
+		if not math.isfinite(self.model.signal_normalize_eps):
+			return False
 		if self.model.signal_normalize_eps <= 0.0:
+			return False
+		if not math.isfinite(self.model.position_normalize_eps):
 			return False
 		if self.model.position_normalize_eps <= 0.0:
 			return False
@@ -214,4 +219,3 @@ class BrainOmniConfig(AbstractConfig):
 			return False
 
 		return True
-

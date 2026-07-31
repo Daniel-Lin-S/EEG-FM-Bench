@@ -55,6 +55,35 @@ class MeanFeatureTrainer(FeatureExtractorTrainer):
         return data.mean(axis=-1)
 
 
+class DiagnosticFeatureTrainer(MeanFeatureTrainer):
+    """Feature trainer exposing model and training diagnostics."""
+
+    def get_model_diagnostics(
+        self,
+        ds_name: str,
+    ) -> dict[str, Any]:
+        """Return opaque model diagnostics for tests."""
+        return {"provider": f"model:{ds_name}"}
+
+    def get_training_diagnostics(
+        self,
+        ds_name: str,
+    ) -> dict[str, Any]:
+        """Return opaque training diagnostics for tests."""
+        return {"provider": f"training:{ds_name}"}
+
+
+class DiagnosticDataFactory:
+    """Minimal data diagnostics provider for trainer-hook tests."""
+
+    def get_data_diagnostics(
+        self,
+        dataset_name: str,
+    ) -> dict[str, Any]:
+        """Return opaque data diagnostics for tests."""
+        return {"provider": f"data:{dataset_name}"}
+
+
 def make_config(
     model_type: str = "catch22",
     model: dict | None = None,
@@ -407,9 +436,11 @@ def test_no_checkpoint_completion_skips_and_reports_clear_error(tmp_path):
 def _write_feature_completion(
     artifact_root: Path,
     test_metrics: dict[str, float],
-) -> None:
+    trainer: FeatureExtractorTrainer | None = None,
+) -> Path:
     """Write one completed deterministic extractor result for tests."""
-    trainer = MeanFeatureTrainer(make_config())
+    if trainer is None:
+        trainer = MeanFeatureTrainer(make_config())
     trainer.log_dir = str(artifact_root)
     trainer.execution_id = "test-run"
     trainer.final_validation_metrics[DATASET_NAME] = {
@@ -417,6 +448,12 @@ def _write_feature_completion(
     }
     trainer.final_test_metrics[DATASET_NAME] = test_metrics
     trainer._write_completion(DATASET_NAME, DATASET_CONFIG)
+    return (
+        artifact_root
+        / "datasets"
+        / DATASET_NAME
+        / "completion.json"
+    )
 
 
 def test_feature_summary_has_campaign_csv_schema_without_std(tmp_path):
@@ -456,6 +493,60 @@ def test_feature_summary_has_campaign_csv_schema_without_std(tmp_path):
     assert "loss" not in test_runs
     assert status["status"] == "complete"
     assert status["dataset_pairs"]["completed"] == 1
+    assert "diagnostics" not in status
+
+
+def test_feature_completion_and_summary_preserve_typed_diagnostics(
+    tmp_path: Path,
+) -> None:
+    """All generic provider namespaces survive opaque aggregation."""
+    trainer = DiagnosticFeatureTrainer(make_config())
+    trainer.dataloader_factory = DiagnosticDataFactory()
+    completion_path = _write_feature_completion(
+        tmp_path,
+        {f"{DATASET_NAME}/test/acc": 0.6},
+        trainer=trainer,
+    )
+
+    completion = json.loads(completion_path.read_text(encoding="utf-8"))
+    assert completion["diagnostics"] == {
+        "data": {"provider": f"data:{DATASET_NAME}"},
+        "model": {"provider": f"model:{DATASET_NAME}"},
+        "training": {"provider": f"training:{DATASET_NAME}"},
+    }
+
+    write_feature_extractor_summary(
+        tmp_path,
+        "catch22",
+        42,
+        {DATASET_NAME: DATASET_CONFIG},
+        "config-identity",
+    )
+
+    status = json.loads(
+        (tmp_path / "summary" / "summary.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert status["diagnostics"] == {
+        "runs": [
+            {
+                "seed": 42,
+                "dataset": DATASET_NAME,
+                "details": completion["diagnostics"],
+            }
+        ]
+    }
+    assert (
+        tmp_path / "summary" / "test_runs.csv"
+    ).read_text(encoding="utf-8").splitlines()[0] == (
+        "dataset,seed,metric,value"
+    )
+    assert (
+        tmp_path / "summary" / "test_summary.csv"
+    ).read_text(encoding="utf-8").splitlines()[0] == (
+        "dataset,metric,count,mean,median"
+    )
 
 
 def test_feature_summary_rejects_neural_test_metrics(tmp_path):

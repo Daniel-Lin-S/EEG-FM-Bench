@@ -277,6 +277,9 @@ class FeatureExtractorTrainer(AbstractTrainer, ABC):
             "test_metrics": test_metrics,
             "completed_at": datetime.datetime.now().isoformat(),
         }
+        diagnostics = self._build_completion_diagnostics(ds_name)
+        if diagnostics:
+            completion["diagnostics"] = diagnostics
         temporary_path = completion_path.with_suffix(".tmp")
         temporary_path.write_text(
             json.dumps(completion, indent=2),

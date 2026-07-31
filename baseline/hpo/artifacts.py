@@ -32,6 +32,7 @@ from baseline.utils.run_artifacts import get_config_hash
 
 
 logger = logging.getLogger("baseline")
+DIAGNOSTIC_NAMESPACES = frozenset({"data", "model", "training"})
 SEED_DIRECTORY_PATTERN = re.compile(r"^seed_(\d+)$")
 ABSOLUTE_PATH_PATTERN = re.compile(r"(?:/[\w.\-]+){2,}")
 VOLATILE_TOKEN_PATTERN = re.compile(
@@ -500,6 +501,11 @@ def _completion_artifact_validation(
     if numeric_count == 0:
         return "test_metrics contains no numeric values", False
 
+    try:
+        validate_completion_diagnostics(completion)
+    except ValueError as exc:
+        return str(exc), False
+
     if completion.get("campaign_hash") not in campaign_identifiers:
         return (
             "campaign identity is not an accepted semantic or legacy ID",
@@ -508,6 +514,56 @@ def _completion_artifact_validation(
     if completion.get("seed") != seed:
         return "seed does not match", True
     return None, True
+
+
+def validate_completion_diagnostics(
+    completion: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Return a validated typed diagnostics envelope from a completion."""
+    diagnostics = completion.get("diagnostics")
+    if diagnostics is None:
+        return {}
+    if not isinstance(diagnostics, Mapping):
+        raise ValueError("completion diagnostics is not a mapping")
+    unknown = set(diagnostics) - DIAGNOSTIC_NAMESPACES
+    if unknown:
+        raise ValueError(
+            "completion diagnostics has unknown namespaces: "
+            f"{sorted(unknown)}"
+        )
+    validated: Dict[str, Any] = {}
+    for namespace in sorted(diagnostics):
+        payload = diagnostics[namespace]
+        if not isinstance(payload, Mapping):
+            raise ValueError(
+                f"completion diagnostics namespace '{namespace}' is not "
+                "a mapping"
+            )
+        if payload:
+            validated[namespace] = dict(payload)
+    return validated
+
+
+def summarize_completion_diagnostics(
+    completions: Iterable[
+        tuple[int, str, Mapping[str, Any]]
+    ],
+) -> Dict[str, Any]:
+    """Aggregate opaque typed diagnostics from completed dataset runs."""
+    runs: list[Dict[str, Any]] = []
+    for seed, dataset_name, completion in completions:
+        details = validate_completion_diagnostics(completion)
+        if not details:
+            continue
+        runs.append({
+            "seed": seed,
+            "dataset": dataset_name,
+            "details": details,
+        })
+    if not runs:
+        return {}
+    runs.sort(key=lambda item: (item["seed"], item["dataset"]))
+    return {"runs": runs}
 
 
 def _compatibility_failure(
@@ -1110,6 +1166,31 @@ def _log_compatibility_problems(
             )
 
 
+def _collect_completion_diagnostics(
+    diagnostics: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> Dict[str, Any]:
+    """Collect opaque typed diagnostics from accepted completions."""
+    completions: list[tuple[int, str, Mapping[str, Any]]] = []
+    for accepted in diagnostics.get("accepted", ()):
+        path_value = accepted.get("path")
+        if not isinstance(path_value, str):
+            continue
+        try:
+            completion = json.loads(
+                Path(path_value).read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError):
+            continue
+        seed = accepted.get("seed")
+        dataset_name = accepted.get("dataset")
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            continue
+        if not isinstance(dataset_name, str) or not dataset_name:
+            continue
+        completions.append((seed, dataset_name, completion))
+    return summarize_completion_diagnostics(completions)
+
+
 def _compact_invocation_status(
     invocation: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -1190,6 +1271,9 @@ def write_campaign_summary(
         "latest_invocation": _compact_invocation_status(invocation),
         "dataset_pairs": pair_status,
     }
+    completion_diagnostics = _collect_completion_diagnostics(diagnostics)
+    if completion_diagnostics:
+        status_payload["diagnostics"] = completion_diagnostics
     if not test_rows:
         logger.warning(
             "No compatible completed seed results exist under %s; previous "
@@ -1313,6 +1397,9 @@ def build_invocation_summary(
         "latest_invocation": _compact_invocation_status(invocation),
         "dataset_pairs": pair_status,
     }
+    completion_diagnostics = _collect_completion_diagnostics(diagnostics)
+    if completion_diagnostics:
+        status_payload["diagnostics"] = completion_diagnostics
     return CampaignSummaryResult(
         status=status_payload,
         test_runs=test_rows,

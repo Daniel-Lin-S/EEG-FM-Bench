@@ -1,6 +1,7 @@
 import sys
 import types
 import unittest
+from unittest import mock
 
 import torch
 
@@ -10,7 +11,9 @@ if "optimi" not in sys.modules:
     optimi.StableAdamW = object
     sys.modules["optimi"] = optimi
 
+import baseline.brainomni.brainomni_adapter as brainomni_adapter_module
 from baseline.brainomni.brainomni_adapter import (
+    BrainOmniDataLoaderFactory,
     BrainOmniDatasetAdapter,
     BrainOmniFilteredDataset,
 )
@@ -46,11 +49,179 @@ class BrainOmniPositionTests(unittest.TestCase):
         torch.testing.assert_close(positions[:, 3:], torch.zeros((2, 3)))
 
     def test_missing_positions_require_rebuild(self):
-        with self.assertRaisesRegex(ValueError, "requires persisted XYZ"):
+        with self.assertRaisesRegex(ValueError, "persisted XYZ"):
             self._adapter()._get_persisted_positions(
                 {"pos": []}, {"montage": "demo/10_20", "chs": []}
             )
 
+    def test_unselected_zero_position_is_ignored(self):
+        result = {"montage": "demo/10_20", "chs": [1, 2]}
+        positions = self._adapter()._get_persisted_positions(
+            {"pos": [[1, 2, 3], [0, 0, 0], [7, 8, 9]]},
+            result,
+        )
+        self.assertEqual(tuple(positions.shape), (2, 6))
+
+    def test_near_zero_signal_std_is_rejected_during_preflight(self):
+        sample = {
+            "montage": "demo/10_20",
+            "data": [[0.0, 0.0], [2.0, 2.0], [1.0e-6, 1.0e-6]],
+            "pos": [[1, 2, 3], [4, 5, 6], [7, 8, 9]],
+        }
+        rejection = self._adapter().get_sample_rejection(sample)
+        self.assertEqual(
+            rejection["code"],
+            "signal_std_below_threshold",
+        )
+
+    def test_nonfinite_signal_is_rejected_during_preflight(self):
+        sample = {
+            "montage": "demo/10_20",
+            "data": [[0.0, float("nan")], [2.0, 2.0], [1.0, 2.0]],
+            "pos": [[1, 2, 3], [4, 5, 6], [7, 8, 9]],
+        }
+
+        rejection = self._adapter().get_sample_rejection(sample)
+
+        self.assertEqual(rejection["code"], "signal_nonfinite")
+
+    def test_malformed_positions_are_rejected_during_preflight(self):
+        sample = {
+            "montage": "demo/10_20",
+            "data": [[0.0, 1.0], [2.0, 2.0], [1.0, 3.0]],
+            "pos": [[1, 2], [4, 5], [7, 8]],
+        }
+
+        rejection = self._adapter().get_sample_rejection(sample)
+
+        self.assertEqual(rejection["code"], "position_shape_invalid")
+
+    def test_degenerate_selected_positions_are_rejected(self):
+        adapter = self._adapter()
+        adapter.normalize_position = True
+        sample = {
+            "montage": "demo/10_20",
+            "data": [[0.0, 1.0], [2.0, 2.0], [1.0, 3.0]],
+            "pos": [[1, 2, 3], [4, 5, 6], [1, 2, 3]],
+        }
+
+        rejection = adapter.get_sample_rejection(sample)
+
+        self.assertEqual(
+            rejection["code"],
+            "position_scale_below_threshold",
+        )
+
+    def test_unexpected_preflight_exception_propagates(self):
+        adapter = self._adapter()
+        with mock.patch.object(
+            adapter,
+            "_select_signal_data",
+            side_effect=RuntimeError("implementation failure"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "implementation failure",
+            ):
+                adapter.get_sample_rejection({})
+
+    def test_filter_diagnostics_and_warning_are_stable_by_split(self):
+        adapter = self._adapter()
+        factory = BrainOmniDataLoaderFactory(num_workers=0)
+        valid_sample = {
+            "montage": "demo/10_20",
+            "data": [[0.0, 1.0], [2.0, 2.0], [1.0, 3.0]],
+            "pos": [[1, 2, 3], [4, 5, 6], [7, 8, 9]],
+        }
+        invalid_sample = {
+            **valid_sample,
+            "data": [[0.0, 0.0], [2.0, 2.0], [0.0, 0.0]],
+        }
+        warning_key = ("demo", "train")
+        brainomni_adapter_module._WARNED_SAMPLE_FILTER_SPLITS.discard(
+            warning_key
+        )
+
+        with self.assertLogs("baseline", level="WARNING") as captured:
+            first = factory._filter_invalid_samples(
+                [valid_sample, invalid_sample],
+                adapter,
+                "train",
+                ["demo"],
+            )
+            second = factory._filter_invalid_samples(
+                [valid_sample, invalid_sample],
+                adapter,
+                "train",
+                ["demo"],
+            )
+
+        self.assertEqual(len(first), 1)
+        self.assertEqual(len(second), 1)
+        self.assertEqual(len(captured.output), 1)
+        self.assertEqual(
+            factory.get_data_diagnostics("demo"),
+            {
+                "sample_filtering": {
+                    "skipped_samples": 1,
+                    "by_split": [
+                        {
+                            "split": "train",
+                            "total_samples": 2,
+                            "retained_samples": 1,
+                            "skipped_samples": 1,
+                            "reasons": [
+                                {
+                                    "code": (
+                                        "signal_std_below_threshold"
+                                    ),
+                                    "message": (
+                                        "centered signal standard "
+                                        "deviation is below 1e-05"
+                                    ),
+                                    "count": 1,
+                                }
+                            ],
+                        }
+                    ],
+                }
+            },
+        )
+
+    def test_filter_rejects_a_dataset_with_no_eligible_samples(self):
+        adapter = self._adapter()
+        factory = BrainOmniDataLoaderFactory(num_workers=0)
+        invalid_sample = {
+            "montage": "demo/10_20",
+            "data": [[0.0, 0.0], [2.0, 2.0], [0.0, 0.0]],
+            "pos": [[1, 2, 3], [4, 5, 6], [7, 8, 9]],
+        }
+        warning_key = ("demo", "validation")
+        brainomni_adapter_module._WARNED_SAMPLE_FILTER_SPLITS.discard(
+            warning_key
+        )
+
+        with mock.patch.object(
+            brainomni_adapter_module,
+            "get_is_master",
+            return_value=False,
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "no eligible samples remain",
+            ):
+                factory._filter_invalid_samples(
+                    [invalid_sample],
+                    adapter,
+                    "validation",
+                    ["demo"],
+                )
+
+        diagnostics = factory.get_data_diagnostics("demo")
+        split_details = diagnostics["sample_filtering"]["by_split"][0]
+        self.assertEqual(split_details["total_samples"], 1)
+        self.assertEqual(split_details["retained_samples"], 0)
+        self.assertEqual(split_details["skipped_samples"], 1)
 
     def test_filtered_dataset_preserves_column_names(self):
         class DatasetWithColumns:
@@ -65,29 +236,6 @@ class BrainOmniPositionTests(unittest.TestCase):
         )
         self.assertEqual(filtered_dataset.column_names, ["montage", "data"])
         self.assertEqual(filtered_dataset["montage"], ["demo/10_20"])
-
-    def test_zero_cross_channel_variation_is_identified(self):
-        cross_channel_std = self._adapter().get_cross_channel_std(
-            {
-                "data": torch.tensor(
-                    [[2.0, 4.0], [1.0, 3.0], [2.0, 4.0]]
-                ),
-                "montage": "demo/10_20",
-            }
-        )
-        self.assertEqual(cross_channel_std.item(), 0.0)
-
-    def test_nonzero_cross_channel_variation_is_retained(self):
-        cross_channel_std = self._adapter().get_cross_channel_std(
-            {
-                "data": torch.tensor(
-                    [[2.0, 4.0], [1.0, 3.0], [5.0, 6.0]]
-                ),
-                "montage": "demo/10_20",
-            }
-        )
-        self.assertGreater(cross_channel_std.item(), 0.0)
-
 
 if __name__ == "__main__":
     unittest.main()

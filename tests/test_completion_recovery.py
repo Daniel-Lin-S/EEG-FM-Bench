@@ -77,6 +77,7 @@ def _write_completion(
     metric: float = 0.75,
     config_identity: str | None = None,
     invocation_id: str | None = None,
+    diagnostics: dict | None = None,
 ) -> Path:
     """Write one completion and its required checkpoint artifact."""
     path = _completion_path(root, config_identity)
@@ -96,6 +97,8 @@ def _write_completion(
     }
     if invocation_id is not None:
         content["invocation_id"] = invocation_id
+    if diagnostics is not None:
+        content["diagnostics"] = diagnostics
     path.write_text(json.dumps(content), encoding="utf-8")
     return path
 
@@ -128,6 +131,29 @@ def test_exact_canonical_completion_is_compatible(tmp_path: Path) -> None:
 
     assert result.compatible is True
     assert result.mode == "exact_canonical_hash"
+
+
+def test_completion_rejects_unknown_diagnostic_namespace(
+    tmp_path: Path,
+) -> None:
+    """Shared validation checks only the typed diagnostics envelope."""
+    selected = _selected_config()
+    config_hash = get_config_hash(selected, multitask=False)
+    path = _write_completion(
+        tmp_path,
+        config_hash,
+        diagnostics={"model_specific_name": {"count": 1}},
+    )
+
+    result = check_completion_compatibility(
+        path,
+        CAMPAIGN_HASH,
+        SEED,
+        selected,
+    )
+
+    assert result.compatible is False
+    assert "unknown namespaces" in result.reason
 
 
 def test_short_campaign_alias_requires_full_semantic_config(
@@ -372,6 +398,56 @@ def test_artifact_summary_includes_every_valid_direct_completion(
     assert "compatibility" not in persisted
     assert "test_runs" not in persisted
     assert "compatibility rejected" not in caplog.text
+
+
+def test_artifact_summary_aggregates_opaque_typed_diagnostics(
+    tmp_path: Path,
+) -> None:
+    """Neural summaries preserve provider-owned diagnostic details."""
+    selected = _selected_config()
+    config_hash = _save_legacy_config(tmp_path, selected)
+    completion_diagnostics = {
+        "data": {
+            "arbitrary_provider_key": {
+                "count": 3,
+                "labels": ["one", "two"],
+            }
+        },
+        "model": {"temperature": 0.25},
+        "training": {"schedule": {"warmup_steps": 5}},
+    }
+    _write_completion(
+        tmp_path,
+        config_hash,
+        diagnostics=completion_diagnostics,
+    )
+    paths = CampaignPaths(tmp_path, tmp_path / "checkpoints")
+
+    summary = write_campaign_summary(
+        paths,
+        CAMPAIGN_HASH,
+        {"id": "invocation", "attempted": [SEED]},
+    )
+
+    assert summary.status["diagnostics"] == {
+        "runs": [
+            {
+                "seed": SEED,
+                "dataset": DATASET_NAME,
+                "details": completion_diagnostics,
+            }
+        ]
+    }
+    assert (
+        paths.summary_root / "test_runs.csv"
+    ).read_text(encoding="utf-8").splitlines()[0] == (
+        "dataset,seed,metric,value"
+    )
+    assert (
+        paths.summary_root / "test_summary.csv"
+    ).read_text(encoding="utf-8").splitlines()[0] == (
+        "dataset,metric,count,mean,median"
+    )
 
 
 def test_zero_row_summary_preserves_previous_without_report(

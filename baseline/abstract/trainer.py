@@ -801,6 +801,104 @@ class AbstractTrainer(ABC):
             })
         self.csv_file.flush()
 
+    def get_data_diagnostics(
+        self,
+        ds_name: str,
+    ) -> Mapping[str, Any]:
+        """Return data-pipeline diagnostics for one dataset completion.
+
+        Parameters
+        ----------
+        ds_name : str
+            Completed dataset name.
+
+        Returns
+        -------
+        Mapping[str, Any]
+            Provider-owned data diagnostics.
+        """
+        if self.dataloader_factory is None:
+            return {}
+        return self.dataloader_factory.get_data_diagnostics(ds_name)
+
+    def get_model_diagnostics(
+        self,
+        ds_name: str,
+    ) -> Mapping[str, Any]:
+        """Return model diagnostics for one dataset completion.
+
+        Parameters
+        ----------
+        ds_name : str
+            Completed dataset name.
+
+        Returns
+        -------
+        Mapping[str, Any]
+            Provider-owned model diagnostics. The default is empty.
+        """
+        del ds_name
+        return {}
+
+    def get_training_diagnostics(
+        self,
+        ds_name: str,
+    ) -> Mapping[str, Any]:
+        """Return training-scheme diagnostics for one completion.
+
+        Parameters
+        ----------
+        ds_name : str
+            Completed dataset name.
+
+        Returns
+        -------
+        Mapping[str, Any]
+            Provider-owned training diagnostics. The default is empty.
+        """
+        del ds_name
+        return {}
+
+    def _build_completion_diagnostics(
+        self,
+        ds_name: str,
+    ) -> Dict[str, Any]:
+        """Build validated typed diagnostics for one completion artifact.
+
+        Parameters
+        ----------
+        ds_name : str
+            Completed dataset name.
+
+        Returns
+        -------
+        Dict[str, Any]
+            Non-empty data, model, and training namespaces.
+        """
+        providers = {
+            "data": self.get_data_diagnostics,
+            "model": self.get_model_diagnostics,
+            "training": self.get_training_diagnostics,
+        }
+        diagnostics: Dict[str, Any] = {}
+        for namespace, provider in providers.items():
+            payload = provider(ds_name)
+            if not isinstance(payload, Mapping):
+                raise TypeError(
+                    f"{namespace} diagnostics for {ds_name} must be a "
+                    f"mapping, but got {type(payload).__name__}."
+                )
+            if payload:
+                diagnostics[namespace] = dict(payload)
+        try:
+            json.dumps(diagnostics, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Completion diagnostics for {ds_name} must contain only "
+                "finite JSON-serializable values."
+            ) from exc
+        return diagnostics
+
     def _write_completion(self, ds_name: str, ds_config: str) -> None:
         """Atomically persist final metadata after successful training."""
         checkpoint_path = self.final_checkpoint_paths.get(ds_name)
@@ -847,6 +945,9 @@ class AbstractTrainer(ABC):
                 'accumulation_steps': self.accumulation_steps,
             },
         }
+        diagnostics = self._build_completion_diagnostics(ds_name)
+        if diagnostics:
+            content["diagnostics"] = diagnostics
         temporary_path = completion_path.with_suffix('.tmp')
         temporary_path.write_text(json.dumps(content, indent=2),
                                   encoding='utf-8')

@@ -14,7 +14,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
-from baseline.hpo.artifacts import summarize_test_rows
+from baseline.hpo.artifacts import (
+    summarize_completion_diagnostics,
+    summarize_test_rows,
+    validate_completion_diagnostics,
+)
 from baseline.utils.identity import IDENTITY_VERSION
 
 
@@ -51,7 +55,12 @@ def write_feature_extractor_summary(
         If a completion is missing, inconsistent, empty, non-numeric, or
         contains a non-finite or neural-only test metric.
     """
-    rows = _collect_test_rows(log_dir, model_type, seed, datasets)
+    rows, completions = _collect_test_rows(
+        log_dir,
+        model_type,
+        seed,
+        datasets,
+    )
     summary_rows = summarize_test_rows(rows)
     if any("std" in row for row in summary_rows):
         raise ValueError(
@@ -65,25 +74,26 @@ def write_feature_extractor_summary(
         TEST_SUMMARY_FIELDS,
         summary_rows,
     )
-    _write_json(
-        summary_dir / "summary.json",
-        {
-            "campaign_identity_version": IDENTITY_VERSION,
-            "campaign_identity": config_identity,
-            "status": "complete",
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-            "latest_invocation": {
-                "requested": [seed],
-                "succeeded": [seed],
-            },
-            "dataset_pairs": {
-                "expected": len(datasets),
-                "completed": len(datasets),
-                "missing": 0,
-                "rejected": 0,
-            },
+    status = {
+        "campaign_identity_version": IDENTITY_VERSION,
+        "campaign_identity": config_identity,
+        "status": "complete",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "latest_invocation": {
+            "requested": [seed],
+            "succeeded": [seed],
         },
-    )
+        "dataset_pairs": {
+            "expected": len(datasets),
+            "completed": len(datasets),
+            "missing": 0,
+            "rejected": 0,
+        },
+    }
+    diagnostics = summarize_completion_diagnostics(completions)
+    if diagnostics:
+        status["diagnostics"] = diagnostics
+    _write_json(summary_dir / "summary.json", status)
 
 
 def _collect_test_rows(
@@ -91,9 +101,13 @@ def _collect_test_rows(
     model_type: str,
     seed: int,
     datasets: Mapping[str, str],
-) -> list[dict[str, Any]]:
+) -> tuple[
+    list[dict[str, Any]],
+    list[tuple[int, str, Mapping[str, Any]]],
+]:
     """Collect validated test-metric rows from every dataset completion."""
     rows: list[dict[str, Any]] = []
+    completions: list[tuple[int, str, Mapping[str, Any]]] = []
     for dataset_name, dataset_config in datasets.items():
         completion_path = (
             log_dir / "datasets" / dataset_name / "completion.json"
@@ -106,11 +120,12 @@ def _collect_test_rows(
             dataset_config,
             model_type,
         )
+        completions.append((seed, dataset_name, completion))
         metrics = completion["test_metrics"]
         rows.extend(
             _metric_rows(metrics, dataset_name, seed, completion_path)
         )
-    return rows
+    return rows, completions
 
 
 def _read_completion(completion_path: Path) -> Mapping[str, Any]:
@@ -171,6 +186,7 @@ def _validate_completion(
             f"Expected null checkpoint_path for feature extractor "
             f"{dataset_name} at {completion_path.resolve()}."
         )
+    validate_completion_diagnostics(completion)
     metrics = completion.get("test_metrics")
     if not isinstance(metrics, dict) or not metrics:
         raise ValueError(
