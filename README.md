@@ -298,19 +298,11 @@ training:
 
 The memory reserve is 15 percent of each GPU's total capacity. It limits the
 training process while accounting for other device users; it does not require
-85 percent of the GPU to be free before a run starts. A disposable
-micro-batch-one update measures activation, workspace, DDP, and allocator
-overhead alongside the analytical fixed-state estimate. The largest predicted
-safe exact divisor is selected across all ranks, and the measured model is
-cached within the invocation. Current external occupancy is still recalculated
-for every run. A recoverable CUDA OOM rebuilds the trainer with the next
-smaller exact divisor. If micro-batch one fails, the runtime releases CUDA
-state, waits once for the configured interval, and retries once.
+85 percent of the GPU to be free before a run starts. 
 
 Every neural run writes `adaptive_batching.json` with the requested global
 batch, selected micro-batch, accumulation steps, allocator limit, analytical
-fixed-memory estimate, measured CUDA peak, and retry count. Deterministic
-feature-extractor baselines do not use adaptive CUDA batching.
+fixed-memory estimate, measured CUDA peak, and retry count.
 
 ##### Campaign logging verbosity
 
@@ -321,10 +313,11 @@ logging:
   level: info  # debug, info, warning, or error; case-insensitive
 ```
 
-`info` is the default. It reports campaign, HPO, seed, and dataset lifecycle milestones; absolute artifact locations; reused or newly selected HPO winners; and final dataset summaries. Optimizer steps, epoch validation details, adaptive calibration, model and loader setup, checkpoint chatter, and individual HPO trial progress require `debug`. CSV, TensorBoard, and cloud metrics are recorded regardless of this console level.
+`info` is the default. It reports campaign, HPO, seed, and dataset lifecycle milestones; absolute artifact locations; reused or newly selected HPO winners; and final dataset summaries. 
 
-At normal verbosity, Optuna's per-trial console messages are suppressed and HPO trial directories do not contain text logs. Structured trial JSON, validation CSV, and SQLite study state remain available. Existing terminal progress bars are unchanged and wrapper logs continue to omit carriage-return redraws. Changing `logging.level` does not change campaign, HPO, or resolved training identities.
+`debug`: display optimizer steps, epoch validation details, adaptive calibration, model and loader setup, checkpoint chatter, and individual HPO trial progress require `debug`.
 
+Changing `logging.level` does not change campaign, HPO, or resolved training identities.
 
 ##### Hyperparameter optimization
 
@@ -385,21 +378,7 @@ Float, integer, and categorical distributions are supported at dotted configurat
 python baseline_main.py conf_file=<local-config>.local.yaml model_type=brainomni hpo.n_trials=100
 ```
 
-Optuna studies use SQLite and resume automatically. `n_trials` counts complete
-and pruned trials; failed trials remain in SQLite for diagnostics but do not
-consume the budget. A complete or pruned trial resets the failure streak, and
-five consecutive terminal failures abort an invalid study. HPO creates
-validation loaders only, reports its objective each epoch, and allows the
-median pruner to stop weak trials. MiniROCKET and catch22 ignore HPO with a
-warning.
-
-The HPO identity excludes `hpo.n_trials` and `hpo.max_consecutive_failed_trials`,
-allowing either operational limit to be changed while resuming an existing
-study.
-
-When a resumed study already has at least `n_trials` complete-or-pruned trials, it constructs no trainer and performs no adaptive calibration. The winner is loaded from SQLite and validated. Increasing `n_trials` runs only the missing budget.
-
-Every HPO scope has a full semantic study identity. New SQLite, trial, checkpoint, and winner artifacts are namespaced by that identity, and an exclusive per-study lock prevents concurrent writers from corrupting one study. Different campaign or dataset scopes may still run concurrently.
+Optuna studies use SQLite and resume automatically. Campaign structure:
 
 ```text
 <campaign>/
@@ -416,9 +395,7 @@ Every HPO scope has a full semantic study identity. New SQLite, trial, checkpoin
             └── trials/trial_<number>/
 ```
 
-Each trial directory contains its resolved configuration, decoded parameters, objective history, status, and epoch-level validation CSV. Trial checkpoints are temporary and are removed after every complete, pruned, or failed trial.
-
-Legacy shared SQLite studies are inspected using the canonical campaign configuration, exact persisted Optuna distributions and decoded parameter metadata, objective direction, and completed budget. A directory suffix or study-name hash is never sufficient. A unique completed study is reused in place. Incomplete duplicate studies are reported and preserved, while all newly written trial and winner files use the namespaced layout.
+Trial checkpoints are temporary and are removed after every complete, pruned, or failed trial.
 
 ##### Multi-seed training and aggregation
 
@@ -434,9 +411,7 @@ The seed list can also be overridden from either the local or SLURM command inte
 python baseline_main.py conf_file=<local-config>.local.yaml model_type=brainomni seeds=[42,43,44]
 ```
 
-The default is `seeds: [42]` (single-seed).
-
-The campaign identity excludes the seed list, so later invocations can add compatible seeds to the same result collection:
+The campaign directory tree::
 
 ```text
 <campaign>/
@@ -454,13 +429,9 @@ The campaign identity excludes the seed list, so later invocations can add compa
     └── summary.json
 ```
 
-Each requested seed and dataset is protected by a nonblocking execution lock. Compatible finite `completion.json` metadata at the ordinary path is authoritative and is skipped without requiring a checkpoint. Missing, malformed, invalid-status, or non-finite completions restart at epoch zero after their partial CSV, TensorBoard, and checkpoint artifacts are reset.
-
-Legacy `configurations/` namespaces are preserved but ignored. Execution, completion discovery, and aggregation use only the ordinary `logs/seed_<seed>/` paths.
-
 ##### Campaign identity and invocation records
 
-Campaign identity is derived from a versioned, type-preserving semantic configuration and compared using the full SHA-256 digest. The short suffix in a directory name is only a display label. `conf_file`, `master_port`, `seeds`, all `logging` fields, `hpo.n_trials`, and `hpo.max_consecutive_failed_trials` are invocation settings and do not change campaign identity. Fixed numerical, data, model, training, objective, sampler, pruner, and search-space values remain semantic.
+Campaign identity is derived from a versioned, type-preserving semantic configuration and compared using the full SHA-256 digest. The short suffix in a directory name is only a display label. `conf_file`, `master_port`, `seeds`, all `logging` fields, `hpo.n_trials`, and `hpo.max_consecutive_failed_trials` are invocation settings and do not change campaign identity.
 
 `campaign.yaml` files contain semantic parameters only. Complete resolved invocation parameters and lifecycle status are kept separately:
 
@@ -479,25 +450,6 @@ Use the audit command to resolve identities, inspect legacy or duplicate studies
 ```bash
 python baseline_main.py audit-campaign conf_file=<local-config>.local.yaml
 ```
-
-##### Checkpoint retention
-
-Final-training checkpoint retention is controlled independently from HPO and seed selection:
-
-```yaml
-logging:
-  save_checkpoints: false
-```
-
-The default is `false`. Neural pipelines still create a temporary validation-best checkpoint, reload it for the single final test evaluation, write terminal completion metadata, and then remove best, periodic, and LoRA companion checkpoints for that dataset or multitask scope. A completed run records `has_checkpoint: false`, `checkpoint_path: null`, and does not emit a missing-checkpoint warning on later reuse.
-
-With `save_checkpoints: true`, only the single loadable validation-best checkpoint is retained. Periodic, superseded, and LoRA companion checkpoints are removed after completion. Cleanup failures are warnings recorded in the invocation status; they do not invalidate completion or trigger retraining.
-
-Incomplete runs do not use resume checkpoints. They restart from epoch zero and overwrite their partial metric artifacts.
-
-##### Completion replacement after HPO budget growth
-
-A completed result is replaced only when immutable provenance proves that the same semantic HPO study reached a strictly larger effective budget and selected different parameters. The old completed artifacts are archived under the current invocation before replacement. If replacement fails, new partial artifacts are removed and the archived completion is restored to the ordinary paths. Incomplete results are overwritten directly and are never archived.
 
 #### Step 3: Analysis & Visualization
 
