@@ -207,9 +207,9 @@ Then set one writable output root and, optionally, exact scan roots for individu
 datasets in `data_paths.local.yaml`:
 
 ```yaml
-output_root: /data/eeg-fm-bench
+output_root: data/eeg-fm-bench
 raw_roots:
-  adftd: /data/neural_data/datasets/adftd
+  adftd: data/neural_data/datasets/adftd
 ```
 
 A `raw_roots` value is the final directory scanned by that dataset: the framework

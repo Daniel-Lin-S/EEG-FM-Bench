@@ -1,16 +1,15 @@
-# parameters for the pre-trained versions of BrainOmni
-# (a multitask foundation model for EEG and MEG)
+# Fine-tune randomly initialized BrainOmni with the Things-EEG base160 shape.
 
 # Basic configuration
 seeds: [42]
-master_port: 51901
-multitask: false   # set to true to fine-tune with training samples from all datasets.
+master_port: 51906
+multitask: false
 model_type: brainomni
 fs: 256
 
 # Data configuration
 data:
-  batch_size: 64
+  batch_size: 128
   num_workers: 1
   datasets:
     tuab: finetune
@@ -20,20 +19,41 @@ data:
 
 # Model configuration
 model:
-  # Directory containing model_cfg.json and BrainOmni.pt
-  pretrained_path: /path/to/brainomni/checkpoint
+  # Null invokes random initialization using the architecture below.
+  pretrained_path: null
 
   normalize_input: true
   normalize_position: true
 
   freeze_tokenizer: false
 
-  # add architecture-related parameters as well if the
-  # architecture is different from the public pre-trained version of BrainOmni
+  # Match the Things-EEG scratch base160 checkpoint architecture.
+  window_length: 512
+  n_filters: 32
+  ratios: [8, 4, 2]
+  kernel_size: 5
+  last_kernel_size: 5
+  n_dim: 256
+  n_head: 4
+  n_neuro: 16
+  dropout: 0.0
+  codebook_dim: 256
+  codebook_size: 512
+  num_quantizers: 4
+  rotation_trick: true
+  quantize_optimize_method: ema
+  overlap_ratio: 0.25
+  lm_dim: 512
+  lm_head: 16
+  lm_depth: 12
+  lm_dropout: 0.1
+  mask_ratio: 0.5
+  num_quantizers_used: 4
 
   # Classifier head configuration
   classifier_head:
-    head_type: avg_pool # options: avg_pool, attention_pool, dual_stream_fusion, flatten_mlp, flatten_linear
+    # Options: avg_pool, attention_pool, dual_stream_fusion, flatten_mlp,
+    # flatten_linear
 
     hidden_dims: [128]
     dropout: 0.3
@@ -84,21 +104,23 @@ training:
 # Logging configuration
 logging:
   level: info
-  experiment_name: brainomni-base
+  experiment_name: brainomni-random-base160_ft-full
 
-  ckpt_interval: 10
+  ckpt_interval: 31
+  run_dir: assets/run
   save_checkpoints: false
 
-  # local logging
-  run_dir: assets/run
+  # Local traces: choose any of csv, log, and tensorboard.
+  outputs: [csv]
 
   # cloud logging
-  use_cloud: true
-  cloud_backend: wandb
+  use_cloud: false
   offline: false
 
   tags:
     - brainomni
+    - random_init
+    - base
     - avg_pool
     - full
 
@@ -106,7 +128,7 @@ logging:
 hpo:
   enabled: true
   seed: 0
-  n_trials: 50
+  n_trials: 30
   max_consecutive_failed_trials: 5
 
   objective:
@@ -118,7 +140,7 @@ hpo:
   sampler:
     type: tpe
     seed: 0
-    n_startup_trials: 10
+    n_startup_trials: 5
 
   pruner:
     type: median
@@ -141,14 +163,14 @@ hpo:
 
     training.encoder_lr_scale:
       distribution: float
-      low: 0.05
+      low: 0.5
       high: 1.0
       log: false
 
     model.classifier_head.hidden_dims:
       distribution: categorical
       choices:
+        - [32]
         - [64]
         - [128]
         - [256]
-        - [256, 128]
