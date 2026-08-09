@@ -188,6 +188,51 @@ class BrainOmniPositionTests(unittest.TestCase):
             },
         )
 
+    def test_filter_cache_reuses_fingerprinted_preflight_indices(self):
+        class FingerprintedSamples(list):
+            _fingerprint = "stable-fingerprint"
+
+        adapter = self._adapter()
+        factory = BrainOmniDataLoaderFactory(num_workers=0)
+        samples = FingerprintedSamples([
+            {
+                "montage": "demo/10_20",
+                "data": [[0.0, 1.0], [2.0, 2.0], [1.0, 3.0]],
+                "pos": [[1, 2, 3], [4, 5, 6], [7, 8, 9]],
+            }
+        ])
+        brainomni_adapter_module._ELIGIBILITY_INDEX_CACHE.clear()
+        with mock.patch.object(
+            adapter,
+            "get_sample_rejection",
+            wraps=adapter.get_sample_rejection,
+        ) as rejection:
+            first = factory._filter_invalid_samples(
+                samples,
+                adapter,
+                "validation",
+                ["demo"],
+                ["finetune"],
+            )
+            second = factory._filter_invalid_samples(
+                samples,
+                adapter,
+                "validation",
+                ["demo"],
+                ["finetune"],
+            )
+            factory._filter_invalid_samples(
+                samples,
+                adapter,
+                "validation",
+                ["demo"],
+                ["pretrain"],
+            )
+
+        self.assertEqual(len(first), len(second))
+        self.assertEqual(rejection.call_count, 2)
+        brainomni_adapter_module._ELIGIBILITY_INDEX_CACHE.clear()
+
     def test_filter_rejects_a_dataset_with_no_eligible_samples(self):
         adapter = self._adapter()
         factory = BrainOmniDataLoaderFactory(num_workers=0)

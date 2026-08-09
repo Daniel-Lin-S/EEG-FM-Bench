@@ -4,6 +4,7 @@ Abstract trainer base class for baseline models.
 import csv
 import json
 import shutil
+import time
 from contextlib import nullcontext
 import datetime
 import os
@@ -172,6 +173,8 @@ class AbstractTrainer(ABC):
         self.final_test_metrics: Dict[str, Dict[str, float]] = {}
         self.final_validation_metrics: Dict[str, Dict[str, float]] = {}
         self.latest_eval_counts: Dict[str, int] = {}
+        self._loader_build_seconds: Dict[str, float] = {}
+        self._evaluation_timings: Dict[str, Dict[str, float]] = {}
         self.run_mode = "legacy"
         self.campaign_hash: Optional[str] = None
         self.selection_provenance: Optional[Mapping[str, Any]] = None
@@ -429,8 +432,12 @@ class AbstractTrainer(ABC):
         dict[str, Any]
             New batch mapping whose tensor values reside on ``self.device``.
         """
+        non_blocking = bool(
+            self.cfg.data.pin_memory
+            and getattr(self.device, "type", None) == "cuda"
+        )
         return {
-            key: value.to(self.device)
+            key: value.to(self.device, non_blocking=non_blocking)
             if isinstance(value, torch.Tensor)
             else value
             for key, value in batch.items()
@@ -859,6 +866,70 @@ class AbstractTrainer(ABC):
         del ds_name
         return {}
 
+    def _record_loader_build_seconds(
+        self,
+        split: datasets.NamedSplit,
+        elapsed_seconds: float,
+    ) -> None:
+        """Accumulate one successful data-loader construction duration."""
+        if not math.isfinite(elapsed_seconds) or elapsed_seconds < 0.0:
+            raise ValueError(
+                "Loader build duration must be finite and non-negative."
+            )
+        split_name = str(split)
+        self._loader_build_seconds[split_name] = (
+            self._loader_build_seconds.get(split_name, 0.0)
+            + elapsed_seconds
+        )
+
+    def _record_evaluation_seconds(
+        self,
+        prefix: str,
+        elapsed_seconds: float,
+    ) -> None:
+        """Accumulate one successful complete evaluation-pass duration."""
+        if not math.isfinite(elapsed_seconds) or elapsed_seconds < 0.0:
+            raise ValueError(
+                "Evaluation duration must be finite and non-negative."
+            )
+        split_name = "validation" if prefix == "eval" else prefix
+        timing = self._evaluation_timings.setdefault(
+            split_name,
+            {"passes": 0.0, "total_seconds": 0.0, "latest_seconds": 0.0},
+        )
+        timing["passes"] += 1.0
+        timing["total_seconds"] += elapsed_seconds
+        timing["latest_seconds"] = elapsed_seconds
+
+    def get_performance_diagnostics(self) -> Dict[str, Any]:
+        """Return finite loader and end-to-end evaluation timing summaries."""
+        evaluations: Dict[str, Dict[str, Union[int, float]]] = {}
+        for split_name, timing in sorted(self._evaluation_timings.items()):
+            passes = int(timing["passes"])
+            total_seconds = float(timing["total_seconds"])
+            if passes <= 0 or not math.isfinite(total_seconds):
+                raise ValueError(
+                    "Evaluation timing must have positive passes and finite "
+                    "total seconds."
+                )
+            evaluations[split_name] = {
+                "passes": passes,
+                "total_seconds": total_seconds,
+                "mean_seconds": total_seconds / passes,
+                "latest_seconds": float(timing["latest_seconds"]),
+            }
+        loader_seconds = {
+            split_name: float(seconds)
+            for split_name, seconds in sorted(
+                self._loader_build_seconds.items()
+            )
+        }
+        return {
+            "scope": "unified" if self.multitask else "dataset",
+            "loader_build_seconds": loader_seconds,
+            "evaluation": evaluations,
+        }
+
     def _build_completion_diagnostics(
         self,
         ds_name: str,
@@ -890,6 +961,7 @@ class AbstractTrainer(ABC):
                 )
             if payload:
                 diagnostics[namespace] = dict(payload)
+        diagnostics["performance"] = self.get_performance_diagnostics()
         try:
             json.dumps(diagnostics, allow_nan=False)
         except (TypeError, ValueError) as exc:
@@ -1426,6 +1498,7 @@ class AbstractTrainer(ABC):
 
     def create_dataloader(self, split: datasets.NamedSplit = datasets.Split.TRAIN):
         logger.debug("Creating main training dataloader...")
+        start_time = time.perf_counter()
         mixed = (split == datasets.Split.TRAIN and self.cfg.multitask)
 
         dataloaders, samplers = self.dataloader_factory.create_dataloader(
@@ -1436,11 +1509,16 @@ class AbstractTrainer(ABC):
             rank=self.local_rank,
             split=split,
         )
+        self._record_loader_build_seconds(
+            split,
+            time.perf_counter() - start_time,
+        )
 
         return dataloaders, samplers
 
     def create_single_dataloader(self, ds_name: str, ds_config: str, split: datasets.NamedSplit = datasets.Split.TRAIN):
         logger.debug("Creating single main training dataloader...")
+        start_time = time.perf_counter()
 
         dataloader, sampler = self.dataloader_factory.create_dataloader(
             datasets_config={ds_name: ds_config},
@@ -1453,6 +1531,10 @@ class AbstractTrainer(ABC):
 
         dataloader = dataloader[0]
         sampler = sampler[0]
+        self._record_loader_build_seconds(
+            split,
+            time.perf_counter() - start_time,
+        )
 
         return dataloader, sampler
 
@@ -1708,7 +1790,7 @@ class AbstractTrainer(ABC):
         self.model.train()
         self.optimizer.zero_grad()
 
-        batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+        batch = self._move_batch_to_device(batch)
         labels = batch['label']
 
         logits, loss = self.train_step(batch, labels)
@@ -1975,7 +2057,7 @@ class AbstractTrainer(ABC):
         self.model.train()
         self.optimizer.zero_grad()
 
-        batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+        batch = self._move_batch_to_device(batch)
 
         loss, reconstructed, mask = self.pretrain_step_for_analysis(batch, mask_ratio, mask_strategy)
 
@@ -2201,6 +2283,7 @@ class AbstractTrainer(ABC):
 
     def eval_epoch(self, dataloaders: list[DataLoader], prefix: str):
         """Evaluate one epoch and return metrics."""
+        start_time = time.perf_counter()
         is_dist = torch.distributed.is_available() and torch.distributed.is_initialized()
         if get_is_master():
             logger.debug("Starting %s evaluation.", prefix)
@@ -2223,7 +2306,7 @@ class AbstractTrainer(ABC):
         with torch.no_grad():
             for dataloader in dataloaders:
                 for batch in dataloader:
-                    batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                    batch = self._move_batch_to_device(batch)
                     labels = batch['label']
                     ds_name = batch['montage'][0].split('/')[0]
                     n_class = self.ds_info[ds_name]['n_class']
@@ -2302,6 +2385,10 @@ class AbstractTrainer(ABC):
 
             if is_dist:
                 torch.distributed.barrier()
+            self._record_evaluation_seconds(
+                prefix,
+                time.perf_counter() - start_time,
+            )
 
             return metric_results
 
@@ -2695,6 +2782,7 @@ class AbstractTrainer(ABC):
                 result = self.run_unified_training()
             else:
                 result = self.run_separate_training()
+            result["performance"] = self.get_performance_diagnostics()
             self.training_result = result
             return result
         finally:

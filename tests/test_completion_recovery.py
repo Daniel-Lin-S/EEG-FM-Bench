@@ -31,8 +31,11 @@ from baseline.hpo.orchestrator import (
     _restore_completed_scope,
     _scope_artifact_roots,
 )
-from baseline.utils.run_artifacts import get_config_hash
-from baseline.utils.run_artifacts import save_resolved_config
+from baseline.utils.run_artifacts import (
+    get_config_hash,
+    save_resolved_config,
+)
+from baseline.utils.identity import get_legacy_run_hash
 
 
 DATASET_NAME = "adftd"
@@ -285,6 +288,29 @@ def test_legacy_runtime_batch_is_recovered_read_only(
     assert result.compatible is True
     assert result.mode == "legacy_runtime_batch_compatible"
     assert path.read_text(encoding="utf-8") == original_completion
+
+
+def test_legacy_completion_accepts_loader_only_settings(
+    tmp_path: Path,
+) -> None:
+    """Loader-only settings recover a historical per-seed completion."""
+    selected = _selected_config()
+    selected["data"]["num_workers"] = 8
+    selected["data"]["pin_memory"] = True
+    saved = copy.deepcopy(selected)
+    saved["data"]["num_workers"] = 1
+    saved["data"]["pin_memory"] = False
+    _save_legacy_config(tmp_path, saved)
+    stored_hash = get_legacy_run_hash(saved, multitask=False)
+    path = _write_completion(tmp_path, stored_hash)
+    result = check_completion_compatibility(
+        path,
+        CAMPAIGN_HASH,
+        SEED,
+        selected,
+    )
+    assert result.compatible is True
+    assert result.mode == "legacy_semantic_compatible"
 
 
 def test_legacy_recovery_rejects_semantic_or_invalid_batch_changes(

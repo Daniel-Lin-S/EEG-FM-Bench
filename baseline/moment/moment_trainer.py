@@ -148,6 +148,7 @@ class MomentTrainer(AbstractTrainer):
         self.dataloader_factory = MomentDataLoaderFactory(
             batch_size=self.cfg.data.batch_size,
             num_workers=self.cfg.data.num_workers,
+            pin_memory=self.cfg.data.pin_memory,
             seed=self.cfg.seed,
             target_seq_len=self.cfg.data.target_seq_len,
         )

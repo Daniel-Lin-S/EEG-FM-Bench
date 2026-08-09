@@ -99,6 +99,7 @@ class CSBrainTrainer(AbstractTrainer):
         self.dataloader_factory = CSBrainDataLoaderFactory(
             batch_size=self.cfg.data.batch_size,
             num_workers=self.cfg.data.num_workers,
+            pin_memory=self.cfg.data.pin_memory,
             seed=self.cfg.seed,
             patch_size=self.cfg.data.patch_size,
             max_seq_len=self.cfg.data.max_seq_len,  # None for dynamic length

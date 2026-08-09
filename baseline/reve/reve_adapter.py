@@ -64,7 +64,7 @@ class ReveDataLoaderFactory(AbstractDataLoaderFactory):
     """Reve DataLoader factory that inherits from AbstractDataLoaderFactory."""
 
     def __init__(self, pos_bank_dict, batch_size: int = 32, num_workers: int = 4, seed: int = 42, channel_restricted: bool = False):
-        super().__init__(batch_size, num_workers, seed)
+        super().__init__(batch_size, num_workers, seed, pin_memory)
         self.pos_bank_dict = pos_bank_dict
         self.channel_restricted = channel_restricted
 

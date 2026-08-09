@@ -74,7 +74,7 @@ def test_campaign_identity_excludes_all_invocation_fields(
     assert get_campaign_hash(changed, changed_hpo) == original
 
 
-def test_campaign_identity_marks_searched_leaves_but_retains_semantics(
+def test_campaign_identity_marks_searched_leaves_and_excludes_loaders(
     tmp_path: Path,
 ) -> None:
     """Unused starting values are ignored while fixed numerics remain."""
@@ -92,11 +92,37 @@ def test_campaign_identity_marks_searched_leaves_but_retains_semantics(
 
     workers = copy.deepcopy(config)
     workers["data"]["num_workers"] += 1
-    assert get_campaign_hash(workers, hpo) != original
+    assert get_campaign_hash(workers, hpo) == original
+
+    pinned = copy.deepcopy(config)
+    assert pinned["data"]["pin_memory"] is False
+    pinned["data"]["pin_memory"] = True
+    assert get_campaign_hash(pinned, hpo) == original
+
+    legacy_default = copy.deepcopy(config)
+    legacy_default["data"].pop("pin_memory")
+    assert get_campaign_hash(legacy_default, hpo) == original
 
     search_change = copy.deepcopy(hpo)
     search_change["search_space"]["training.max_lr"]["high"] = 2e-3
     assert get_campaign_hash(config, search_change) != original
+
+
+@pytest.mark.parametrize("path", ("data.num_workers", "data.pin_memory"))
+def test_hpo_rejects_runtime_only_loader_paths(path: str) -> None:
+    """Runtime-only loader settings cannot be HPO search parameters."""
+    with pytest.raises(ValueError, match="runtime-only data-loader field"):
+        HpoConfig.model_validate({
+            "enabled": True,
+            "n_trials": 1,
+            "search_space": {
+                path: {
+                    "distribution": "int",
+                    "low": 1,
+                    "high": 2,
+                },
+            },
+        })
 
 
 def test_separate_task_identity_excludes_dataset_membership(
@@ -138,6 +164,7 @@ def test_resolver_reuses_unique_legacy_root_without_rewriting(
     """A renamed source file resolves to its unique historical root."""
     config = _model_config(tmp_path).model_dump(mode="json")
     config["conf_file"] = "/old/name.local.yaml"
+    config["data"]["num_workers"] = 1
     hpo = _hpo_config().model_dump(mode="json")
     legacy_root = (
         tmp_path
@@ -147,6 +174,16 @@ def test_resolver_reuses_unique_legacy_root_without_rewriting(
         / "manually-renamed-a5f8f3d25a11"
     )
     original = _write_legacy_campaign(legacy_root, config, hpo)
+    identity_path = legacy_root / "identity.json"
+    identity_path.write_text(
+        json.dumps({
+            "campaign_identity": "a" * 64,
+            "identity_version": 2,
+        }),
+        encoding="utf-8",
+    )
+    original_identity = identity_path.read_bytes()
+
     completion_path = (
         legacy_root
         / "logs"
@@ -167,6 +204,7 @@ def test_resolver_reuses_unique_legacy_root_without_rewriting(
     requested["master_port"] += 10
     requested["logging"]["experiment_name"] = "new-label"
     requested["data"]["datasets"]["bcic_2a"] = "finetune"
+    requested["data"]["num_workers"] = 8
     resolution = resolve_campaign(
         str(tmp_path),
         "brainomni",
@@ -179,6 +217,7 @@ def test_resolver_reuses_unique_legacy_root_without_rewriting(
     assert resolution.legacy is True
     assert "3f68277ec5ec" in resolution.aliases
     assert (legacy_root / "campaign.yaml").read_bytes() == original
+    assert identity_path.read_bytes() == original_identity
 
 
 def test_resolver_prefers_existing_current_campaign_root(

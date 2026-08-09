@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import math
 from typing import Any, Dict, List, Mapping, Union
@@ -23,10 +24,15 @@ from common.utils import ElectrodeSet
 _EEG_SENSOR_TYPE_ID = 0
 _SIGNAL_NORMALIZE_EPS_DEFAULT = 1.0e-5
 _POSITION_NORMALIZE_EPS_DEFAULT = 1.0e-8
+_ELIGIBILITY_CACHE_VERSION = 1
 
 
 logger = logging.getLogger("baseline")
 _WARNED_SAMPLE_FILTER_SPLITS: set[tuple[str, str]] = set()
+_ELIGIBILITY_INDEX_CACHE: Dict[
+    tuple[Any, ...],
+    tuple[tuple[int, ...], Dict[tuple[str, str], Dict[str, Any]]],
+] = {}
 
 
 class _BrainOmniSampleError(ValueError):
@@ -375,6 +381,7 @@ class BrainOmniDataLoaderFactory(AbstractDataLoaderFactory):
         batch_size: int = 32,
         num_workers: int = 2,
         seed: int = 42,
+        pin_memory: bool = False,
         normalize_input: bool = True,
         normalize_position: bool = True,
         signal_normalize_eps: float = _SIGNAL_NORMALIZE_EPS_DEFAULT,
@@ -384,6 +391,7 @@ class BrainOmniDataLoaderFactory(AbstractDataLoaderFactory):
             batch_size=batch_size,
             num_workers=num_workers,
             seed=seed,
+            pin_memory=pin_memory,
         )
         self.normalize_input = normalize_input
         self.normalize_position = normalize_position
@@ -444,8 +452,25 @@ class BrainOmniDataLoaderFactory(AbstractDataLoaderFactory):
         adapter: BrainOmniDatasetAdapter,
         split: Any,
         dataset_names: List[str],
+        dataset_configs: Union[List[str], None] = None,
     ) -> BrainOmniFilteredDataset:
         """Build a view excluding samples that cannot reach the model."""
+        cache_key = self._eligibility_cache_key(
+            dataset,
+            adapter,
+            split,
+            dataset_names,
+            dataset_configs,
+        )
+        if cache_key is not None:
+            cached = _ELIGIBILITY_INDEX_CACHE.get(cache_key)
+            if cached is not None:
+                sample_indices, diagnostics = cached
+                self._data_diagnostics.update(copy.deepcopy(diagnostics))
+                return BrainOmniFilteredDataset(
+                    dataset=dataset,
+                    sample_indices=list(sample_indices),
+                )
         sample_indices: List[int] = []
         split_name = str(split)
         counts: Dict[str, Dict[str, Any]] = {}
@@ -538,9 +563,55 @@ class BrainOmniDataLoaderFactory(AbstractDataLoaderFactory):
                 "BrainOmni cannot create a data loader because no eligible "
                 f"samples remain for split {split_name}."
             )
+        if cache_key is not None:
+            diagnostics = {
+                (dataset_name, split_name): copy.deepcopy(
+                    self._data_diagnostics[(dataset_name, split_name)]
+                )
+                for dataset_name in dataset_names
+            }
+            _ELIGIBILITY_INDEX_CACHE[cache_key] = (
+                tuple(sample_indices),
+                diagnostics,
+            )
         return BrainOmniFilteredDataset(
             dataset=dataset,
             sample_indices=sample_indices,
+        )
+
+
+    @staticmethod
+    def _eligibility_cache_key(
+        dataset: HFDataset,
+        adapter: BrainOmniDatasetAdapter,
+        split: Any,
+        dataset_names: List[str],
+        dataset_configs: Union[List[str], None],
+    ) -> Union[tuple[Any, ...], None]:
+        """Return a process-local cache key for deterministic preflight."""
+        fingerprint = getattr(dataset, "_fingerprint", None)
+        if not isinstance(fingerprint, str) or not fingerprint:
+            return None
+        montage_signature = tuple(
+            (
+                montage,
+                tuple(mapping["idx"]),
+                tuple(bool(value) for value in mapping["sel"]),
+            )
+            for montage, mapping in sorted(adapter.montage_mappings.items())
+        )
+        return (
+            _ELIGIBILITY_CACHE_VERSION,
+            fingerprint,
+            str(split),
+            tuple(dataset_names),
+            tuple(dataset_configs or ()),
+            adapter.normalize_input,
+            adapter.normalize_position,
+            adapter.signal_normalize_eps,
+            adapter.position_normalize_eps,
+            adapter.scale,
+            montage_signature,
         )
 
     def loading_dataset(
@@ -571,6 +642,7 @@ class BrainOmniDataLoaderFactory(AbstractDataLoaderFactory):
             adapter,
             split,
             dataset_names,
+            dataset_configs,
         )
         adapter.dataset = filtered_dataset
         sampler = DistributedGroupBatchSampler(
@@ -584,6 +656,7 @@ class BrainOmniDataLoaderFactory(AbstractDataLoaderFactory):
         dataloader_kwargs: Dict[str, Any] = {
             "batch_sampler": sampler,
             "num_workers": self.num_workers,
+            "pin_memory": self.pin_memory and torch.cuda.is_available(),
             "persistent_workers": self.num_workers > 0,
             "prefetch_factor": 2 if self.num_workers > 0 else None,
         }

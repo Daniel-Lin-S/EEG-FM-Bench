@@ -191,11 +191,18 @@ class AbstractDatasetAdapter(Dataset, ABC):
 
 class AbstractDataLoaderFactory(ABC):
     """Abstract factory for creating data loaders."""
-    
-    def __init__(self, batch_size: int = 32, num_workers: int = 4, seed: int = 42):
+
+    def __init__(
+        self,
+        batch_size: int = 32,
+        num_workers: int = 4,
+        seed: int = 42,
+        pin_memory: bool = False,
+    ) -> None:
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.seed = seed
+        self.pin_memory = pin_memory
 
     def get_data_diagnostics(
         self,
@@ -271,6 +278,7 @@ class AbstractDataLoaderFactory(ABC):
         dataloader_kwargs = {
             'batch_sampler': sampler,
             'num_workers': self.num_workers,
+            'pin_memory': self.pin_memory and torch.cuda.is_available(),
             'persistent_workers': self.num_workers > 0,
             'prefetch_factor': 2 if self.num_workers > 0 else None,
         }

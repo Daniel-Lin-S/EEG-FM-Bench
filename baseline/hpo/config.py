@@ -13,6 +13,8 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
+from baseline.utils.identity import is_runtime_only_config_path
+
 
 PROTECTED_SEARCH_PATHS = frozenset({
     "data.datasets",
@@ -254,6 +256,11 @@ class HpoConfig(BaseModel):
                 "hpo.search_space must not be empty when HPO is enabled."
             )
         for path in self.search_space:
+            if is_runtime_only_config_path(path):
+                raise ValueError(
+                    f"Search path '{path}' targets a runtime-only "
+                    "data-loader field."
+                )
             if path in PROTECTED_SEARCH_PATHS or path.startswith(
                 PROTECTED_SEARCH_PREFIXES
             ):

@@ -98,6 +98,7 @@ class MantisDataLoaderFactory(AbstractDataLoaderFactory, StandardEEGChannelsMixi
         batch_size: int = 32,
         num_workers: int = 2,
         seed: int = 42,
+        pin_memory: bool = False,
         target_seq_len: int = 512,
         use_zscore: bool = True,
     ):
@@ -117,7 +118,7 @@ class MantisDataLoaderFactory(AbstractDataLoaderFactory, StandardEEGChannelsMixi
         use_zscore : bool
             Whether to apply z-score normalization.
         """
-        super().__init__(batch_size, num_workers, seed)
+        super().__init__(batch_size, num_workers, seed, pin_memory)
         self.target_seq_len = target_seq_len
         self.use_zscore = use_zscore
     

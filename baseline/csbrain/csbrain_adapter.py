@@ -203,10 +203,11 @@ class CSBrainDataLoaderFactory(AbstractDataLoaderFactory):
         batch_size: int = 32, 
         num_workers: int = 4, 
         seed: int = 42,
+        pin_memory: bool = False,
         patch_size: int = 200,
         max_seq_len: Optional[int] = None  # None means use actual sample length
     ):
-        super().__init__(batch_size, num_workers, seed)
+        super().__init__(batch_size, num_workers, seed, pin_memory)
         self.patch_size = patch_size
         self.max_seq_len = max_seq_len
     

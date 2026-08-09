@@ -81,6 +81,7 @@ class LabramTrainer(AbstractTrainer):
         self.dataloader_factory = LabramDataLoaderFactory(
             batch_size=self.cfg.data.batch_size,
             num_workers=self.cfg.data.num_workers,
+            pin_memory=self.cfg.data.pin_memory,
             seed=self.cfg.seed
         )
         

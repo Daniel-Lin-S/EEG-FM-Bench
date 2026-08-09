@@ -12,7 +12,7 @@ import json
 from typing import Any, Mapping, MutableMapping, Optional
 
 
-IDENTITY_VERSION = 2
+IDENTITY_VERSION = 3
 DISPLAY_ID_LENGTH = 12
 HPO_SEARCH_MARKER_KEY = "__hpo_search_parameter__"
 DETERMINISTIC_MODEL_TYPES = frozenset({"catch22", "minirocket", "naive"})
@@ -25,6 +25,10 @@ INVOCATION_CONFIG_FIELDS = frozenset({
 INVOCATION_HPO_FIELDS = frozenset({
     "max_consecutive_failed_trials",
     "n_trials",
+})
+RUNTIME_DATA_CONFIG_FIELDS = frozenset({
+    "num_workers",
+    "pin_memory",
 })
 
 
@@ -110,6 +114,46 @@ def short_identity(identity: str) -> str:
     return identity[:DISPLAY_ID_LENGTH]
 
 
+def is_runtime_only_config_path(dotted_path: str) -> bool:
+    """Return whether a path targets an identity-excluded loader setting.
+
+    Parameters
+    ----------
+    dotted_path : str
+        Dotted resolved-configuration path.
+
+    Returns
+    -------
+    bool
+        Whether the path names a runtime-only data-loader setting.
+    """
+    return dotted_path in {
+        f"data.{field}" for field in RUNTIME_DATA_CONFIG_FIELDS
+    }
+
+
+def _remove_runtime_data_fields(
+    semantic: MutableMapping[str, Any],
+) -> None:
+    """Remove data-loader settings that cannot affect evaluation semantics.
+
+    Parameters
+    ----------
+    semantic : MutableMapping[str, Any]
+        Detached resolved configuration to normalize in place.
+
+    Notes
+    -----
+    Add a field only when it cannot change samples, splits, windows, seeds,
+    optimization semantics, or metrics.
+    """
+    data_config = semantic.get("data")
+    if not isinstance(data_config, MutableMapping):
+        return
+    for field in RUNTIME_DATA_CONFIG_FIELDS:
+        data_config.pop(field, None)
+
+
 def _base_semantic_config(
     config: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -130,6 +174,7 @@ def _base_semantic_config(
         raise TypeError("Expected the resolved configuration to be a mapping.")
     for field in INVOCATION_CONFIG_FIELDS:
         semantic.pop(field, None)
+    _remove_runtime_data_fields(semantic)
     return semantic
 
 
@@ -154,6 +199,11 @@ def _replace_search_value(
     parts = dotted_path.split(".")
     if not dotted_path or any(not part for part in parts):
         raise ValueError(f"Invalid search path component: {dotted_path!r}.")
+    if is_runtime_only_config_path(dotted_path):
+        raise ValueError(
+            f"HPO search path '{dotted_path}' targets a runtime-only "
+            "data-loader field."
+        )
     if parts[0] in INVOCATION_CONFIG_FIELDS or parts[0] == "hpo":
         raise ValueError(
             f"HPO search path '{dotted_path}' targets an operational field."

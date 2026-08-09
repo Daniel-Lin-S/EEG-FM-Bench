@@ -83,6 +83,7 @@ class BrainOmniTrainer(AbstractTrainer):
 		self.dataloader_factory = BrainOmniDataLoaderFactory(
 			batch_size=self.cfg.data.batch_size,
 			num_workers=self.cfg.data.num_workers,
+			pin_memory=self.cfg.data.pin_memory,
 			seed=self.cfg.seed,
 			normalize_input=self.cfg.model.normalize_input,
 			normalize_position=self.cfg.model.normalize_position,

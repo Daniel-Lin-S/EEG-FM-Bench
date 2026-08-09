@@ -2333,6 +2333,7 @@ class CampaignRunner:
         error: Optional[str] = None,
         objective_history: Optional[list[Mapping[str, Any]]] = None,
         memory_information: Optional[Mapping[str, Any]] = None,
+        performance: Optional[Mapping[str, Any]] = None,
     ) -> None:
         """Persist one trial's decoded parameters and terminal state."""
         if not get_is_master():
@@ -2349,6 +2350,8 @@ class CampaignRunner:
             payload["objective_history"] = list(objective_history)
         if memory_information is not None:
             payload["memory_information"] = dict(memory_information)
+        if performance is not None:
+            payload["performance"] = dict(performance)
         _exclusive_json(trial_root / "trial.json", payload)
 
     def _run_hpo_scope(
@@ -2520,6 +2523,12 @@ class CampaignRunner:
                     prepare_trial,
                 )
                 pruned = bool(result.get("pruned"))
+                performance = result.get("performance")
+                if not isinstance(performance, Mapping):
+                    raise TypeError(
+                        "HPO trainer result must include performance timing "
+                        "diagnostics."
+                    )
                 if get_is_master():
                     if best_value is None:
                         raise ValueError(
@@ -2537,6 +2546,7 @@ class CampaignRunner:
                             decoded,
                             objective=best_value,
                             objective_history=objective_history,
+                            performance=performance,
                         )
                     else:
                         study.tell(trial, best_value)
@@ -2546,6 +2556,7 @@ class CampaignRunner:
                             decoded,
                             objective=best_value,
                             objective_history=objective_history,
+                            performance=performance,
                         )
                 trial_budgeted = True
             except Exception as exc:

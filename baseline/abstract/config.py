@@ -96,10 +96,15 @@ class BaseDataArgs(BaseModel):
         trainers derive a per-rank micro-batch and accumulation count.
     num_workers : int
         Number of worker processes used by each PyTorch data loader.
+    pin_memory : bool, optional, default=False
+        Whether PyTorch data loaders allocate tensor batches in pinned host
+        memory. This can accelerate CUDA transfers when paired with
+        non-blocking device copies.
     """
     datasets: Dict[str, str] = Field(default_factory=lambda: {})
     batch_size: int = Field(default=32, ge=1)
     num_workers: int = 2
+    pin_memory: bool = False
 
 
 class BaseModelArgs(BaseModel):

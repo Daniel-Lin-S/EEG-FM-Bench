@@ -103,6 +103,7 @@ class BendrTrainer(AbstractTrainer):
         self.dataloader_factory = BendrDataLoaderFactory(
             batch_size=self.cfg.data.batch_size,
             num_workers=self.cfg.data.num_workers,
+            pin_memory=self.cfg.data.pin_memory,
             seed=self.cfg.seed
         )
         
