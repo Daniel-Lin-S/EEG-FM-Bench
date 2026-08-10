@@ -282,6 +282,8 @@ class NaiveTrainer(FeatureExtractorTrainer):
 
     def _write_summary(self) -> None:
         """Write one-seed summaries in the shared deterministic format."""
+        if self.campaign_invocation_id is not None:
+            return
         write_feature_extractor_summary(
             Path(self.log_dir),
             self.model_type,

@@ -136,6 +136,34 @@ def test_exact_canonical_completion_is_compatible(tmp_path: Path) -> None:
     assert result.mode == "exact_canonical_hash"
 
 
+def test_completion_accepts_performance_diagnostics(
+    tmp_path: Path,
+) -> None:
+    """Performance diagnostics are valid completed-run metadata."""
+    selected = _selected_config()
+    config_hash = get_config_hash(selected, multitask=False)
+    path = _write_completion(
+        tmp_path,
+        config_hash,
+        diagnostics={
+            "performance": {
+                "scope": "dataset",
+                "loader_build_seconds": {"training": 1.5},
+                "evaluation": {},
+            }
+        },
+    )
+
+    result = check_completion_compatibility(
+        path,
+        CAMPAIGN_HASH,
+        SEED,
+        selected,
+    )
+
+    assert result.compatible is True
+
+
 def test_completion_rejects_unknown_diagnostic_namespace(
     tmp_path: Path,
 ) -> None:
@@ -426,6 +454,49 @@ def test_artifact_summary_includes_every_valid_direct_completion(
     assert "compatibility rejected" not in caplog.text
 
 
+def test_invocation_summary_aggregates_performance_diagnostics(
+    tmp_path: Path,
+) -> None:
+    """Current invocation summaries retain timing diagnostics."""
+    selected = _selected_config()
+    config_hash = _save_legacy_config(tmp_path, selected)
+    invocation_id = "performance-invocation"
+    performance = {
+        "scope": "dataset",
+        "loader_build_seconds": {},
+        "evaluation": {},
+    }
+    _write_completion(
+        tmp_path,
+        config_hash,
+        invocation_id=invocation_id,
+        diagnostics={"performance": performance},
+    )
+    paths = CampaignPaths(tmp_path, tmp_path / "checkpoints")
+
+    summary = build_invocation_summary(
+        paths,
+        CAMPAIGN_HASH,
+        {
+            "id": invocation_id,
+            "complete": True,
+            "dataset_attempts": [
+                {"seed": SEED, "dataset": DATASET_NAME}
+            ],
+        },
+    )
+
+    assert summary.status["diagnostics"] == {
+        "runs": [
+            {
+                "seed": SEED,
+                "dataset": DATASET_NAME,
+                "details": {"performance": performance},
+            }
+        ]
+    }
+
+
 def test_artifact_summary_aggregates_opaque_typed_diagnostics(
     tmp_path: Path,
 ) -> None:
@@ -441,6 +512,11 @@ def test_artifact_summary_aggregates_opaque_typed_diagnostics(
         },
         "model": {"temperature": 0.25},
         "training": {"schedule": {"warmup_steps": 5}},
+        "performance": {
+            "scope": "dataset",
+            "loader_build_seconds": {},
+            "evaluation": {},
+        },
     }
     _write_completion(
         tmp_path,

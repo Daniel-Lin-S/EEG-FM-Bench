@@ -12,7 +12,7 @@ import json
 from typing import Any, Mapping, MutableMapping, Optional
 
 
-IDENTITY_VERSION = 3
+IDENTITY_VERSION = 4
 DISPLAY_ID_LENGTH = 12
 HPO_SEARCH_MARKER_KEY = "__hpo_search_parameter__"
 DETERMINISTIC_MODEL_TYPES = frozenset({"catch22", "minirocket", "naive"})
@@ -22,6 +22,21 @@ INVOCATION_CONFIG_FIELDS = frozenset({
     "master_port",
     "seeds",
 })
+DETERMINISTIC_RUNTIME_CONFIG_FIELDS = {
+    "catch22": frozenset({
+        "data.batch_size",
+        "data.load_batch_size",
+        "model.extractor.n_jobs",
+    }),
+    "minirocket": frozenset({
+        "data.batch_size",
+        "data.load_batch_size",
+        "model.extractor.n_jobs",
+    }),
+    "naive": frozenset({
+        "data.batch_size",
+    }),
+}
 INVOCATION_HPO_FIELDS = frozenset({
     "max_consecutive_failed_trials",
     "n_trials",
@@ -154,6 +169,45 @@ def _remove_runtime_data_fields(
         data_config.pop(field, None)
 
 
+def _remove_dotted_path(
+    config: MutableMapping[str, Any],
+    dotted_path: str,
+) -> None:
+    """Remove one optional dotted path from a detached configuration.
+
+    Parameters
+    ----------
+    config : MutableMapping[str, Any]
+        Detached resolved configuration normalized in place.
+    dotted_path : str
+        Runtime-only path declared by one model implementation.
+    """
+    parts = dotted_path.split(".")
+    parent: MutableMapping[str, Any] = config
+    for part in parts[:-1]:
+        child = parent.get(part)
+        if not isinstance(child, MutableMapping):
+            return
+        parent = child
+    parent.pop(parts[-1], None)
+
+
+def _remove_model_runtime_fields(
+    semantic: MutableMapping[str, Any],
+) -> None:
+    """Remove declared result-invariant fields for one deterministic model.
+
+    Runtime exclusions are explicit. Model settings remain semantic unless
+    their implementation declares them after proving they do not change
+    produced metrics.
+    """
+    model_type = semantic.get("model_type")
+    if not isinstance(model_type, str):
+        return
+    for path in DETERMINISTIC_RUNTIME_CONFIG_FIELDS.get(model_type, ()):
+        _remove_dotted_path(semantic, path)
+
+
 def _base_semantic_config(
     config: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -175,6 +229,7 @@ def _base_semantic_config(
     for field in INVOCATION_CONFIG_FIELDS:
         semantic.pop(field, None)
     _remove_runtime_data_fields(semantic)
+    _remove_model_runtime_fields(semantic)
     return semantic
 
 
@@ -308,6 +363,13 @@ def build_run_semantic_config(
             "A final run identity requires exactly one integer effective seed."
         )
     semantic = _base_semantic_config(config)
+    if not multitask:
+        data_config = semantic.get("data")
+        if not isinstance(data_config, dict):
+            raise ValueError(
+                "A separate-task run requires a data configuration mapping."
+            )
+        data_config.pop("datasets", None)
     semantic["effective_seed"] = seeds[0]
     semantic["multitask"] = bool(multitask)
     return semantic

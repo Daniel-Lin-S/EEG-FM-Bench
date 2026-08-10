@@ -21,6 +21,7 @@ import yaml
 
 from baseline.utils.identity import (
     IDENTITY_VERSION,
+    DETERMINISTIC_MODEL_TYPES,
     build_campaign_semantic_config,
     build_run_semantic_config,
     get_campaign_identity,
@@ -32,7 +33,9 @@ from baseline.utils.run_artifacts import get_config_hash
 
 
 logger = logging.getLogger("baseline")
-DIAGNOSTIC_NAMESPACES = frozenset({"data", "model", "training"})
+DIAGNOSTIC_NAMESPACES = frozenset(
+    {"data", "model", "performance", "training"}
+)
 SEED_DIRECTORY_PATTERN = re.compile(r"^seed_(\d+)$")
 ABSOLUTE_PATH_PATTERN = re.compile(r"(?:/[\w.\-]+){2,}")
 VOLATILE_TOKEN_PATTERN = re.compile(
@@ -53,6 +56,7 @@ class CampaignPaths:
 
     log_root: Path
     checkpoint_root: Path
+    flat_results: bool = False
 
     def seed_log_root(self, seed: int) -> Path:
         """Return the ordinary artifact root for one seed.
@@ -67,6 +71,8 @@ class CampaignPaths:
         pathlib.Path
             Seed artifact root matching ``log_root``.
         """
+        if self.flat_results:
+            return self.log_root
         return self.log_root / "logs" / f"seed_{seed}"
 
     def seed_checkpoint_root(self, seed: int) -> Path:
@@ -196,7 +202,11 @@ def build_campaign_paths(
     name = f"{experiment_name}-{display_hash}"
     log_root = root / "log" / "baseline" / model_type / name
     checkpoint_root = root / "ckpt" / "baseline" / model_type / name
-    return CampaignPaths(log_root=log_root, checkpoint_root=checkpoint_root)
+    return CampaignPaths(
+        log_root=log_root,
+        checkpoint_root=checkpoint_root,
+        flat_results=model_type in DETERMINISTIC_MODEL_TYPES,
+    )
 
 
 def _read_campaign_manifest(path: Path) -> dict[str, Any]:
@@ -251,6 +261,90 @@ def _manifest_semantic_config(
     return build_campaign_semantic_config(model_config, hpo)
 
 
+def _normalize_legacy_seed_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize a saved scalar seed without changing its source artifact."""
+    normalized = json.loads(json.dumps(config, sort_keys=True))
+    if "seed" not in normalized:
+        return normalized
+    if "seeds" in normalized:
+        raise ValueError("saved configuration contains both seed and seeds")
+    seed = normalized.pop("seed")
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise ValueError(f"saved configuration has invalid seed {seed!r}")
+    normalized["seeds"] = [seed]
+    return normalized
+
+def _load_legacy_flat_config(
+    completion_path: Path,
+    completion: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Load one flat deterministic completion resolved configuration."""
+    execution_id = completion.get("execution_id")
+    if (
+        not isinstance(execution_id, str)
+        or not execution_id
+        or Path(execution_id).name != execution_id
+    ):
+        raise ValueError("execution_id is missing or invalid")
+    config_path = completion_path.parents[2] / "configs"
+    config_path = config_path / f"{execution_id}.yaml"
+    if not config_path.is_file():
+        raise ValueError(
+            f"resolved configuration does not exist at {config_path.resolve()}"
+        )
+    try:
+        saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        raise ValueError(f"resolved configuration is invalid: {exc}") from exc
+    if not isinstance(saved, dict):
+        raise ValueError("resolved configuration is not a mapping")
+    return _normalize_legacy_seed_config(saved)
+
+
+def _has_terminal_legacy_flat_completion(candidate: Path) -> bool:
+    """Return whether a flat root contains a completed deterministic result."""
+    for completion_path in candidate.glob("datasets/*/completion.json"):
+        try:
+            completion = json.loads(
+                completion_path.read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(completion, dict):
+            continue
+        if completion.get("status") == "completed" and isinstance(
+            completion.get("test_metrics"),
+            dict,
+        ):
+            return True
+    return False
+
+
+def _legacy_flat_root_matches(
+    candidate: Path,
+    model_type: str,
+    semantic_config: Mapping[str, Any],
+) -> bool:
+    """Return whether a completed flat root has matching semantics."""
+    if model_type not in DETERMINISTIC_MODEL_TYPES:
+        return False
+    if not _has_terminal_legacy_flat_completion(candidate):
+        return False
+    for config_path in sorted((candidate / "configs").glob("*.yaml")):
+        try:
+            saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+            if not isinstance(saved, dict):
+                continue
+            normalized = _normalize_legacy_seed_config(saved)
+            candidate_semantic = build_campaign_semantic_config(
+                normalized,
+                {},
+            )
+        except (OSError, ValueError, yaml.YAMLError):
+            continue
+        if candidate_semantic == semantic_config:
+            return True
+    return False
 def _campaign_aliases(
     log_root: Path,
     experiment_name: str,
@@ -341,8 +435,15 @@ def resolve_campaign(
         experiment_name,
         campaign_identity,
     )
-    if requested_paths.log_root.exists():
-        manifest_path = requested_paths.log_root / "campaign.yaml"
+    requested_manifest_path = requested_paths.log_root / "campaign.yaml"
+    requested_root_is_incomplete = (
+        model_type in DETERMINISTIC_MODEL_TYPES
+        and requested_paths.log_root.is_dir()
+        and not requested_manifest_path.is_file()
+        and not _has_terminal_legacy_flat_completion(requested_paths.log_root)
+    )
+    if requested_paths.log_root.exists() and not requested_root_is_incomplete:
+        manifest_path = requested_manifest_path
         if not manifest_path.is_file():
             raise RuntimeError(
                 "The current campaign path exists without a manifest: "
@@ -377,8 +478,16 @@ def resolve_campaign(
         matches: list[tuple[Path, bool]] = []
         if model_root.is_dir():
             for candidate in sorted(model_root.iterdir()):
+                if not candidate.is_dir():
+                    continue
                 manifest_path = candidate / "campaign.yaml"
-                if not candidate.is_dir() or not manifest_path.is_file():
+                if not manifest_path.is_file():
+                    if _legacy_flat_root_matches(
+                        candidate,
+                        model_type,
+                        semantic_config,
+                    ):
+                        matches.append((candidate, True))
                     continue
                 try:
                     manifest = _read_campaign_manifest(manifest_path)
@@ -411,8 +520,18 @@ def resolve_campaign(
                 / model_type
                 / log_root.name
             )
-            paths = CampaignPaths(log_root, checkpoint_root)
+            paths = CampaignPaths(
+                log_root,
+                checkpoint_root,
+                flat_results=model_type in DETERMINISTIC_MODEL_TYPES,
+            )
         else:
+            if requested_root_is_incomplete:
+                raise RuntimeError(
+                    "The current deterministic campaign path is incomplete "
+                    f"and has no reusable fallback: "
+                    f"{requested_paths.log_root.resolve()}."
+                )
             paths = requested_paths
             legacy = False
 
@@ -807,6 +926,94 @@ def check_completion_compatibility(
     )
 
 
+def _legacy_flat_completion_compatibility(
+    path: Path,
+    seed: int,
+    expected_config: Mapping[str, Any] | str,
+) -> CompletionCompatibility:
+    """Validate one historical flat deterministic completion for reuse."""
+    if not path.is_file():
+        return CompletionCompatibility(
+            compatible=False,
+            mode="missing",
+            reason="completion.json does not exist",
+        )
+    if isinstance(expected_config, str):
+        return _compatibility_failure(
+            "legacy flat reuse requires the selected configuration"
+        )
+    try:
+        completion = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return _compatibility_failure(
+            f"completion metadata is invalid: {exc}"
+        )
+    if not isinstance(completion, dict):
+        return _compatibility_failure("completion metadata is not a mapping")
+    if completion.get("status") != "completed":
+        return _compatibility_failure(
+            "completion status is not 'completed'",
+            completion,
+        )
+    metrics = completion.get("test_metrics")
+    if not isinstance(metrics, dict) or not metrics:
+        return _compatibility_failure(
+            "test_metrics is missing or empty",
+            completion,
+        )
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        for value in metrics.values()
+    ):
+        return _compatibility_failure(
+            "test_metrics contains a non-finite or non-numeric value",
+            completion,
+        )
+    try:
+        saved_config = _load_legacy_flat_config(path, completion)
+        saved_semantic = build_run_semantic_config(saved_config, False)
+        expected_semantic = build_run_semantic_config(
+            expected_config,
+            bool(expected_config.get("multitask")),
+        )
+    except ValueError as exc:
+        return _compatibility_failure(str(exc), completion)
+    if saved_config.get("seeds") != [seed]:
+        return _compatibility_failure(
+            "resolved configuration seed does not match",
+            completion,
+            terminal=True,
+        )
+    expected_datasets = expected_config.get("data", {}).get("datasets", {})
+    if completion.get("dataset_config") != expected_datasets.get(
+        path.parent.name
+    ):
+        return _compatibility_failure(
+            "dataset configuration does not match",
+            completion,
+            terminal=True,
+        )
+    if saved_config.get("model_type") != expected_config.get("model_type"):
+        return _compatibility_failure(
+            "model type does not match",
+            completion,
+            terminal=True,
+        )
+    if saved_semantic != expected_semantic:
+        return _compatibility_failure(
+            "resolved configuration differs semantically",
+            completion,
+            terminal=True,
+        )
+    return CompletionCompatibility(
+        compatible=True,
+        mode="legacy_flat_semantic_compatible",
+        reason="accepted a semantically identical flat completion",
+        completion=completion,
+        terminal=True,
+    )
 def locate_completion(
     campaign_root: Path,
     campaign_hash: str,
@@ -852,8 +1059,21 @@ def locate_completion(
         expected_config,
         campaign_aliases=campaign_aliases,
     )
-    existing = (path,) if path.is_file() else ()
-    return LocatedCompletion(path, result, existing)
+    if path.is_file():
+        return LocatedCompletion(path, result, (path,))
+    if (
+        isinstance(expected_config, str)
+        or expected_config.get("model_type") not in DETERMINISTIC_MODEL_TYPES
+    ):
+        return LocatedCompletion(path, result, ())
+    flat_path = campaign_root / "datasets" / dataset_name / "completion.json"
+    flat_result = _legacy_flat_completion_compatibility(
+        flat_path,
+        seed,
+        expected_config,
+    )
+    existing = (flat_path,) if flat_path.is_file() else ()
+    return LocatedCompletion(flat_path, flat_result, existing)
 
 
 def _append_metric_rows(
@@ -1117,6 +1337,54 @@ def collect_artifact_test_rows_with_diagnostics(
         diagnostic["mode"] = "artifact_self_consistent"
         diagnostics["accepted"].append(diagnostic)
         _append_metric_rows(rows, completion, dataset_name, seed)
+    for completion_path in sorted(
+        campaign_root.glob("datasets/*/completion.json")
+    ):
+        dataset_name = completion_path.parent.name
+        try:
+            completion = json.loads(
+                completion_path.read_text(encoding="utf-8")
+            )
+            if not isinstance(completion, dict):
+                raise ValueError("completion metadata is not a mapping")
+            if (
+                invocation_id is not None
+                and completion.get("invocation_id") != invocation_id
+            ):
+                continue
+            saved_config = _load_legacy_flat_config(
+                completion_path,
+                completion,
+            )
+            saved_seeds = saved_config.get("seeds")
+            if not isinstance(saved_seeds, list) or len(saved_seeds) != 1:
+                raise ValueError("resolved configuration has invalid seeds")
+            seed = saved_seeds[0]
+            result = _legacy_flat_completion_compatibility(
+                completion_path,
+                seed,
+                saved_config,
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            diagnostics["rejected"].append({
+                "seed": None,
+                "dataset": dataset_name,
+                "path": str(completion_path.resolve()),
+                "reason": str(exc),
+            })
+            continue
+        diagnostic = {
+            "seed": seed,
+            "dataset": dataset_name,
+            "path": str(completion_path.resolve()),
+            "reason": result.reason,
+        }
+        if not result.compatible or result.completion is None:
+            diagnostics["rejected"].append(diagnostic)
+            continue
+        diagnostic["mode"] = result.mode
+        diagnostics["accepted"].append(diagnostic)
+        _append_metric_rows(rows, result.completion, dataset_name, seed)
     return rows, diagnostics
 
 

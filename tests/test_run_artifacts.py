@@ -80,13 +80,15 @@ def test_logging_level_is_normalized_and_not_part_of_identity() -> None:
 
 
 
-def test_final_run_identity_includes_dataset_selection() -> None:
-    """Completion identity includes its selected dataset configuration."""
+def test_final_run_identity_excludes_separate_dataset_selection() -> None:
+    """Separate tasks share one campaign while multitask retains membership."""
     config = BrainOmniConfig().model_dump(mode='json')
-    first_hash = get_config_hash(config, multitask=False)
+    separate_hash = get_config_hash(config, multitask=False)
+    multitask_hash = get_config_hash(config, multitask=True)
     config['data']['datasets'] = {'bcic_1a': 'finetune'}
-    assert first_hash != get_config_hash(config, multitask=False)
-    assert first_hash != get_config_hash(config, multitask=True)
+
+    assert separate_hash == get_config_hash(config, multitask=False)
+    assert multitask_hash != get_config_hash(config, multitask=True)
 
 
 def test_saved_config_round_trip(tmp_path: Path) -> None:

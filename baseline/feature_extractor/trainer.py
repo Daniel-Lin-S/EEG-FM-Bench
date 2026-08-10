@@ -633,6 +633,8 @@ class FeatureExtractorTrainer(AbstractTrainer, ABC):
     def _write_summary(self) -> None:
         """Write one-seed campaign-compatible extractor summary tables."""
         require_single_seed(self.cfg)
+        if self.campaign_invocation_id is not None:
+            return
         write_feature_extractor_summary(
             Path(self.log_dir),
             self.model_type,

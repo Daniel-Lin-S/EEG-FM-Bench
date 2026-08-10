@@ -10,7 +10,6 @@ import numpy as np
 import pytest
 import yaml
 
-import baseline_main
 from baseline.catch22.catch22_config import Catch22Config
 from baseline.catch22.catch22_trainer import Catch22Trainer
 import baseline.catch22.extractor as catch22_extractor_module
@@ -34,7 +33,6 @@ from baseline.feature_extractor.summary import (
     write_feature_extractor_summary,
 )
 from baseline.feature_extractor.trainer import FeatureExtractorTrainer
-from baseline.hpo.config import HpoConfig
 from baseline.minirocket.minirocket_config import MiniRocketConfig
 from baseline.minirocket.minirocket_trainer import MiniRocketTrainer
 from baseline.utils.run_artifacts import load_final_checkpoint
@@ -457,7 +455,7 @@ def _write_feature_completion(
 
 
 def test_feature_summary_has_campaign_csv_schema_without_std(tmp_path):
-    """One-seed extractor summaries omit neural fields and standard deviation."""
+    """One-seed extractor summaries omit neural fields."""
     test_metrics = {
         f"{DATASET_NAME}/test/acc": 0.6,
         f"{DATASET_NAME}/test/balanced_acc": 0.55,
@@ -493,7 +491,21 @@ def test_feature_summary_has_campaign_csv_schema_without_std(tmp_path):
     assert "loss" not in test_runs
     assert status["status"] == "complete"
     assert status["dataset_pairs"]["completed"] == 1
-    assert "diagnostics" not in status
+    assert status["diagnostics"] == {
+        "runs": [
+            {
+                "seed": 42,
+                "dataset": DATASET_NAME,
+                "details": {
+                    "performance": {
+                        "scope": "dataset",
+                        "loader_build_seconds": {},
+                        "evaluation": {},
+                    }
+                },
+            }
+        ]
+    }
 
 
 def test_feature_completion_and_summary_preserve_typed_diagnostics(
@@ -513,6 +525,11 @@ def test_feature_completion_and_summary_preserve_typed_diagnostics(
         "data": {"provider": f"data:{DATASET_NAME}"},
         "model": {"provider": f"model:{DATASET_NAME}"},
         "training": {"provider": f"training:{DATASET_NAME}"},
+        "performance": {
+            "scope": "dataset",
+            "loader_build_seconds": {},
+            "evaluation": {},
+        },
     }
 
     write_feature_extractor_summary(
@@ -550,7 +567,7 @@ def test_feature_completion_and_summary_preserve_typed_diagnostics(
 
 
 def test_feature_summary_rejects_neural_test_metrics(tmp_path):
-    """Feature summaries reject neural-only metrics instead of exporting them."""
+    """Reject neural-only test metrics instead of exporting them."""
     _write_feature_completion(
         tmp_path,
         {f"{DATASET_NAME}/test/loss": 1.0},
@@ -614,7 +631,7 @@ def test_matching_artifact_root_rejects_ambiguity(tmp_path):
 
 
 def test_all_skipped_feature_rerun_writes_summary(tmp_path):
-    """Completed extractor datasets are skipped while their summary refreshes."""
+    """Completed extractor datasets are skipped and summaries refresh."""
     config = make_config()
     trainer = MeanFeatureTrainer(config)
     trainer.log_dir = str(tmp_path)
@@ -637,13 +654,6 @@ def test_all_skipped_feature_rerun_writes_summary(tmp_path):
     assert (tmp_path / "summary" / "summary.json").is_file()
 
 
-def test_feature_entry_point_requires_one_seed():
-    """The direct feature-extractor path rejects repeated seeds."""
-    config = make_config()
-    config.seeds = [42, 43]
-
-    with pytest.raises(ValueError, match="exactly one deterministic seed"):
-        baseline_main._run_feature_extractor(config, HpoConfig())
 
 
 def test_feature_matrix_validation_rejects_nan():

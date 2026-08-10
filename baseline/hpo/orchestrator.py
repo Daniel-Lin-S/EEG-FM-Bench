@@ -1977,7 +1977,8 @@ class CampaignRunner:
         if not get_is_master():
             return
         self.paths.log_root.mkdir(parents=True, exist_ok=True)
-        self.paths.checkpoint_root.mkdir(parents=True, exist_ok=True)
+        if self.base_dict["model_type"] not in DETERMINISTIC_MODELS:
+            self.paths.checkpoint_root.mkdir(parents=True, exist_ok=True)
         campaign_path = self.paths.log_root / "campaign.yaml"
         if not campaign_path.exists():
             try:
@@ -2032,13 +2033,20 @@ class CampaignRunner:
                 self.paths.log_root.resolve(),
             )
         logger.info("Campaign log root: %s", self.paths.log_root.resolve())
-        logger.info(
-            "Campaign checkpoint root: %s",
-            self.paths.checkpoint_root.resolve(),
+        if self.base_dict["model_type"] not in DETERMINISTIC_MODELS:
+            logger.info(
+                "Campaign checkpoint root: %s",
+                self.paths.checkpoint_root.resolve(),
+            )
+        result_layout = (
+            "datasets/, csv/, configs/, logs/, and summary/"
+            if self.paths.flat_results
+            else "hpo/, logs/seed_<seed>/, and summary/"
         )
         logger.info(
             "Campaign layout: campaign.yaml, identity.json, invocations/, "
-            "hpo/, logs/seed_<seed>/, and summary/ under %s.",
+            "%s under %s.",
+            result_layout,
             self.paths.log_root.resolve(),
         )
 

@@ -10,7 +10,14 @@ import pytest
 import yaml
 
 from baseline.brainomni.brainomni_config import BrainOmniConfig
-from baseline.hpo.artifacts import get_campaign_hash, resolve_campaign
+from baseline.catch22.catch22_config import Catch22Config
+from baseline.hpo.artifacts import (
+    build_campaign_paths,
+    collect_artifact_test_rows_with_diagnostics,
+    get_campaign_hash,
+    locate_completion,
+    resolve_campaign,
+)
 from baseline.hpo.config import HpoConfig
 from baseline.hpo.orchestrator import CampaignRunner
 from baseline.utils.identity import build_campaign_semantic_config
@@ -370,3 +377,96 @@ def test_audit_mode_does_not_create_campaign_artifacts(
     assert report["campaign_identity"] == runner.campaign_hash
     assert not runner.paths.log_root.exists()
     assert not runner.paths.checkpoint_root.exists()
+
+
+def test_deterministic_identity_excludes_declared_runtime_fields(
+    tmp_path: Path,
+) -> None:
+    """Runtime-only deterministic settings do not split campaigns."""
+    config = Catch22Config(
+        data={"datasets": {"adftd": "finetune"}},
+        logging={"run_dir": str(tmp_path)},
+    ).model_dump(mode="json")
+    original = get_campaign_hash(config, {})
+    changed = copy.deepcopy(config)
+    changed["data"]["batch_size"] = 64
+    changed["data"]["load_batch_size"] = 64
+    changed["data"]["num_workers"] = 8
+    changed["data"]["datasets"]["bcic_2a"] = "finetune"
+    changed["model"]["extractor"]["n_jobs"] = 2
+    assert get_campaign_hash(changed, {}) == original
+
+    semantic = copy.deepcopy(config)
+    semantic["model"]["classifier"]["alphas"] = [0.1]
+    assert get_campaign_hash(semantic, {}) != original
+
+    paths = build_campaign_paths(
+        str(tmp_path),
+        "catch22",
+        "catch22",
+        original,
+    )
+    assert paths.flat_results is True
+    assert paths.seed_log_root(42) == paths.log_root
+
+
+def test_campaign_adopts_matching_legacy_flat_extractor_root(
+    tmp_path: Path,
+) -> None:
+    """One completed flat extractor root is reused without result copying."""
+    config = Catch22Config(
+        data={"datasets": {"adftd": "finetune"}},
+        logging={"run_dir": str(tmp_path), "experiment_name": "catch22"},
+    ).model_dump(mode="json")
+    legacy_root = tmp_path / "log" / "baseline" / "catch22" / "legacy"
+    config_path = legacy_root / "configs" / "legacy-run.yaml"
+    config_path.parent.mkdir(parents=True)
+    saved = copy.deepcopy(config)
+    saved["seed"] = saved.pop("seeds")[0]
+    config_path.write_text(yaml.safe_dump(saved), encoding="utf-8")
+    completion_path = legacy_root / "datasets" / "adftd" / "completion.json"
+    completion_path.parent.mkdir(parents=True)
+    completion_path.write_text(
+        json.dumps({
+            "status": "completed",
+            "dataset_config": "finetune",
+            "execution_id": "legacy-run",
+            "invocation_id": "current-invocation",
+            "model_type": "catch22",
+            "has_checkpoint": False,
+            "checkpoint_path": None,
+            "test_metrics": {"adftd/test/balanced_acc": 0.5},
+        }),
+        encoding="utf-8",
+    )
+
+    resolution = resolve_campaign(
+        str(tmp_path),
+        "catch22",
+        "catch22",
+        config,
+        {},
+    )
+    located = locate_completion(
+        resolution.paths.log_root,
+        resolution.campaign_identity,
+        42,
+        "adftd",
+        config,
+        resolution.aliases,
+    )
+
+    assert resolution.paths.log_root == legacy_root
+    assert resolution.legacy is True
+    assert resolution.paths.flat_results is True
+    assert resolution.paths.seed_log_root(42) == legacy_root
+    assert located.compatibility.compatible
+    assert located.compatibility.mode == "legacy_flat_semantic_compatible"
+    rows, diagnostics = collect_artifact_test_rows_with_diagnostics(
+        legacy_root,
+        resolution.campaign_identity,
+        resolution.aliases,
+        invocation_id="current-invocation",
+    )
+    assert len(rows) == 1
+    assert len(diagnostics["accepted"]) == 1

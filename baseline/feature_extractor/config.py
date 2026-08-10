@@ -147,5 +147,10 @@ class FeatureExtractorConfig(AbstractConfig):
             raise ValueError(
                 f"{self.model_type} requires at least one configured dataset."
             )
+        if len(self.seeds) != 1:
+            raise ValueError(
+                f"{self.model_type} supports exactly one deterministic "
+                f"seed, but got {self.seeds}."
+            )
         return True
 
