@@ -147,9 +147,9 @@ class StudyRuntime:
     checkpoint_root : pathlib.Path
         Exclusive namespaced trial checkpoint root.
     legacy : bool
-        Whether the selected study lives in legacy shared SQLite storage.
+        Whether the selected study uses a historical storage namespace.
     duplicate_names : tuple[str, ...]
-        Preserved non-selected study names found in legacy storage.
+        Preserved non-selected study names found in the HPO scope.
     lock_file : BinaryIO
         Open file whose advisory lock is held for this runtime.
     removed_trial_numbers : tuple[int, ...], optional
@@ -1280,6 +1280,16 @@ def _read_sqlite_studies(storage_path: Path) -> list[Dict[str, Any]]:
         ).fetchall()
         records: list[Dict[str, Any]] = []
         for study in studies:
+            attribute_rows = connection.execute(
+                "SELECT key, value_json FROM study_user_attributes "
+                "WHERE study_id = ? ORDER BY study_user_attribute_id",
+                (study["study_id"],),
+            ).fetchall()
+            user_attributes = {
+                row["key"]: json.loads(row["value_json"])
+                for row in attribute_rows
+            }
+            semantic_fields = _study_semantic_fields(user_attributes)
             state_rows = connection.execute(
                 "SELECT state, COUNT(*) AS count FROM trials "
                 "WHERE study_id = ? GROUP BY state",
@@ -1350,6 +1360,7 @@ def _read_sqlite_studies(storage_path: Path) -> list[Dict[str, Any]]:
                     if best_row is not None
                     else None
                 ),
+                **semantic_fields,
             })
         return records
     except (json.JSONDecodeError, sqlite3.Error) as exc:
@@ -1359,6 +1370,168 @@ def _read_sqlite_studies(storage_path: Path) -> list[Dict[str, Any]]:
     finally:
         if "connection" in locals():
             connection.close()
+
+
+def _study_semantic_payload(
+    user_attributes: Mapping[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Parse one persisted semantic study payload.
+
+    Parameters
+    ----------
+    user_attributes : Mapping[str, Any]
+        Optuna study user attributes.
+
+    Returns
+    -------
+    dict[str, Any] or None
+        Parsed payload, or None when it is absent or invalid.
+    """
+    raw_payload = user_attributes.get("semantic_payload")
+    if not isinstance(raw_payload, str):
+        return None
+    try:
+        payload = json.loads(raw_payload)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def _study_semantic_fields(
+    user_attributes: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Return normalized semantic fields for candidate selection.
+
+    Parameters
+    ----------
+    user_attributes : Mapping[str, Any]
+        Optuna study user attributes.
+
+    Returns
+    -------
+    dict[str, Any]
+        Presence, validity, campaign, schema version, and scope fields.
+    """
+    semantic_payload = _study_semantic_payload(user_attributes)
+    return {
+        "semantic_payload_present": (
+            "semantic_payload" in user_attributes
+        ),
+        "semantic_payload_valid": semantic_payload is not None,
+        "campaign_identity": (
+            semantic_payload.get("campaign_identity")
+            if semantic_payload is not None
+            else None
+        ),
+        "identity_version": (
+            semantic_payload.get("identity_version")
+            if semantic_payload is not None
+            else None
+        ),
+        "scope": (
+            semantic_payload.get("scope")
+            if semantic_payload is not None
+            else None
+        ),
+    }
+
+
+def _study_record_matches_semantics(
+    record: Mapping[str, Any],
+    scope: str,
+    study_identity: str,
+    campaign_aliases: frozenset[str],
+) -> bool:
+    """Return whether persisted metadata identifies the requested study.
+
+    Parameters
+    ----------
+    record : Mapping[str, Any]
+        Candidate study metadata.
+    scope : str
+        Dataset name or multitask.
+    study_identity : str
+        Current semantic study identity.
+    campaign_aliases : frozenset[str]
+        Current and verified historical campaign identities.
+
+    Returns
+    -------
+    bool
+        Whether the candidate belongs to the same semantic HPO scope.
+    """
+    if record.get("semantic_payload_present"):
+        return bool(
+            record.get("semantic_payload_valid")
+            and record.get("scope") == scope
+            and record.get("campaign_identity") in campaign_aliases
+        )
+    study_name = record.get("study_name")
+    return bool(
+        isinstance(study_name, str)
+        and (
+            study_name == study_identity
+            or study_name.endswith(f"-{scope}")
+        )
+    )
+
+
+def _top_study_records(
+    records: list[Dict[str, Any]],
+    study_identity: str,
+    campaign_identity: str,
+    requested_budget: int,
+) -> list[Dict[str, Any]]:
+    """Return the strongest compatible persisted study candidates.
+
+    Selection first preserves the greatest completed-or-pruned trial budget,
+    then prefers current semantic identifiers and the newest identity schema.
+    Equal candidates remain ambiguous rather than selecting by filesystem
+    order or objective value.
+
+    Parameters
+    ----------
+    records : list[dict[str, Any]]
+        Compatible candidate metadata.
+    study_identity : str
+        Current semantic study identity.
+    campaign_identity : str
+        Current semantic campaign identity.
+    requested_budget : int
+        Requested completed-or-pruned trial count.
+
+    Returns
+    -------
+    list[dict[str, Any]]
+        One selected record, tied records, or an empty list.
+    """
+    if not records:
+        return []
+
+    def priority(record: Mapping[str, Any]) -> tuple[int, ...]:
+        budgeted = int(record["complete"]) + int(record["pruned"])
+        raw_version = record.get("identity_version")
+        identity_version = (
+            int(raw_version)
+            if isinstance(raw_version, int)
+            and not isinstance(raw_version, bool)
+            else -1
+        )
+        return (
+            int(budgeted >= requested_budget),
+            budgeted,
+            int(record.get("study_name") == study_identity),
+            int(record.get("campaign_identity") == campaign_identity),
+            identity_version,
+        )
+
+    best_priority = max(priority(record) for record in records)
+    return [
+        record for record in records
+        if priority(record) == best_priority
+    ]
 
 
 def _study_progress(trials: list[Any]) -> tuple[int, int]:
@@ -2095,95 +2268,136 @@ class CampaignRunner:
         )
         return sampler, pruner
 
-    def _legacy_study(
+    def _existing_study(
         self,
-        storage_path: Path,
+        scope_root: Path,
         scope: str,
-        storage: str,
-    ) -> tuple[Optional[Any], tuple[str, ...]]:
-        """Select a unique compatible legacy study without touching others.
+        study_identity: str,
+    ) -> tuple[Optional[Any], Optional[Path], tuple[str, ...]]:
+        """Select the strongest compatible historical study read-only.
 
         Parameters
         ----------
-        storage_path : pathlib.Path
-            Existing legacy SQLite path.
+        scope_root : pathlib.Path
+            HPO scope containing flat and namespaced study databases.
         scope : str
-            Dataset name or ``multitask``.
-        storage : str
-            Optuna SQLite storage URL.
+            Dataset name or multitask.
+        study_identity : str
+            Current semantic study identity.
 
         Returns
         -------
-        tuple[Any or None, tuple[str, ...]]
-            Selected study and preserved non-selected study names.
+        tuple[Any or None, pathlib.Path or None, tuple[str, ...]]
+            Selected study, its database path, and preserved non-selected
+            study names.
 
         Raises
         ------
         RuntimeError
-            If multiple equally eligible legacy studies are compatible.
+            If multiple equally strong historical studies are compatible.
         """
         import optuna
 
-        if not storage_path.is_file():
-            return None, ()
-        summaries = optuna.study.get_all_study_summaries(storage=storage)
-        direction = self.hpo_config.objective.direction.upper()
-        compatible: list[tuple[Any, int, bool]] = []
-        all_names: list[str] = []
-        expected_names = {
-            f"{alias}-{scope}"
-            for alias in self.campaign_aliases
-        }
-        for summary in summaries:
-            all_names.append(summary.study_name)
-            if not summary.study_name.endswith(f"-{scope}"):
-                continue
-            if summary.direction.name != direction:
-                continue
-            sampler, pruner = self._study_sampler_and_pruner()
-            candidate = optuna.load_study(
-                study_name=summary.study_name,
-                storage=storage,
-                sampler=sampler,
-                pruner=pruner,
+        storage_paths = [scope_root / "study.sqlite3"]
+        studies_root = scope_root / "studies"
+        if studies_root.is_dir():
+            storage_paths.extend(
+                sorted(studies_root.glob("*/study.sqlite3"))
             )
-            trials = candidate.get_trials(deepcopy=False)
-            if not _trial_metadata_matches(trials, self.hpo_config):
+        direction = self.hpo_config.objective.direction.upper()
+        compatible: list[tuple[Any, Dict[str, Any]]] = []
+        all_names: list[str] = []
+        aliases = frozenset({
+            self.campaign_hash,
+            *self.campaign_aliases,
+        })
+        for storage_path in storage_paths:
+            if not storage_path.is_file():
                 continue
-            budgeted, _ = _study_progress(trials)
-            compatible.append((
-                candidate,
-                budgeted,
-                summary.study_name in expected_names,
-            ))
+            storage = f"sqlite:///{storage_path.resolve()}"
+            summaries = optuna.study.get_all_study_summaries(
+                storage=storage
+            )
+            for summary in summaries:
+                all_names.append(summary.study_name)
+                if summary.direction.name != direction:
+                    continue
+                sampler, pruner = self._study_sampler_and_pruner()
+                candidate = optuna.load_study(
+                    study_name=summary.study_name,
+                    storage=storage,
+                    sampler=sampler,
+                    pruner=pruner,
+                )
+                trials = candidate.get_trials(deepcopy=False)
+                semantic_fields = _study_semantic_fields(
+                    candidate.user_attrs
+                )
+                record: Dict[str, Any] = {
+                    "study_name": summary.study_name,
+                    "storage_path": str(storage_path.resolve()),
+                    "complete": sum(
+                        trial.state.name == "COMPLETE" for trial in trials
+                    ),
+                    "pruned": sum(
+                        trial.state.name == "PRUNED" for trial in trials
+                    ),
+                    **semantic_fields,
+                }
+                if not _study_record_matches_semantics(
+                    record,
+                    scope,
+                    study_identity,
+                    aliases,
+                ):
+                    continue
+                parameterized = any(
+                    trial.distributions for trial in trials
+                )
+                if parameterized and not _trial_metadata_matches(
+                    trials,
+                    self.hpo_config,
+                ):
+                    continue
+                if not parameterized and summary.study_name != study_identity:
+                    continue
+                compatible.append((candidate, record))
 
-        complete = [
-            item for item in compatible
-            if item[1] >= self.hpo_config.n_trials
-        ]
-        matching_partial = [
-            item for item in compatible if item[2]
-        ]
-        if complete:
-            eligible = complete
-        elif matching_partial:
-            eligible = matching_partial
-        else:
-            eligible = compatible
-        if len(eligible) > 1:
+        eligible_records = _top_study_records(
+            [record for _, record in compatible],
+            study_identity,
+            self.campaign_hash,
+            self.hpo_config.n_trials,
+        )
+        if len(eligible_records) > 1:
             names = ", ".join(
-                study.study_name for study, _, _ in eligible
+                f"{record['study_name']} at {record['storage_path']}"
+                for record in eligible_records
             )
             raise RuntimeError(
-                f"Multiple compatible legacy HPO studies exist for scope "
-                f"'{scope}' in {storage_path.resolve()}: {names}."
+                f"Multiple equally strong compatible HPO studies exist "
+                f"for scope '{scope}': {names}."
             )
-        selected = eligible[0][0] if eligible else None
+        selected_record = (
+            eligible_records[0] if eligible_records else None
+        )
+        selected = next(
+            (
+                candidate for candidate, record in compatible
+                if record is selected_record
+            ),
+            None,
+        )
+        selected_path = (
+            Path(selected_record["storage_path"])
+            if selected_record is not None
+            else None
+        )
         selected_name = selected.study_name if selected is not None else None
         duplicates = tuple(
             name for name in all_names if name != selected_name
         )
-        return selected, duplicates
+        return selected, selected_path, duplicates
 
     def _create_study(self, scope: str) -> StudyRuntime:
         """Create or resume one exclusively locked rank-zero Optuna study."""
@@ -2197,15 +2411,19 @@ class CampaignRunner:
 
         study_identity, identity_payload = self._study_identity(scope)
         scope_root = _hpo_scope_root(self.paths.log_root, scope)
-        artifact_root = scope_root / "studies" / study_identity
-        checkpoint_root = (
+        requested_artifact_root = (
+            scope_root / "studies" / study_identity
+        )
+        requested_checkpoint_root = (
             _hpo_scope_root(self.paths.checkpoint_root, scope)
             / "studies"
             / study_identity
         )
-        artifact_root.mkdir(parents=True, exist_ok=True)
-        checkpoint_root.mkdir(parents=True, exist_ok=True)
-        lock_path = artifact_root / ".study.lock"
+        requested_storage_path = (
+            requested_artifact_root / "study.sqlite3"
+        ).resolve()
+        scope_root.mkdir(parents=True, exist_ok=True)
+        lock_path = scope_root / ".study.lock"
         lock_file = lock_path.open("a+b")
         try:
             fcntl.flock(
@@ -2216,24 +2434,42 @@ class CampaignRunner:
             lock_file.close()
             raise RuntimeError(
                 "Another process is already writing semantic HPO study "
-                f"{study_identity} at {artifact_root.resolve()}."
+                f"{study_identity} at {scope_root.resolve()}."
             ) from exc
 
         legacy_path = (scope_root / "study.sqlite3").resolve()
-        legacy_storage = f"sqlite:///{legacy_path}"
         try:
-            study, duplicates = self._legacy_study(
-                legacy_path,
+            study, selected_path, duplicates = self._existing_study(
+                scope_root,
                 scope,
-                legacy_storage,
+                study_identity,
             )
-            legacy = study is not None
-            if legacy:
-                storage_path = legacy_path
-                storage = legacy_storage
-            else:
-                storage_path = (artifact_root / "study.sqlite3").resolve()
+            if study is not None:
+                if selected_path is None:
+                    raise RuntimeError(
+                        "Selected HPO study has no SQLite storage path."
+                    )
+                storage_path = selected_path.resolve()
                 storage = f"sqlite:///{storage_path}"
+                if storage_path == legacy_path:
+                    artifact_root = requested_artifact_root
+                    checkpoint_root = requested_checkpoint_root
+                else:
+                    artifact_root = storage_path.parent
+                    checkpoint_root = (
+                        _hpo_scope_root(
+                            self.paths.checkpoint_root,
+                            scope,
+                        )
+                        / "studies"
+                        / artifact_root.name
+                    )
+            else:
+                artifact_root = requested_artifact_root
+                checkpoint_root = requested_checkpoint_root
+                storage_path = requested_storage_path
+                storage = f"sqlite:///{storage_path}"
+                artifact_root.mkdir(parents=True, exist_ok=True)
                 sampler, pruner = self._study_sampler_and_pruner()
                 study = optuna.create_study(
                     study_name=study_identity,
@@ -2263,9 +2499,18 @@ class CampaignRunner:
                         "Study identity collision or corrupt semantic metadata "
                         f"at {storage_path}."
                     )
+            artifact_root.mkdir(parents=True, exist_ok=True)
+            checkpoint_root.mkdir(parents=True, exist_ok=True)
+            selected_identity = study.user_attrs.get("study_identity")
+            if (
+                not isinstance(selected_identity, str)
+                or not selected_identity
+            ):
+                selected_identity = study.study_name
+            legacy = storage_path != requested_storage_path
             artifact_roots = (
                 (artifact_root, scope_root)
-                if legacy
+                if storage_path == legacy_path
                 else (artifact_root,)
             )
             checkpoint_scope_root = _hpo_scope_root(
@@ -2274,7 +2519,7 @@ class CampaignRunner:
             )
             checkpoint_roots = (
                 (checkpoint_root, checkpoint_scope_root)
-                if legacy
+                if storage_path == legacy_path
                 else (checkpoint_root,)
             )
             removed_trials = _cleanup_unbudgeted_hpo_trials(
@@ -2299,15 +2544,15 @@ class CampaignRunner:
                 )
             if duplicates:
                 logger.warning(
-                    "Preserving non-selected HPO studies for scope %s in %s: "
-                    "%s.",
+                    "Preserving non-selected HPO studies for scope %s under "
+                    "%s: %s.",
                     scope,
-                    legacy_path,
+                    scope_root.resolve(),
                     ", ".join(duplicates),
                 )
             return StudyRuntime(
                 study=study,
-                study_identity=study_identity,
+                study_identity=selected_identity,
                 storage_path=storage_path,
                 artifact_root=artifact_root,
                 checkpoint_root=checkpoint_root,
@@ -2374,17 +2619,18 @@ class CampaignRunner:
         runtime = self._create_study(scope) if get_is_master() else None
         self._active_study_runtime = runtime
         study = runtime.study if runtime is not None else None
-        study_identity, _ = self._study_identity(scope)
-        artifact_root = (
-            _hpo_scope_root(self.paths.log_root, scope)
-            / "studies"
-            / study_identity
-        )
-        checkpoint_study_root = (
-            _hpo_scope_root(self.paths.checkpoint_root, scope)
-            / "studies"
-            / study_identity
-        )
+        if get_is_master():
+            study_paths = {
+                "study_identity": runtime.study_identity,
+                "artifact_root": str(runtime.artifact_root),
+                "checkpoint_root": str(runtime.checkpoint_root),
+            }
+        else:
+            study_paths = None
+        study_paths = _broadcast_object(study_paths)
+        study_identity = str(study_paths["study_identity"])
+        artifact_root = Path(study_paths["artifact_root"])
+        checkpoint_study_root = Path(study_paths["checkpoint_root"])
         if get_is_master():
             persisted_trials = study.get_trials(deepcopy=False)
             budgeted, consecutive_failures = _study_progress(
@@ -3603,18 +3849,20 @@ class CampaignRunner:
         records: list[Dict[str, Any]] = []
         for storage_path in storage_paths:
             records.extend(_read_sqlite_studies(storage_path))
-        expected_names = {
-            study_identity,
-            *(f"{alias}-{scope}" for alias in self.campaign_aliases),
-        }
+        campaign_aliases = frozenset({
+            self.campaign_hash,
+            *self.campaign_aliases,
+        })
         expected_distributions = _serialized_trial_distributions(
             self.hpo_config
         )
         compatible = [
             record for record in records
-            if (
-                record["study_name"] == study_identity
-                or record["study_name"].endswith(f"-{scope}")
+            if _study_record_matches_semantics(
+                record,
+                scope,
+                study_identity,
+                campaign_aliases,
             )
             and str(record["direction"]).lower()
             == self.hpo_config.objective.direction
@@ -3622,21 +3870,12 @@ class CampaignRunner:
             and record["distributions"]
             == expected_distributions
         ]
-        complete = [
-            record for record in compatible
-            if record["complete"] + record["pruned"]
-            >= self.hpo_config.n_trials
-        ]
-        matching_partial = [
-            record for record in compatible
-            if record["study_name"] in expected_names
-        ]
-        if complete:
-            eligible = complete
-        elif matching_partial:
-            eligible = matching_partial
-        else:
-            eligible = compatible
+        eligible = _top_study_records(
+            compatible,
+            study_identity,
+            self.campaign_hash,
+            self.hpo_config.n_trials,
+        )
         report: Dict[str, Any] = {
             "scope": scope,
             "study_identity": study_identity,

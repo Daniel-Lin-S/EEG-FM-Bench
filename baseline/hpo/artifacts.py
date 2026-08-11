@@ -365,7 +365,7 @@ def _campaign_aliases(
     -------
     frozenset[str]
         Full identity, display prefix, detectable directory suffix, and IDs
-        recovered from contained completion metadata.
+        recovered from immutable campaign and completion metadata.
     """
     aliases = {campaign_identity, short_identity(campaign_identity)}
     prefix = f"{experiment_name}-"
@@ -377,6 +377,18 @@ def _campaign_aliases(
         final_component = log_root.name.rsplit("-", maxsplit=1)[-1]
         if final_component:
             aliases.add(final_component)
+    identity_path = log_root / "identity.json"
+    if identity_path.is_file():
+        try:
+            identity_payload = json.loads(
+                identity_path.read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError):
+            identity_payload = None
+        if isinstance(identity_payload, dict):
+            stored_identity = identity_payload.get("campaign_identity")
+            if isinstance(stored_identity, str) and stored_identity:
+                aliases.add(stored_identity)
     for completion_path in sorted(
         log_root.glob("logs/seed_*/datasets/*/completion.json")
     ):

@@ -222,6 +222,7 @@ def test_resolver_reuses_unique_legacy_root_without_rewriting(
 
     assert resolution.paths.log_root == legacy_root
     assert resolution.legacy is True
+    assert "a" * 64 in resolution.aliases
     assert "3f68277ec5ec" in resolution.aliases
     assert (legacy_root / "campaign.yaml").read_bytes() == original
     assert identity_path.read_bytes() == original_identity

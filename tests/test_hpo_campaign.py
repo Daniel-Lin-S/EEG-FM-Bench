@@ -632,6 +632,121 @@ def test_completed_hpo_budget_reuses_winner_without_trainer(
     ).is_file()
 
 
+def test_completed_versioned_study_survives_identity_schema_change(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A completed predecessor is selected across identity versions."""
+    import optuna
+
+    runner = CampaignRunner.__new__(CampaignRunner)
+    runner.paths = CampaignPaths(
+        log_root=tmp_path / "log",
+        checkpoint_root=tmp_path / "ckpt",
+    )
+    runner.campaign_hash = "current-campaign"
+    runner.campaign_aliases = frozenset({"historic-campaign"})
+    runner.hpo_config = make_hpo_config().model_copy(
+        update={"n_trials": 1}
+    )
+    scope_config = BrainOmniConfig().model_dump(mode="json")
+    runner.base_dict = scope_config
+    runner.config_class = BrainOmniConfig
+    runner.invocation_root = tmp_path / "log" / "invocations" / "test"
+    runner.invocation_root.mkdir(parents=True)
+    runner._active_study_runtime = None
+
+    scope_root = _hpo_scope_root(runner.paths.log_root, "alpha")
+    historic_identity = "historic-study"
+    historic_root = scope_root / "studies" / historic_identity
+    historic_root.mkdir(parents=True)
+    storage_path = (historic_root / "study.sqlite3").resolve()
+    historic = optuna.create_study(
+        study_name=historic_identity,
+        storage=f"sqlite:///{storage_path}",
+        direction="minimize",
+    )
+    historic.set_user_attr("identity_version", 3)
+    historic.set_user_attr("study_identity", historic_identity)
+    historic.set_user_attr(
+        "semantic_payload",
+        json.dumps({
+            "identity_version": 3,
+            "campaign_identity": "historic-campaign",
+            "scope": "alpha",
+        }, sort_keys=True, separators=(",", ":")),
+    )
+    trial = historic.ask()
+    _, decoded = sample_config(
+        scope_config,
+        runner.hpo_config,
+        trial,
+    )
+    trial.set_user_attr("decoded_params", decoded)
+    historic.tell(trial, 1.0)
+    best_payload = {
+        "study_identity": historic_identity,
+        "trial_number": 0,
+        "objective": 1.0,
+        "parameters": decoded,
+    }
+    (historic_root / "best_trial_00000.json").write_text(
+        json.dumps(best_payload, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    current_identity, _ = runner._study_identity("alpha")
+    current_root = scope_root / "studies" / current_identity
+    current_root.mkdir(parents=True)
+    current_storage_path = (current_root / "study.sqlite3").resolve()
+    current = optuna.create_study(
+        study_name=current_identity,
+        storage=f"sqlite:///{current_storage_path}",
+        direction="minimize",
+    )
+    current.set_user_attr("identity_version", 4)
+    current.set_user_attr("study_identity", current_identity)
+    current.set_user_attr(
+        "semantic_payload",
+        json.dumps({
+            "identity_version": 4,
+            "campaign_identity": "current-campaign",
+            "scope": "alpha",
+        }, sort_keys=True, separators=(",", ":")),
+    )
+    current_trial = current.ask()
+    sample_config(scope_config, runner.hpo_config, current_trial)
+
+    audit_report, audited = runner._audit_hpo_scope(
+        "alpha",
+        scope_config,
+    )
+    assert audit_report["status"] == "selected"
+    assert audit_report["selected"]["study_name"] == historic_identity
+    assert audited is not None
+
+    def reject_training(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("trainer must not be constructed")
+
+    monkeypatch.setattr(runner, "_run_adaptive_trainer", reject_training)
+    selected = runner._run_hpo_scope("alpha", scope_config)
+
+    expected = json.loads(json.dumps(scope_config))
+    for dotted_path, value in decoded.items():
+        orchestrator_module.set_dotted_value(
+            expected,
+            dotted_path,
+            value,
+        )
+    assert selected == expected
+    assert runner.selection_provenance["alpha"]["study_identity"] == (
+        historic_identity
+    )
+    assert len(current.trials) == 1
+    assert current.trials[0].state.name == "RUNNING"
+
+
 def _study_test_runner(tmp_path: Path) -> CampaignRunner:
     """Return a minimal runner for study storage and lock tests."""
     runner = CampaignRunner.__new__(CampaignRunner)
