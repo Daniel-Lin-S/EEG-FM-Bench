@@ -40,7 +40,7 @@ from data.dataset.trujillo_2019 import Trujillo2019Builder
 from data.dataset.tue.tuab import TuabBuilder
 from data.dataset.tue.tuar import TuarBuilder
 from data.dataset.tue.tueg import TuegBuilder
-from data.dataset.tue.tuep import TuepBuilder
+from data.dataset.tue.tuep import TuepBuilder, TuepV200Builder
 from data.dataset.tue.tuev import TuevBuilder
 from data.dataset.tue.tusl import TuslBuilder
 from data.dataset.tue.tusz import TuszBuilder
@@ -56,6 +56,7 @@ DATASET_SELECTOR: dict[str, Type[EEGDatasetBuilder]] = {
     'tuar': TuarBuilder,
     'tueg': TuegBuilder,
     'tuep': TuepBuilder,
+    'tuep_v2_0_0': TuepV200Builder,
     'tuev': TuevBuilder,
     'tusl': TuslBuilder,
     'tusz': TuszBuilder,

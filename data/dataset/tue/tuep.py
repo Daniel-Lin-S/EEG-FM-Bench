@@ -8,6 +8,13 @@ from pandas import DataFrame
 from common.type import DatasetTaskType
 from data.processor.builder import EEGDatasetBuilder, EEGConfig
 
+OFFICIAL_LABEL_PREFIX_LENGTH = 3
+OFFICIAL_CLASS_DIRS = {'00_epilepsy', '01_no_epilepsy'}
+LEGACY_CLASS_LABELS = {
+    'epilepsy_edf': 'epilepsy',
+    'no_epilepsy_edf': 'no_epilepsy',
+}
+
 
 @dataclass
 class TuepConfig(EEGConfig):
@@ -152,9 +159,21 @@ class TuepBuilder(EEGDatasetBuilder):
         })
         return info
 
-    def _resolve_exp_events(self, file_path: str, info: dict[str, Any]) -> dict[str, list[tuple[str, int, int]]]:
-        label = self._extract_middle_path(file_path, -5, -4)[0]
-        label = label[3:]
+    def _resolve_exp_events(
+            self, file_path: str, info: dict[str, Any]
+    ) -> list[tuple[str, int, int]]:
+        class_dir = self._extract_middle_path(file_path, -5, -4)[0]
+        if class_dir not in OFFICIAL_CLASS_DIRS:
+            raise ValueError(
+                f'Expected official TUEP class directory in '
+                f'{sorted(OFFICIAL_CLASS_DIRS)}, but got {class_dir!r} '
+                f'for recording {file_path}.')
+
+        label = class_dir[OFFICIAL_LABEL_PREFIX_LENGTH:]
+        if label not in self.config.category:
+            raise ValueError(
+                f'Expected TUEP label in {self.config.category}, but got '
+                f'{label!r} from class directory {class_dir!r}.')
         return [(label, 0, -1)]
 
     def _divide_split(self, df: DataFrame) -> DataFrame:
@@ -170,6 +189,61 @@ class TuepBuilder(EEGDatasetBuilder):
         chs_std = [self.montage_10_20_replace_dict.get(ch, ch) for ch in chs_std]
         self._std_chs_cache[montage] = chs_std
         return chs_std
+
+
+@dataclass
+class TuepV200Config(TuepConfig):
+    """Configuration for the Tianpu TUEP v2.0.0 directory layout."""
+
+    version: Optional[Union[datasets.utils.Version, str]] = (
+        datasets.utils.Version("2.0.0")
+    )
+    dataset_name: Optional[str] = 'tuep_v2_0_0'
+    suffix_path: str = os.path.join('TUE', 'tuep_v2_0_0')
+
+
+class TuepV200Builder(TuepBuilder):
+    """Build TUEP v2.0.0 from separate epilepsy and no-epilepsy roots."""
+
+    BUILDER_CONFIG_CLASS = TuepV200Config
+    BUILDER_CONFIGS = [
+        BUILDER_CONFIG_CLASS(name='pretrain'),
+        BUILDER_CONFIG_CLASS(name='finetune', is_finetune=True),
+    ]
+
+    def _resolve_exp_events(
+            self, file_path: str, info: dict[str, Any]
+    ) -> list[tuple[str, int, int]]:
+        """Return the legacy class label encoded in the top-level directory.
+
+        Parameters
+        ----------
+        file_path : str
+            Absolute EDF path below the configured TUEP v2.0.0 raw root.
+        info : dict[str, Any]
+            Recording metadata. It is not used because the corpus label is
+            encoded by the top-level class directory.
+
+        Returns
+        -------
+        list[tuple[str, int, int]]
+            One full-recording event labelled ``epilepsy`` or ``no_epilepsy``.
+
+        Raises
+        ------
+        ValueError
+            If the recording is not below a recognised legacy class root.
+        """
+        relative_path = os.path.relpath(file_path, self.config.raw_path)
+        class_dir = relative_path.split(os.sep, maxsplit=1)[0]
+        try:
+            label = LEGACY_CLASS_LABELS[class_dir]
+        except KeyError as error:
+            raise ValueError(
+                f'Expected legacy TUEP class directory in '
+                f'{sorted(LEGACY_CLASS_LABELS)}, but got {class_dir!r} '
+                f'for recording {file_path}.') from error
+        return [(label, 0, -1)]
 
 
 if __name__ == "__main__":
