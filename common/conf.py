@@ -18,7 +18,8 @@ class BasePreprocArgs(BaseModel):
         resampled dataset written to disk and must match the model's requirements
     clean_middle_cache : bool, optional, default=False
         Clears intermediate artifacts and dependent processed Arrow output before
-        rebuilding each selected dataset.
+        rebuilding each selected dataset. It is ignored for completed Arrow
+        datasets unless ``refresh_arrow`` is true.
     clean_shared_info : bool, optional, default=False
         Includes shared builder metadata in cache cleanup. Has no effect unless
         ``clean_middle_cache`` is enabled.
@@ -47,11 +48,11 @@ class BasePreprocArgs(BaseModel):
     fs: int = 256
     clean_middle_cache: bool = False
     clean_shared_info: bool = False
-    # Recompute only these auxiliary field flows from cached recordings.
+    # Recompute only these auxiliary field flows when refresh_arrow is true.
     # ``pos`` currently is the sole supported field flow.
     refresh_fields: list[str] = Field(default_factory=lambda: [])
-    # Rebuild final Arrow artifacts from valid intermediate/field caches without
-    # discarding the signal cache.
+    # Explicitly rebuild final Arrow artifacts from valid intermediate/field
+    # caches. Existing completed Arrow artifacts are preserved when false.
     refresh_arrow: bool = False
     num_preproc_arrow_writers: int = 4
     num_preproc_mid_workers: int = 6

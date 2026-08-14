@@ -14,9 +14,11 @@ clean_shared_info : bool, optional, default=False
     Also clears shared builder metadata during cache cleanup; ignored unless
     ``clean_middle_cache`` is true.
 refresh_fields : list[str], optional, default=[]
-    Field flows to force-refresh after signal-cache reuse. ``pos`` is currently supported.
+    Field flows to force-refresh when ``refresh_arrow`` is true. ``pos`` is
+    currently supported.
 refresh_arrow : bool, optional, default=False
-    Rebuild final Arrow artifacts from valid intermediate and field caches only.
+    Explicitly rebuild final Arrow artifacts from valid intermediate and field
+    caches. Existing completed Arrow artifacts are never changed when false.
 num_preproc_arrow_writers : int, optional, default=4
     Worker processes used by ``download_and_prepare`` to materialize the final
     Arrow dataset.
@@ -51,7 +53,7 @@ from common.conf import BasePreprocArgs
 from common.log import setup_log
 from common.path import get_conf_file_path
 from data.processor.builder import EEGDatasetBuilder
-from data.processor.wrapper import DATASET_SELECTOR
+from data.processor.wrapper import DATASET_SELECTOR, resolve_dataset_builder
 
 
 logger = logging.getLogger('preproc')
@@ -119,6 +121,78 @@ def _failure_reason(error: Exception) -> str:
     return f'{type(error).__name__}: {message}' if message else type(error).__name__
 
 
+def _processed_arrow_root(builder: EEGDatasetBuilder) -> str | None:
+    """Return the final Arrow root for a builder with local output paths.
+
+    Parameters
+    ----------
+    builder : EEGDatasetBuilder
+        Dataset builder whose final output location is inspected.
+
+    Returns
+    -------
+    str, optional
+        Absolute final Arrow root, or ``None`` when the builder does not expose
+        a local processed-output contract.
+    """
+    config = getattr(builder, 'config', None)
+    if config is None or bool(getattr(config, 'is_remote_fs', False)):
+        return None
+    data_path = getattr(config, 'data_path', None)
+    dataset_name = getattr(config, 'dataset_name', None)
+    config_name = getattr(config, 'name', None)
+    if not all(isinstance(value, str) and value for value in (
+            data_path,
+            dataset_name,
+            config_name,
+    )):
+        return None
+    return os.path.join(data_path, dataset_name, config_name)
+
+
+def _load_existing_processed_dataset(
+        builder: EEGDatasetBuilder,
+) -> tuple[int, str] | None:
+    """Validate an existing local Arrow dataset without altering it.
+
+    Parameters
+    ----------
+    builder : EEGDatasetBuilder
+        Builder used only to load and validate final Arrow artifacts.
+
+    Returns
+    -------
+    tuple[int, str], optional
+        Sample count and output directory when a valid final dataset exists.
+        ``None`` when no final Arrow artifact exists.
+
+    Raises
+    ------
+    RuntimeError
+        If Arrow artifacts exist but are not a valid completed dataset.
+    """
+    arrow_root = _processed_arrow_root(builder)
+    if arrow_root is None:
+        return None
+    arrow_files = []
+    if os.path.isdir(arrow_root):
+        for root, _, files in os.walk(arrow_root):
+            arrow_files.extend(
+                os.path.join(root, file_name)
+                for file_name in files
+                if file_name.endswith('.arrow')
+            )
+    if not arrow_files:
+        return None
+    try:
+        return _validate_prepared_dataset(builder.as_dataset(), builder)
+    except Exception as error:
+        raise RuntimeError(
+            'Existing processed Arrow artifacts are incomplete or unreadable; '
+            'refusing to replace them while refresh_arrow is false.'
+        ) from error
+
+
 def prepare_dataset(
         conf: BasePreprocArgs,
         builder_cls: Type[EEGDatasetBuilder],
@@ -129,13 +203,28 @@ def prepare_dataset(
     try:
         logger.info(f"Preparing dataset {dataset_name} {config_name} at fs={conf.fs}Hz...")
         builder = builder_cls(config_name, fs=conf.fs)
+        if not conf.refresh_arrow:
+            existing = _load_existing_processed_dataset(builder)
+            if existing is not None:
+                sample_count, output_dir = existing
+                logger.info(
+                    f'Using completed Arrow dataset for {dataset_name} '
+                    f'{config_name} at {output_dir}.'
+                )
+                return DatasetPreparationResult(
+                    dataset_name=dataset_name,
+                    config_name=config_name,
+                    status='success',
+                    sample_count=sample_count,
+                    output_dir=output_dir,
+                )
         if conf.clean_middle_cache:
             builder.clean_all_cache(clean_shared_info=conf.clean_shared_info)
         builder.preproc(n_proc=conf.num_preproc_mid_workers)
-        materialize_fields = getattr(builder, 'materialize_fields', None)
-        fields_changed = materialize_fields(conf.refresh_fields) if materialize_fields else False
-        arrow_requires_refresh = getattr(builder, 'arrow_requires_refresh', None)
-        if fields_changed or conf.refresh_arrow or (arrow_requires_refresh and arrow_requires_refresh()):
+        if conf.refresh_arrow:
+            materialize_fields = getattr(builder, 'materialize_fields', None)
+            if materialize_fields is not None:
+                materialize_fields(conf.refresh_fields)
             builder.clean_arrow_set()
         builder.download_and_prepare(num_proc=conf.num_preproc_arrow_writers)
         dataset = builder.as_dataset()
@@ -179,10 +268,10 @@ def preproc(conf: BasePreprocArgs) -> list[DatasetPreparationResult]:
     results = []
     for dataset_name, config_name in zip(dataset_names, dataset_configs):
         try:
-            if dataset_name not in DATASET_SELECTOR:
-                raise ValueError(f'Dataset {dataset_name} is not supported')
-
-            builder_cls = DATASET_SELECTOR[dataset_name]
+            builder_cls = resolve_dataset_builder(
+                dataset_name,
+                dataset_selector=DATASET_SELECTOR,
+            )
             if config_name not in builder_cls.builder_configs:
                 raise ValueError(
                     f'Config {config_name} is not supported for dataset {dataset_name}'

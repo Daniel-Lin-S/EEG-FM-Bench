@@ -38,6 +38,7 @@ class TuarConfig(EEGConfig):
     dataset_name: Optional[str] = 'tuar'
     task_type: DatasetTaskType = DatasetTaskType.ARTIFACT
     file_ext: str = 'edf'
+    position_montage: Optional[str] = 'standard_1020'
     montage: dict[str, list[str]] = field(default_factory=lambda: {
         '01_tcp_ar': [
             'EEG FP1-REF',

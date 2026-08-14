@@ -41,13 +41,18 @@ class FakeSplit:
 
 def make_builder(name, root, events, *, fail=False, warnings=0, create_artifact=True,
                  sample_count=3):
-    artifact_path = Path(root) / name / f'{name}-train.arrow'
+    artifact_path = Path(root) / name / 'finetune' / f'{name}-train.arrow'
 
     class FakeBuilder:
         builder_configs = {'finetune': object()}
 
         def __init__(self, config_name, fs):
-            self.config = SimpleNamespace(is_remote_fs=False)
+            self.config = SimpleNamespace(
+                data_path=str(root),
+                dataset_name=name,
+                is_remote_fs=False,
+                name='finetune',
+            )
             self.cache_dir = str(Path(root) / name)
             self.preproc_warning_count = warnings
             self.preproc_warning_messages = (
@@ -67,6 +72,13 @@ def make_builder(name, root, events, *, fail=False, warnings=0, create_artifact=
             if create_artifact:
                 artifact_path.parent.mkdir(parents=True, exist_ok=True)
                 artifact_path.touch()
+
+        def clean_arrow_set(self):
+            events.append((name, 'clean_arrow'))
+
+        def materialize_fields(self, refresh_fields):
+            events.append((name, 'materialize', tuple(refresh_fields)))
+            return False
 
         def as_dataset(self):
             events.append((name, 'load'))
@@ -149,6 +161,127 @@ class PreprocessingStatusTests(unittest.TestCase):
 
         self.assertTrue(result.succeeded)
         self.assertFalse(any(event[1] == 'clean_all' for event in events))
+
+    def test_completed_arrow_is_never_replaced_without_refresh(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            events = []
+            builder = make_builder('complete', temp_dir, events)
+            builder('finetune', fs=256).download_and_prepare()
+
+            result = preproc_module.prepare_dataset(
+                self._conf(['complete']),
+                builder,
+                'complete',
+                'finetune',
+            )
+
+        self.assertTrue(result.succeeded)
+        self.assertEqual(result.sample_count, 3)
+        self.assertFalse(any(
+            event[1] in {
+                'clean_all',
+                'clean_arrow',
+                'materialize',
+                'preproc',
+                'download',
+            }
+            for event in events[1:]
+        ))
+
+    def test_completed_arrow_is_not_refreshed_for_changed_fields(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            events = []
+            builder = make_builder('fields', temp_dir, events)
+            builder('finetune', fs=256).download_and_prepare()
+            conf = self._conf(['fields'])
+            conf.refresh_fields = ['pos']
+
+            result = preproc_module.prepare_dataset(
+                conf,
+                builder,
+                'fields',
+                'finetune',
+            )
+
+        self.assertTrue(result.succeeded)
+        self.assertFalse(any(
+            event[1] in {
+                'clean_arrow',
+                'materialize',
+                'preproc',
+                'download',
+            }
+            for event in events[1:]
+        ))
+
+    def test_completed_arrow_is_preserved_when_cleaning_is_requested(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            events = []
+            builder = make_builder('clean_complete', temp_dir, events)
+            builder('finetune', fs=256).download_and_prepare()
+            conf = self._conf(['clean_complete'])
+            conf.clean_middle_cache = True
+
+            result = preproc_module.prepare_dataset(
+                conf,
+                builder,
+                'clean_complete',
+                'finetune',
+            )
+
+        self.assertTrue(result.succeeded)
+        self.assertFalse(any(
+            event[1] in {
+                'clean_all',
+                'clean_arrow',
+                'materialize',
+                'preproc',
+                'download',
+            }
+            for event in events[1:]
+        ))
+
+    def test_refresh_arrow_explicitly_rebuilds_completed_arrow(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            events = []
+            builder = make_builder('refresh', temp_dir, events)
+            builder('finetune', fs=256).download_and_prepare()
+            conf = self._conf(['refresh'])
+            conf.refresh_arrow = True
+
+            result = preproc_module.prepare_dataset(
+                conf,
+                builder,
+                'refresh',
+                'finetune',
+            )
+
+        self.assertTrue(result.succeeded)
+        self.assertIn(('refresh', 'preproc'), events)
+        self.assertIn(('refresh', 'clean_arrow'), events)
+        self.assertIn(('refresh', 'materialize', ()), events)
+        self.assertIn(('refresh', 'download'), events[1:])
+
+    def test_incomplete_arrow_is_not_replaced_without_refresh(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            events = []
+            builder = make_builder('incomplete', temp_dir, events)
+            artifact = Path(temp_dir) / 'incomplete' / 'finetune' / 'bad.arrow'
+            artifact.parent.mkdir(parents=True)
+            artifact.touch()
+            result = preproc_module.prepare_dataset(
+                self._conf(['incomplete']),
+                builder,
+                'incomplete',
+                'finetune',
+            )
+
+        self.assertFalse(result.succeeded)
+        self.assertIn('refusing to replace', result.reason)
+        self.assertFalse(any(
+            event[1] in {'clean_arrow', 'preproc', 'download'}
+            for event in events
+        ))
 
     def test_missing_arrow_artifact_is_a_dataset_failure(self):
         with tempfile.TemporaryDirectory() as temp_dir:

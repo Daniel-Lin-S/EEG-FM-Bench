@@ -47,6 +47,7 @@ class SeedConfig(EEGConfig):
     dataset_name: Optional[str] = 'seed'
     task_type: DatasetTaskType = DatasetTaskType.EMOTION
     file_ext: str = 'set'
+    position_montage: Optional[str] = 'standard_1020'
     montage: dict[str, list[str]] = field(default_factory=lambda: {
         '10_10': [
                               'FP1','FPZ','FP2',

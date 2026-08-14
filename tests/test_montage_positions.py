@@ -3,6 +3,11 @@ import unittest
 import mne
 import numpy as np
 
+from data.dataset.seeds.seed import SeedBuilder, SeedConfig
+from data.dataset.tue.tuab import TuabConfig
+from data.dataset.tue.tuar import TuarConfig
+from data.dataset.tue.tuep import TuepV200Config
+from data.dataset.tue.tuev import TuevConfig
 from data.processor.montage import resolve_electrode_positions
 
 
@@ -10,7 +15,25 @@ class MontagePositionTests(unittest.TestCase):
     @staticmethod
     def _raw(ch_names):
         info = mne.create_info(ch_names, sfreq=100.0, ch_types="eeg")
-        return mne.io.RawArray(np.zeros((len(ch_names), 10)), info, verbose=False)
+        data = np.arange(len(ch_names) * 10, dtype=np.float64).reshape(
+            len(ch_names),
+            10,
+        )
+        return mne.io.RawArray(data, info, verbose=False)
+
+    @staticmethod
+    def _standardized_tue_channels(channels):
+        replacements = {
+            'T3': 'T7',
+            'T4': 'T8',
+            'T5': 'P7',
+            'T6': 'P8',
+        }
+        labels = [channel.split(maxsplit=1)[-1] for channel in channels]
+        return [
+            replacements.get(label.split('-')[0], label.split('-')[0])
+            for label in labels
+        ]
 
     def test_native_coordinates_take_precedence(self):
         raw = self._raw(["Fp1", "Fp2"])
@@ -38,6 +61,54 @@ class MontagePositionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "could not resolve"):
             resolve_electrode_positions(raw, "standard_1020", ["UNKNOWN"])
 
+    def test_seed_selected_channels_use_standard_1020_coordinates(self):
+        config = SeedConfig()
+        channels = config.montage['10_10']
+        raw = self._raw(channels)
+
+        positions = resolve_electrode_positions(
+            raw,
+            config.position_montage,
+            channels,
+        )
+
+        self.assertEqual(config.position_montage, 'standard_1020')
+        self.assertEqual(positions.shape, (len(channels), 3))
+        self.assertTrue(np.isfinite(positions).all())
+        self.assertTrue(set(channels).issubset(SeedBuilder._orig_ch_names()))
+        self.assertEqual(
+            set(SeedBuilder._orig_ch_names()).difference(channels),
+            {'CB1', 'CB2'},
+        )
+
+    def test_tue_positions_preserve_reference_channel_names_and_samples(self):
+        configs = (TuabConfig(), TuepV200Config(), TuarConfig(), TuevConfig())
+        for config in configs:
+            self.assertEqual(config.position_montage, 'standard_1020')
+            for montage_name, channels in config.montage.items():
+                with self.subTest(
+                        dataset=config.dataset_name,
+                        montage=montage_name,
+                ):
+                    raw = self._raw(channels)
+                    expected_samples = raw.get_data().copy()
+                    standardized = self._standardized_tue_channels(channels)
+                    positions = resolve_electrode_positions(
+                        raw,
+                        config.position_montage,
+                        standardized,
+                    )
+
+                    self.assertEqual(raw.ch_names, channels)
+                    np.testing.assert_array_equal(
+                        raw.get_data(),
+                        expected_samples,
+                    )
+                    self.assertEqual(positions.shape, (len(channels), 3))
+                    self.assertTrue(np.isfinite(positions).all())
+                    self.assertFalse(
+                        np.any(np.all(positions == 0.0, axis=1))
+                    )
 
 if __name__ == "__main__":
     unittest.main()

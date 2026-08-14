@@ -1,5 +1,7 @@
 import logging
 import warnings
+from collections.abc import Mapping
+from pathlib import Path
 from typing import Optional, Type
 
 import mne
@@ -25,6 +27,11 @@ from data.dataset.mimul_11 import Mimul11Builder
 from data.dataset.motor_mv_img import MotorMoveImagineBuilder
 from data.dataset.openmiir import OpenMiirBuilder
 from data.dataset.seeds.seed import SeedBuilder
+from data.dataset.seeds.seed_cnt import (
+    SOURCE_LAYOUT_CNT,
+    SeedCntBuilder,
+    detect_seed_source_layout,
+)
 from data.dataset.seeds.seed_fra import SeedFraBuilder
 from data.dataset.seeds.seed_ger import SeedGerBuilder
 from data.dataset.seeds.seed_iv import SeedIVBuilder
@@ -46,6 +53,7 @@ from data.dataset.tue.tusl import TuslBuilder
 from data.dataset.tue.tusz import TuszBuilder
 from data.dataset.workload import WorkloadBuilder
 from data.processor.builder import EEGDatasetBuilder, EEGConfig
+from common.path import get_dataset_raw_path
 
 
 log = logging.getLogger()
@@ -90,6 +98,53 @@ DATASET_SELECTOR: dict[str, Type[EEGDatasetBuilder]] = {
     'chisco': ChiscoBuilder,
     'open_miir': OpenMiirBuilder,
 }
+
+
+def resolve_dataset_builder(
+        dataset_name: str,
+        raw_path: str | Path | None = None,
+        dataset_selector: Mapping[str, Type[EEGDatasetBuilder]] | None = None,
+) -> Type[EEGDatasetBuilder]:
+    """Resolve a dataset builder from its registry name and source layout.
+
+    Parameters
+    ----------
+    dataset_name : str
+        Registered public dataset name.
+    raw_path : str or Path, optional
+        Raw source root used for source-aware selection.  When omitted, the
+        configured path for the requested dataset is used.
+    dataset_selector : Mapping[str, Type[EEGDatasetBuilder]], optional
+        Dataset registry used for normal non-source-aware resolution.
+
+    Returns
+    -------
+    Type[EEGDatasetBuilder]
+        The appropriate builder class for the requested dataset.
+
+    Raises
+    ------
+    ValueError
+        If the dataset is unknown or the SEED source layout is unsupported.
+    """
+    selector = DATASET_SELECTOR if dataset_selector is None else dataset_selector
+    try:
+        builder_cls = selector[dataset_name]
+    except KeyError as error:
+        raise ValueError(
+            f'Dataset {dataset_name!r} is not supported.'
+        ) from error
+    if dataset_name != 'seed':
+        return builder_cls
+    if raw_path is None:
+        raw_path, _ = get_dataset_raw_path(
+            'seed',
+            SeedBuilder.BUILDER_CONFIGS[0].suffix_path,
+        )
+    layout = detect_seed_source_layout(raw_path)
+    if layout.kind == SOURCE_LAYOUT_CNT:
+        return SeedCntBuilder
+    return SeedBuilder
 
 
 def split_dataset_montage_key(montage_key: str) -> tuple[str, str]:
@@ -301,5 +356,3 @@ if __name__ == '__main__':
 
     for batch in loader:
         pass
-
-
