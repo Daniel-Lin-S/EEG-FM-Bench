@@ -7,6 +7,7 @@ from data.dataset.seeds.seed import SeedBuilder, SeedConfig
 from data.dataset.tue.tuab import TuabConfig
 from data.dataset.tue.tuar import TuarConfig
 from data.dataset.tue.tuep import TuepV200Config
+from data.dataset.tue.tusl import TuslConfig
 from data.dataset.tue.tuev import TuevConfig
 from data.processor.montage import resolve_electrode_positions
 
@@ -82,7 +83,13 @@ class MontagePositionTests(unittest.TestCase):
         )
 
     def test_tue_positions_preserve_reference_channel_names_and_samples(self):
-        configs = (TuabConfig(), TuepV200Config(), TuarConfig(), TuevConfig())
+        configs = (
+            TuabConfig(),
+            TuepV200Config(),
+            TuarConfig(),
+            TuslConfig(),
+            TuevConfig(),
+        )
         for config in configs:
             self.assertEqual(config.position_montage, 'standard_1020')
             for montage_name, channels in config.montage.items():
