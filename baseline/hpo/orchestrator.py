@@ -3612,6 +3612,144 @@ class CampaignRunner:
         self,
         selected_configs: Mapping[str, Mapping[str, Any]],
     ) -> tuple[Dict[str, Any], bool]:
+        """Run multitask scopes atomically and other scopes dataset-first."""
+        if self.base_dict.get("multitask", False):
+            return self._run_multitask_seeds(selected_configs)
+        return self._run_dataset_seeds(selected_configs)
+
+    def _run_dataset_seeds(
+        self,
+        selected_configs: Mapping[str, Mapping[str, Any]],
+    ) -> tuple[Dict[str, Any], bool]:
+        """Run each non-multitask dataset through its configured seeds."""
+        self.final_dataset_attempts = []
+        seeds = list(self.base_dict["seeds"])
+        attempted: list[int] = []
+        succeeded: list[int] = []
+        failed: list[Dict[str, Any]] = []
+        skipped: list[int] = []
+        unattempted: list[int] = []
+        dataset_outcomes: list[Dict[str, Any]] = []
+        error_log_path = os.environ.get("EEGFM_ERROR_LOG_PATH", "<stderr>")
+
+        for dataset_name, scoped in selected_configs.items():
+            previous_failure: Optional[str] = None
+            dataset_attempted: list[int] = []
+            dataset_succeeded: list[int] = []
+            dataset_skipped: list[int] = []
+            dataset_failed: list[Dict[str, Any]] = []
+            dataset_unattempted: list[int] = []
+            for index, seed in enumerate(seeds):
+                try:
+                    did_run = self._run_seed(seed, {dataset_name: scoped})
+                except Exception as exc:
+                    fingerprint = failure_fingerprint(exc)
+                    failure = {
+                        "dataset": dataset_name,
+                        "seed": seed,
+                        "fingerprint": fingerprint,
+                    }
+                    attempted.append(seed)
+                    dataset_attempted.append(seed)
+                    failed.append(failure)
+                    dataset_failed.append(failure)
+                    logger.exception(
+                        "Dataset %s seed %d failed with fingerprint %s",
+                        dataset_name,
+                        seed,
+                        fingerprint,
+                    )
+                    if fingerprint == previous_failure:
+                        remaining = seeds[index + 1:]
+                        unattempted.extend(remaining)
+                        dataset_unattempted.extend(remaining)
+                        break
+                    previous_failure = fingerprint
+                    continue
+
+                if did_run is False:
+                    skipped.append(seed)
+                    dataset_skipped.append(seed)
+                    logger.info(
+                        "Dataset %s seed %d is already complete and "
+                        "compatible; skipping.",
+                        dataset_name,
+                        seed,
+                    )
+                    continue
+
+                attempted.append(seed)
+                dataset_attempted.append(seed)
+                succeeded.append(seed)
+                dataset_succeeded.append(seed)
+                previous_failure = None
+                logger.info(
+                    "Dataset %s seed %d completed; artifacts: %s.",
+                    dataset_name,
+                    seed,
+                    self.paths.seed_log_root(seed).resolve(),
+                )
+
+            if dataset_failed:
+                status = "failed"
+            elif dataset_succeeded:
+                status = "succeeded"
+            else:
+                status = "skipped"
+            dataset_outcomes.append({
+                "dataset": dataset_name,
+                "status": status,
+                "attempted": dataset_attempted,
+                "succeeded": dataset_succeeded,
+                "skipped": dataset_skipped,
+                "failed": dataset_failed,
+                "unattempted": dataset_unattempted,
+            })
+
+        failed_datasets = [
+            outcome for outcome in dataset_outcomes
+            if outcome["status"] == "failed"
+        ]
+        logger.info(
+            "Dataset execution summary: succeeded=%d, skipped=%d, "
+            "failed=%d.",
+            sum(
+                outcome["status"] == "succeeded"
+                for outcome in dataset_outcomes
+            ),
+            sum(
+                outcome["status"] == "skipped"
+                for outcome in dataset_outcomes
+            ),
+            len(failed_datasets),
+        )
+        for outcome in failed_datasets:
+            last_failure = outcome["failed"][-1]
+            logger.info(
+                "Failed dataset %s: %s. Detailed error log: %s.",
+                outcome["dataset"],
+                last_failure["fingerprint"],
+                error_log_path,
+            )
+
+        invocation = {
+            "attempted": attempted,
+            "dataset_attempts": list(self.final_dataset_attempts),
+            "dataset_outcomes": dataset_outcomes,
+            "id": getattr(self, "invocation_id", "unmanaged"),
+            "requested": seeds,
+            "succeeded": succeeded,
+            "failed": failed,
+            "skipped": skipped,
+            "unattempted": unattempted,
+            "complete": not failed,
+        }
+        return invocation, not failed
+
+    def _run_multitask_seeds(
+        self,
+        selected_configs: Mapping[str, Mapping[str, Any]],
+    ) -> tuple[Dict[str, Any], bool]:
         """Run configured seeds with consecutive-error stopping."""
         self.final_dataset_attempts = []
         seeds = list(self.base_dict["seeds"])

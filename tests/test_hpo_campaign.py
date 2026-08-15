@@ -38,6 +38,8 @@ from baseline.registry import register_builtin_models
 from baseline_main import _load_configs, _normalize_legacy_seed
 from common.utils import setup_yaml
 
+TEST_FS = 256
+
 
 class FakeTrial:
     """Deterministic trial implementing the search helper protocol."""
@@ -111,17 +113,17 @@ def make_hpo_config() -> HpoConfig:
 
 def test_public_seeds_default_and_effective_seed_contract() -> None:
     """Public configs use a list while trainers receive one effective seed."""
-    assert BrainOmniConfig().seeds == [42]
-    assert BrainOmniConfig().seed == 42
+    assert BrainOmniConfig(fs=TEST_FS).seeds == [42]
+    assert BrainOmniConfig(fs=TEST_FS).seed == 42
     with pytest.raises(RuntimeError, match="exactly one effective seed"):
-        _ = BrainOmniConfig(seeds=[42, 43]).seed
+        _ = BrainOmniConfig(fs=TEST_FS, seeds=[42, 43]).seed
 
 
 @pytest.mark.parametrize("seeds", ([True], ["42"], 42))
 def test_public_seeds_reject_coerced_types(seeds) -> None:
     """Boolean, string, and scalar seed inputs are not silently coerced."""
     with pytest.raises(ValidationError, match="seeds must"):
-        BrainOmniConfig(seeds=seeds)
+        BrainOmniConfig(fs=TEST_FS, seeds=seeds)
 
 
 def test_legacy_seed_converts_with_warning() -> None:
@@ -166,7 +168,7 @@ def test_public_yaml_accepts_cli_hpo_budget_override(
 
 def test_campaign_identity_excludes_seeds_and_trial_budget() -> None:
     """Adding evaluation seeds or HPO trials resumes the same campaign."""
-    base = BrainOmniConfig(seeds=[42]).model_dump(mode="json")
+    base = BrainOmniConfig(fs=TEST_FS, seeds=[42]).model_dump(mode="json")
     hpo = make_hpo_config().model_dump(mode="json")
     original = get_campaign_hash(base, hpo)
 
@@ -197,7 +199,7 @@ def test_enabled_hpo_requires_budget_and_search_space() -> None:
 
 def test_search_sampling_changes_only_selected_paths() -> None:
     """Dotted search paths preserve every unselected model parameter."""
-    base = BrainOmniConfig(seeds=[0]).model_dump(mode="json")
+    base = BrainOmniConfig(fs=TEST_FS, seeds=[0]).model_dump(mode="json")
     hpo = make_hpo_config()
     validate_search_space(base, hpo, BrainOmniConfig)
     sampled, decoded = sample_config(base, hpo, FakeTrial())
@@ -219,7 +221,7 @@ def test_search_sampling_changes_only_selected_paths() -> None:
 
 def test_search_rejects_overlapping_learning_rate_ranges() -> None:
     """Every sampled min_lr must remain at or below sampled max_lr."""
-    base = BrainOmniConfig(seeds=[0]).model_dump(mode="json")
+    base = BrainOmniConfig(fs=TEST_FS, seeds=[0]).model_dump(mode="json")
     raw = make_hpo_config().model_dump(mode="json")
     raw["search_space"]["training.min_lr"]["high"] = 3e-4
     hpo = HpoConfig.model_validate(raw)
@@ -295,7 +297,10 @@ def make_failure_runner(
 ) -> CampaignRunner:
     """Create a campaign runner whose seed executions use fake outcomes."""
     runner = CampaignRunner.__new__(CampaignRunner)
-    runner.base_dict = {"seeds": [42, 43, 44, 45]}
+    runner.base_dict = {
+        "multitask": True,
+        "seeds": [42, 43, 44, 45],
+    }
     runner.paths = CampaignPaths(
         log_root=tmp_path / "log",
         checkpoint_root=tmp_path / "ckpt",
@@ -463,6 +468,7 @@ def test_single_task_and_multitask_hpo_scopes_and_paths(
 ) -> None:
     """Single-task studies split by dataset; multitask uses one joint path."""
     base = BrainOmniConfig(
+        fs=TEST_FS,
         seeds=[42, 43],
         data={
             "datasets": {
@@ -598,7 +604,7 @@ def test_completed_hpo_budget_reuses_winner_without_trainer(
     runner.hpo_config = make_hpo_config().model_copy(
         update={"n_trials": 1}
     )
-    scope_config = BrainOmniConfig().model_dump(mode="json")
+    scope_config = BrainOmniConfig(fs=TEST_FS).model_dump(mode="json")
     runner.base_dict = scope_config
     runner.config_class = BrainOmniConfig
 
@@ -649,7 +655,7 @@ def test_completed_versioned_study_survives_identity_schema_change(
     runner.hpo_config = make_hpo_config().model_copy(
         update={"n_trials": 1}
     )
-    scope_config = BrainOmniConfig().model_dump(mode="json")
+    scope_config = BrainOmniConfig(fs=TEST_FS).model_dump(mode="json")
     runner.base_dict = scope_config
     runner.config_class = BrainOmniConfig
     runner.invocation_root = tmp_path / "log" / "invocations" / "test"
@@ -788,6 +794,7 @@ def test_legacy_study_prefers_completed_alias_and_preserves_duplicate(
     storage_path = (scope_root / "study.sqlite3").resolve()
     storage = f"sqlite:///{storage_path}"
     scope_config = BrainOmniConfig(
+        fs=TEST_FS,
         data={"datasets": {"alpha": "finetune"}},
     ).model_dump(mode="json")
 
@@ -911,13 +918,13 @@ def test_campaign_runs_hpo_once_before_all_evaluation_seeds() -> None:
     ]
 
 
-def test_deterministic_model_ignores_hpo_but_keeps_all_seeds() -> None:
-    """Deterministic baselines warn, skip HPO, and retain seed repetition."""
+def test_deterministic_model_ignores_hpo_with_one_seed() -> None:
+    """Deterministic baselines warn and skip HPO for their sole seed."""
     runner = CampaignRunner.__new__(CampaignRunner)
     runner.hpo_config = make_hpo_config()
     runner.base_dict = {
         "model_type": "minirocket",
-        "seeds": [42, 43, 44],
+        "seeds": [42],
     }
     runner.campaign_hash = "campaign"
     runner.distributed_initialized = False
@@ -945,5 +952,82 @@ def test_deterministic_model_ignores_hpo_but_keeps_all_seeds() -> None:
     assert calls == [
         ("init", 42),
         ("fixed",),
-        ("seeds", [42, 43, 44], {"fixed": {}}),
+        ("seeds", [42], {"fixed": {}}),
     ]
+
+def test_nonmultitask_failures_are_isolated_by_dataset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stop only the failing dataset after two matching seed errors."""
+    runner = CampaignRunner.__new__(CampaignRunner)
+    runner.base_dict = {
+        "multitask": False,
+        "seeds": [42, 43, 44],
+    }
+    runner.paths = CampaignPaths(
+        log_root=tmp_path / "log",
+        checkpoint_root=tmp_path / "ckpt",
+    )
+    runner.final_dataset_attempts = []
+    calls: list[tuple[str, int]] = []
+
+    def run_seed(seed: int, selected: dict[str, dict]) -> bool:
+        """Fail alpha repeatedly while beta completes every seed."""
+        dataset_name = next(iter(selected))
+        calls.append((dataset_name, seed))
+        if dataset_name == "alpha":
+            raise RuntimeError("dataset setup failed")
+        return True
+
+    runner._run_seed = run_seed
+    messages: list[str] = []
+    monkeypatch.setattr(
+        orchestrator_module.logger,
+        "info",
+        lambda message, *args: messages.append(message % args),
+    )
+    monkeypatch.setenv("EEGFM_ERROR_LOG_PATH", "/tmp/baseline.err")
+
+    invocation, eligible = runner._run_seeds({
+        "alpha": {},
+        "beta": {},
+    })
+
+    assert calls == [
+        ("alpha", 42),
+        ("alpha", 43),
+        ("beta", 42),
+        ("beta", 43),
+        ("beta", 44),
+    ]
+    assert eligible is False
+    assert invocation["dataset_outcomes"] == [
+        {
+            "dataset": "alpha",
+            "status": "failed",
+            "attempted": [42, 43],
+            "succeeded": [],
+            "skipped": [],
+            "failed": invocation["failed"],
+            "unattempted": [44],
+        },
+        {
+            "dataset": "beta",
+            "status": "succeeded",
+            "attempted": [42, 43, 44],
+            "succeeded": [42, 43, 44],
+            "skipped": [],
+            "failed": [],
+            "unattempted": [],
+        },
+    ]
+    assert (
+        "Dataset execution summary: succeeded=1, skipped=0, failed=1."
+        in messages
+    )
+    assert any(
+        message.startswith("Failed dataset alpha:")
+        for message in messages
+    )
+    assert any("/tmp/baseline.err" in message for message in messages)

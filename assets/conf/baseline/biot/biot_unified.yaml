@@ -6,6 +6,7 @@ seeds: [42]
 master_port: 51601
 multitask: true
 model_type: 'biot'
+fs: 200  # pre-training sampling frequency (aligned with published BIOT model)
 
 # Data configuration
 data:

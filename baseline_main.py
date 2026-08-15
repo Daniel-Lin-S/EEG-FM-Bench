@@ -121,9 +121,8 @@ def _load_configs() -> tuple[type[Any], Any, HpoConfig]:
     cli_model_cfg.pop("hpo", None)
 
     config_class = ModelRegistry.get_config_class(model_type)
-    code_cfg = OmegaConf.create(config_class().model_dump())
     merged_config = OmegaConf.merge(
-        code_cfg,
+        # Pydantic supplies nested defaults after required fields are present.
         file_model_cfg,
         cli_model_cfg,
     )

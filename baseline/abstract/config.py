@@ -424,7 +424,7 @@ class AbstractConfig(BaseModel, ABC):
     multitask: bool = False
     model_type: str = "base"  # To identify which model is being used
     conf_file: Optional[str] = None
-    fs: int = 256
+    fs: int = Field(gt=0)
     
     data: BaseDataArgs = Field(default_factory=BaseDataArgs)
     model: BaseModelArgs = Field(default_factory=BaseModelArgs)

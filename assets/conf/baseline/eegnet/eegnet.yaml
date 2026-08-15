@@ -3,6 +3,7 @@
 
 # Basic configuration
 seeds: [42]
+fs: 256
 master_port: 51100
 multitask: false  # Train separate models for each dataset
 

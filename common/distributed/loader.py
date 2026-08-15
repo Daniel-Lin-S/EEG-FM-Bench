@@ -336,13 +336,3 @@ def create_finetune_loader_list(
         weight_list.append(distribution)
 
     return dataset_list, sampler_list, loader_list, weight_list
-
-
-if __name__ == "__main__":
-    data, _ = load_concat_eeg_datasets(['seed_v'], ['finetune'], datasets.Split.TRAIN, fs=256)
-    sampler = DistributedGroupBatchSampler(data, 32, 0.8, 2, 0, drop_last=True,)
-
-    loader = torch.utils.data.DataLoader(dataset=data, batch_sampler=sampler, num_workers=4)
-
-    for batch in loader:
-        print(batch)

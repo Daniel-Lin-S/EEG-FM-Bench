@@ -18,6 +18,10 @@ NEVER re-run experiments that already have artifacts -- complete waste of comput
 
 AVOID writing codes in a way that destroy or overwrite artifacts of already completed runs, unless necessary or requested.
 
+## Training
+
+Deterministic models like Catch22, MiniROCKET should NEVER be executed for multiple times even if multiple seeds are provided. There should be only one csv file saved for each dataset under `{artifact_root}/csv`.
+
 ## Open-closed principle
 
 This benchmark integrates multiple models, datasets, and training schemes. Any code implementation should allow extension to any of the 3 dimensions WITHOUT causing cascading changes.

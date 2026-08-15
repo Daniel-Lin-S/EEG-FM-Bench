@@ -42,11 +42,13 @@ DATASET_NAME = "adftd"
 DATASET_CONFIG = "finetune"
 CAMPAIGN_HASH = "campaign"
 SEED = 42
+TEST_FS = 256
 
 
 def _selected_config(batch_size: int = 128) -> dict:
     """Return one resolved selected configuration for compatibility tests."""
     return BrainOmniConfig(
+        fs=TEST_FS,
         seeds=[SEED],
         data={
             "datasets": {DATASET_NAME: DATASET_CONFIG},
@@ -597,6 +599,7 @@ def test_invocation_summary_excludes_skipped_historic_results(
     historic_seed = 43
     historic_dataset = "bcic_1a"
     historic_config = BrainOmniConfig(
+        fs=TEST_FS,
         seeds=[historic_seed],
         data={"datasets": {historic_dataset: DATASET_CONFIG}},
     ).model_dump(mode="json")
@@ -817,6 +820,7 @@ def test_partial_multitask_completion_recovers_from_shared_csv(
     """Unambiguous best-validation and test rows recover a missing pair."""
     second_dataset = "bcic_1a"
     selected = BrainOmniConfig(
+        fs=TEST_FS,
         seeds=[SEED],
         multitask=True,
         data={

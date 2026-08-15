@@ -102,7 +102,6 @@ class MomentConfig(AbstractConfig):
     """MOMENT configuration that extends AbstractConfig."""
     
     model_type: str = "moment"
-    fs: int = 256  # Default sampling frequency
     
     data: MomentDataArgs = Field(default_factory=MomentDataArgs)
     model: MomentModelArgs = Field(default_factory=MomentModelArgs)

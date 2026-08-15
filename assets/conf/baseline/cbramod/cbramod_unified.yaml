@@ -6,6 +6,7 @@ seeds: [42]
 master_port: 51701
 multitask: true
 model_type: 'cbramod'
+fs: 200  # pre-training sampling frequency (aligned with published CBraMod model)
 
 # Data configuration
 data:

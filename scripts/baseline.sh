@@ -60,7 +60,8 @@ echo "Selected GPU     : ${CUDA_DEVICE}"
 echo "Log file          : ${LOG_FILE}"
 echo "Error file        : ${ERR_FILE}"
 echo "======= MAIN TASK ======="
-if CUDA_VISIBLE_DEVICES="${CUDA_DEVICE}" "${PYTHON}" baseline_main.py "$@"; then
+if EEGFM_ERROR_LOG_PATH="${ERR_FILE}" \
+  CUDA_VISIBLE_DEVICES="${CUDA_DEVICE}" "${PYTHON}" baseline_main.py "$@"; then
   EXIT_CODE=0
 else
   EXIT_CODE=$?

@@ -32,8 +32,10 @@ class BiotDataLoaderFactory(AbstractDataLoaderFactory):
             self,
             dataset: HFDataset,
             dataset_names: List[str],
-            dataset_configs: List[str]
+            dataset_configs: List[str],
+            fs: int,
     ) -> HFDataset:
+        del fs
         return dataset
 
 
@@ -134,6 +136,7 @@ class BiotTrainer(AbstractTrainer):
         self.conv_router = DynamicChannelConvRouter(
             conv_configs,
             target_channel=model_cfg.max_channels,
+            fs=self.cfg.fs,
         )
         logger.info(f"Created dynamic convolution router: {list(conv_configs.keys())}")
 

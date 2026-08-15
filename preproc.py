@@ -2,10 +2,10 @@
 
 Configuration parameters
 ------------------------
-conf_file : str, optional (CLI only), default=None
-    Path, name, or repository-relative name of the YAML to load. When omitted,
-    no file is loaded and ``BasePreprocArgs`` defaults are used.
-fs : int, optional, default=256
+conf_file : str (CLI only)
+    Path, name, or repository-relative name of the YAML to load. It must
+    define the target sampling rate.
+fs : int
     Sampling rate in Hz supplied to every dataset builder. It determines the
     resampled data written to disk and must match training.
 clean_middle_cache : bool, optional, default=False
@@ -33,7 +33,8 @@ finetune_datasets : dict[str, str], optional, default={}
     For 'pretrain' configuration, no label is stored and test ratio is 0.
     For 'finetune' or related configurations (e.g., `finetune-reach`), segments are labelled and test-split is preserved.
 
-Values passed after ``conf_file`` on the command line override YAML values.
+Values passed after ``conf_file`` on the command line override YAML values,
+except ``fs``, which must remain defined by the YAML.
 Every dataset and configuration is checked against ``DATASET_SELECTOR`` before
 it runs. ``common.conf.BasePreprocArgs`` documents the validation schema.
 """
@@ -324,15 +325,23 @@ def print_preprocessing_summary(results: list[DatasetPreparationResult]) -> None
 def _load_config() -> BasePreprocArgs:
     cli_args: DictConfig = OmegaConf.from_cli()
     logger.info(cli_args)
-    if 'conf_file' in cli_args:
-        logger.info(cli_args.conf_file)
-        file_cfg = OmegaConf.load(get_conf_file_path(cli_args.conf_file))
-        cli_args.pop("conf_file")
-    else:
-        file_cfg = OmegaConf.create({})
+    if "conf_file" not in cli_args:
+        raise ValueError(
+            "Preprocessing requires conf_file YAML with a top-level fs value."
+        )
+    logger.info(cli_args.conf_file)
+    file_cfg = OmegaConf.load(get_conf_file_path(cli_args.conf_file))
+    cli_args.pop("conf_file")
+    if "fs" in cli_args:
+        raise ValueError(
+            "Preprocessing fs must be defined by the YAML, not the CLI."
+        )
+    if "fs" not in file_cfg:
+        raise ValueError(
+            "Preprocessing YAML must define a top-level fs value."
+        )
 
-    code_cfg = OmegaConf.create(BasePreprocArgs().model_dump())
-    cfg = OmegaConf.merge(code_cfg, file_cfg, cli_args)
+    cfg = OmegaConf.merge(file_cfg, cli_args)
     cfg = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
     logger.info(cfg)
     return BasePreprocArgs.model_validate(cfg)

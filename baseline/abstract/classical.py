@@ -12,7 +12,13 @@ from pydantic import Field
 
 from baseline.abstract.config import AbstractConfig, BaseDataArgs, BaseModelArgs, BaseTrainingArgs, BaseLoggingArgs
 from baseline.abstract.trainer import AbstractTrainer, format_console_log_dict
-from data.processor.wrapper import get_dataset_montage, get_dataset_n_class, get_dataset_category, get_dataset_patch_len
+from data.processor.wrapper import (
+    get_dataset_category,
+    get_dataset_montage,
+    get_dataset_n_class,
+    get_dataset_patch_len,
+    resolve_common_montage_layout,
+)
 from common.distributed.env import get_is_master
 from common.distributed.loader import DistributedGroupBatchSampler
 
@@ -95,7 +101,7 @@ class ClassicalTrainer(AbstractTrainer, ABC):
     def __init__(self, cfg: ClassicalConfig):
         super().__init__(cfg)
         self.cfg = cfg
-        self.sfreq = 256
+        self.sfreq = cfg.fs
 
         self.encoder = None
         self.loss_fn = nn.CrossEntropyLoss()
@@ -109,11 +115,18 @@ class ClassicalTrainer(AbstractTrainer, ABC):
             raise NotImplementedError(f'{self.cfg.model_type} does not support mixed datasets.')
 
         ds_conf = self.ds_conf[ds_name]
-        montages: dict = get_dataset_montage(ds_name, ds_conf)
-        if len(montages) == 0 or len(montages) > 1:
-            raise ValueError(f'{self.cfg.model_type} does not support dataset with multiple montages.')
-        else:
-            montage = next(iter(montages.values()))
+        montages = get_dataset_montage(ds_name, ds_conf, self.cfg.fs)
+        montage = resolve_common_montage_layout(
+            montages,
+            self.cfg.model_type,
+            ds_name,
+        )
+
+        if not hasattr(self, "dataloader_factory"):
+            raise RuntimeError(
+                f"{self.cfg.model_type} must configure a data loader factory."
+            )
+        self.dataloader_factory.channel_layout = montage
 
         self.ds_info = {
             ds_name: {

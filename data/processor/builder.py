@@ -81,7 +81,7 @@ class EEGConfig(BuilderConfig):
         The upper cutoff frequency for the band-pass filter in Hz.
     filter_notch : float, default 50.0
         The fundamental frequency for the notch filter (e.g., 50 or 60 Hz) to remove power line interference.
-    fs : float, default 256.0
+    fs : float, optional
         The target sampling frequency in Hz for resampling.
     unit : str, default "uV"
         The physical unit of the signal values (e.g., microvolts).
@@ -161,7 +161,7 @@ class EEGConfig(BuilderConfig):
     filter_low: float = 0.1
     filter_high: float = 100.0
     filter_notch: float = 50.0
-    fs: float = 256.0
+    fs: Optional[float] = None
     unit: str = "uV"
 
     # middle cache storage
@@ -223,9 +223,9 @@ class EEGConfig(BuilderConfig):
     def __post_init__(self):
         super().__post_init__()
 
-        # renew fs dependent items
-        fs = self.fs
-        self.apply_fs(fs)
+        # Sampling-rate-dependent paths are initialized by the builder.
+        if self.fs is not None:
+            self.apply_fs(self.fs)
 
         self.raw_path, self.has_configured_raw_path = get_dataset_raw_path(
             self.dataset_name, self.suffix_path)
@@ -277,12 +277,22 @@ class EEGDatasetBuilder(datasets.GeneratorBasedBuilder, ABC):
         BUILDER_CONFIG_CLASS(name='pretrain'),
         BUILDER_CONFIG_CLASS(name='finetune', is_finetune=True),]
 
-    def __init__(self, config_name='pretrain', fs: Optional[float] = None, **kwargs):
-        # Override sampling rate if specified
-        if fs is not None:
-            self.builder_configs[config_name].apply_fs(float(fs))
-        else:
-            self.builder_configs[config_name].apply_fs(256.0)
+    def __init__(
+            self,
+            config_name: str = 'pretrain',
+            fs: Optional[float] = None,
+            **kwargs,
+    ):
+        if isinstance(fs, bool) or not isinstance(fs, (int, float)):
+            raise ValueError(
+                "Dataset builder requires a numeric sampling rate via fs."
+            )
+        if not math.isfinite(float(fs)) or float(fs) <= 0.0:
+            raise ValueError(
+                "Dataset builder requires a finite positive sampling rate, "
+                f"but got {fs!r}."
+            )
+        self.builder_configs[config_name].apply_fs(float(fs))
 
         conf: EEGConfig = self.builder_configs.get(config_name)
         validate_configured_raw_path(

@@ -1,3 +1,4 @@
+fs: 256
 pretrain_datasets:
   # - 'tueg'
 finetune_datasets: []

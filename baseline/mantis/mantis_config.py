@@ -94,7 +94,6 @@ class MantisConfig(AbstractConfig):
     """Mantis configuration that extends AbstractConfig."""
     
     model_type: str = "mantis"
-    fs: int = 256  # Default sampling frequency
     
     data: MantisDataArgs = Field(default_factory=MantisDataArgs)
     model: MantisModelArgs = Field(default_factory=MantisModelArgs)

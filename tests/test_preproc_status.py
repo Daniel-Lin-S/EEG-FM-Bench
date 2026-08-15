@@ -28,6 +28,9 @@ else:
     DEPENDENCY_ERROR = None
 
 
+TEST_FS = 256
+
+
 class FakeSplit:
     def __init__(self, sample_count, artifact_path):
         self.sample_count = sample_count
@@ -91,6 +94,7 @@ def make_builder(name, root, events, *, fail=False, warnings=0, create_artifact=
 class PreprocessingStatusTests(unittest.TestCase):
     def _conf(self, dataset_names):
         return BasePreprocArgs(
+            fs=TEST_FS,
             num_preproc_arrow_writers=1,
             num_preproc_mid_workers=1,
             finetune_datasets={name: 'finetune' for name in dataset_names},

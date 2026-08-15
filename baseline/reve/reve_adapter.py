@@ -17,6 +17,7 @@ class ReveDatasetAdapter(AbstractDatasetAdapter):
             dataset: HFDataset,
             dataset_names: List[str],
             dataset_configs: List[str],
+            fs: int,
             pos_bank_dict: Dict[str, torch.Tensor],
             channel_restricted: bool = False,
     ):
@@ -24,7 +25,7 @@ class ReveDatasetAdapter(AbstractDatasetAdapter):
         self.electrode_set: ElectrodeSet = ElectrodeSet()
         self.channel_restricted = channel_restricted
         self.normalizer = ZScoreNorm()
-        super().__init__(dataset, dataset_names, dataset_configs)
+        super().__init__(dataset, dataset_names, dataset_configs, fs)
 
         self.pos_bank.load_state_dict(pos_bank_dict)
 
@@ -73,11 +74,13 @@ class ReveDataLoaderFactory(AbstractDataLoaderFactory):
             dataset: HFDataset,
             dataset_names: List[str],
             dataset_configs: List[str],
+            fs: int,
     ) -> ReveDatasetAdapter:
         return ReveDatasetAdapter(
             dataset, 
             dataset_names, 
-            dataset_configs, 
+            dataset_configs,
+            fs,
             pos_bank_dict=self.pos_bank_dict, 
             channel_restricted=self.channel_restricted
         )

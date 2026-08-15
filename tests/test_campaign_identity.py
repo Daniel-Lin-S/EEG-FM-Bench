@@ -23,6 +23,9 @@ from baseline.hpo.orchestrator import CampaignRunner
 from baseline.utils.identity import build_campaign_semantic_config
 
 
+TEST_FS = 256
+
+
 def _hpo_config() -> HpoConfig:
     """Return a minimal enabled HPO configuration."""
     return HpoConfig.model_validate({
@@ -47,6 +50,7 @@ def _model_config(
 ) -> BrainOmniConfig:
     """Return a resolved BrainOmni configuration under a temporary root."""
     return BrainOmniConfig(
+        fs=TEST_FS,
         data={"datasets": {"adftd": "finetune"}},
         logging={
             "run_dir": str(run_dir),
@@ -385,6 +389,7 @@ def test_deterministic_identity_excludes_declared_runtime_fields(
 ) -> None:
     """Runtime-only deterministic settings do not split campaigns."""
     config = Catch22Config(
+        fs=TEST_FS,
         data={"datasets": {"adftd": "finetune"}},
         logging={"run_dir": str(tmp_path)},
     ).model_dump(mode="json")
@@ -416,6 +421,7 @@ def test_campaign_adopts_matching_legacy_flat_extractor_root(
 ) -> None:
     """One completed flat extractor root is reused without result copying."""
     config = Catch22Config(
+        fs=TEST_FS,
         data={"datasets": {"adftd": "finetune"}},
         logging={"run_dir": str(tmp_path), "experiment_name": "catch22"},
     ).model_dump(mode="json")

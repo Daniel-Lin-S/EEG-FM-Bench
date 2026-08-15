@@ -6,7 +6,7 @@ seeds: [42]
 master_port: 51102
 multitask: true
 model_type: 'csbrain'
-fs: 200
+fs: 200  # pre-training sampling frequency (aligned with published CSBrain model)
 
 # Data configuration
 data:

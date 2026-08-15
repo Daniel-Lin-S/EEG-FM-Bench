@@ -31,12 +31,13 @@ class MomentDatasetAdapter(AbstractDatasetAdapter, StandardEEGChannelsMixin):
         dataset: HFDataset, 
         dataset_names: List[str], 
         dataset_configs: List[str],
+        fs: int,
         target_seq_len: int = 512,
     ):
         self.target_seq_len = target_seq_len
         self.electrode_set = ElectrodeSet()
 
-        super().__init__(dataset, dataset_names, dataset_configs)
+        super().__init__(dataset, dataset_names, dataset_configs, fs)
         self.model_name = 'moment'
         self.scale = 1.0  # RevIN handles normalization in the model
 
@@ -64,10 +65,12 @@ class MomentDataLoaderFactory(AbstractDataLoaderFactory, StandardEEGChannelsMixi
         dataset: HFDataset,
         dataset_names: List[str],
         dataset_configs: List[str],
+        fs: int,
     ) -> MomentDatasetAdapter:
         return MomentDatasetAdapter(
             dataset=dataset,
             dataset_names=dataset_names,
             dataset_configs=dataset_configs,
+            fs=fs,
             target_seq_len=self.target_seq_len,
         )

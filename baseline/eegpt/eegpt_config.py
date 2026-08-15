@@ -95,7 +95,6 @@ class EegptConfig(AbstractConfig):
     """EEGPT configuration that extends AbstractConfig."""
     
     model_type: str = "eegpt"
-    fs: int = 256
     
     data: EegptDataArgs = Field(default_factory=EegptDataArgs)
     model: EegptModelArgs = Field(default_factory=EegptModelArgs)

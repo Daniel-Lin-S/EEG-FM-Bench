@@ -6,6 +6,7 @@ seeds: [42]
 master_port: 51301
 multitask: true
 model_type: 'labram'
+fs: 200  # pre-training sampling frequency (aligned with published LaBraM model)
 
 # Data configuration
 data:

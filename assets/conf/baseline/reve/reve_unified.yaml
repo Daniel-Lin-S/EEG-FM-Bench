@@ -6,6 +6,7 @@ seeds: [42]
 master_port: 51104
 multitask: true
 model_type: 'reve'
+fs: 200   # pre-training sampling frequency (aligned with published REVE model)
 
 # Data configuration
 data:

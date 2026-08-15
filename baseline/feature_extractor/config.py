@@ -149,8 +149,9 @@ class FeatureExtractorConfig(AbstractConfig):
             )
         if len(self.seeds) != 1:
             raise ValueError(
-                f"{self.model_type} supports exactly one deterministic "
-                f"seed, but got {self.seeds}."
+                f"{self.model_type} supports exactly one seed because its "
+                "feature extraction and classifier evaluation are "
+                "deterministic."
             )
         return True
 

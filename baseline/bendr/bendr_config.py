@@ -93,7 +93,6 @@ class BendrConfig(AbstractConfig):
     """BENDR configuration that extends AbstractConfig."""
     
     model_type: str = "bendr"
-    fs: int = 256
     
     data: BendrDataArgs = Field(default_factory=BendrDataArgs)
     model: BendrModelArgs = Field(default_factory=BendrModelArgs)

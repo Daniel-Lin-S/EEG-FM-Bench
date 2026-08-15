@@ -49,6 +49,12 @@ class LabramDataLoaderFactory(AbstractDataLoaderFactory):
         self,
         dataset: HFDataset,
         dataset_names: List[str],
-        dataset_configs: List[str]
+        dataset_configs: List[str],
+        fs: int,
     ) -> LabramDatasetAdapter:
-        return LabramDatasetAdapter(dataset, dataset_names, dataset_configs) 
+        return LabramDatasetAdapter(
+            dataset,
+            dataset_names,
+            dataset_configs,
+            fs,
+        )

@@ -45,11 +45,18 @@ class AbstractDatasetAdapter(Dataset, ABC):
         For example, if the model accepts mV, set scale to 0.001.
     """
     
-    def __init__(self, dataset: HFDataset, dataset_names: List[str], dataset_configs: List[str]):
+    def __init__(
+            self,
+            dataset: HFDataset,
+            dataset_names: List[str],
+            dataset_configs: List[str],
+            fs: int,
+    ):
         self.model_name = ''
         self.dataset = dataset
         self.dataset_names = dataset_names
         self.dataset_configs = dataset_configs
+        self.fs = fs
         self.montage_mappings = {}
 
         self.scale = 1.0
@@ -66,7 +73,11 @@ class AbstractDatasetAdapter(Dataset, ABC):
         supported_channels = self.get_supported_channels()
 
         for dataset_name, dataset_config in zip(self.dataset_names, self.dataset_configs):
-            montages = get_dataset_montage(dataset_name=dataset_name, config_name=dataset_config)
+            montages = get_dataset_montage(
+                dataset_name=dataset_name,
+                config_name=dataset_config,
+                fs=self.fs,
+            )
 
             for montage_key, channel_names in montages.items():
                 # Process montage to create model-specific mapping
@@ -189,6 +200,59 @@ class AbstractDatasetAdapter(Dataset, ABC):
             raise ValueError(f"Montage {montage} not found")
 
 
+
+class FixedWidthChannelDataset(Dataset):
+    """Read-only view that selects one ordered channel layout per montage."""
+
+    def __init__(
+        self,
+        dataset: HFDataset,
+        montage_layouts: Mapping[str, list[str]],
+        channel_layout: list[str],
+    ) -> None:
+        if not channel_layout:
+            raise ValueError("Fixed-width channel layout must be nonempty.")
+        self.dataset = dataset
+        self.selectors: Dict[str, torch.Tensor] = {}
+        for montage, channels in montage_layouts.items():
+            missing = [
+                channel for channel in channel_layout if channel not in channels
+            ]
+            if missing:
+                raise ValueError(
+                    f"Montage {montage} is missing required channels "
+                    f"{missing}."
+                )
+            self.selectors[montage] = torch.tensor(
+                [channels.index(channel) for channel in channel_layout],
+                dtype=torch.long,
+            )
+
+    def __len__(self) -> int:
+        """Return the number of samples in the underlying Arrow dataset."""
+        return len(self.dataset)
+
+    def __getitem__(self, index: int | str) -> Any:
+        """Return aligned signal data or delegate column access."""
+        if isinstance(index, str):
+            return self.dataset[index]
+        sample = dict(self.dataset[index])
+        montage = str(sample["montage"])
+        selector = self.selectors.get(montage)
+        if selector is None:
+            raise ValueError(
+                f"Sample montage {montage} has no fixed-width mapping."
+            )
+        data = torch.as_tensor(sample["data"])
+        if data.ndim != 2:
+            raise ValueError(
+                f"Expected {montage} data shape (channels, timepoints), "
+                f"but got {tuple(data.shape)}."
+            )
+        sample["data"] = data.index_select(0, selector)
+        return sample
+
+
 class AbstractDataLoaderFactory(ABC):
     """Abstract factory for creating data loaders."""
 
@@ -203,6 +267,7 @@ class AbstractDataLoaderFactory(ABC):
         self.num_workers = num_workers
         self.seed = seed
         self.pin_memory = pin_memory
+        self.channel_layout: Optional[list[str]] = None
 
     def get_data_diagnostics(
         self,
@@ -228,7 +293,8 @@ class AbstractDataLoaderFactory(ABC):
         self,
         dataset: HFDataset,
         dataset_names: List[str],
-        dataset_configs: List[str]
+        dataset_configs: List[str],
+        fs: int,
     ) -> AbstractDatasetAdapter:
         """Create dataset adapter instance."""
         pass
@@ -258,12 +324,24 @@ class AbstractDataLoaderFactory(ABC):
             cast_label=True,
             fs=fs,
         )
+        if self.channel_layout is not None:
+            montage_layouts: Dict[str, list[str]] = {}
+            for dataset_name, config_name in datasets_config.items():
+                montage_layouts.update(
+                    get_dataset_montage(dataset_name, config_name, fs)
+                )
+            combined_dataset = FixedWidthChannelDataset(
+                combined_dataset,
+                montage_layouts,
+                self.channel_layout,
+            )
 
         # Create adapter
         adapter = self.create_adapter(
             dataset=combined_dataset,
             dataset_names=dataset_names,
-            dataset_configs=config_names
+            dataset_configs=config_names,
+            fs=fs,
         )
 
         sampler = DistributedGroupBatchSampler(

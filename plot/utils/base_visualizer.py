@@ -469,7 +469,11 @@ class BaseVisualizer(ABC):
                         ch_names.append(ch)
 
                 if len(ch_names) > 0:
-                    info = mne.create_info(ch_names=ch_names, sfreq=256, ch_types='eeg')
+                    info = mne.create_info(
+                        ch_names=ch_names,
+                        sfreq=self.cfg.fs,
+                        ch_types='eeg',
+                    )
                     info.set_montage(montage)
 
                     cam_filtered = np.delete(cam, exclude, axis=0)
@@ -593,7 +597,11 @@ class BaseVisualizer(ABC):
                         ch_names.append(ch)
 
                 if len(ch_names) > 0:
-                    info = mne.create_info(ch_names=ch_names, sfreq=256, ch_types='eeg')
+                    info = mne.create_info(
+                        ch_names=ch_names,
+                        sfreq=self.cfg.fs,
+                        ch_types='eeg',
+                    )
                     info.set_montage(montage)
 
                     attr_filtered = np.delete(channel_avg_attr, exclude, axis=0)

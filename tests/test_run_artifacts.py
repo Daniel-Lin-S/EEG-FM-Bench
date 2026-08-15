@@ -12,6 +12,9 @@ from baseline.utils.run_artifacts import load_saved_run_config
 from baseline.utils.run_artifacts import save_resolved_config
 
 
+TEST_FS = 256
+
+
 def test_performance_diagnostics_aggregate_finite_passes() -> None:
     """Timing diagnostics retain compact finite split summaries."""
     class PerformanceTrainer(AbstractTrainer):
@@ -53,7 +56,7 @@ def test_checkpoint_retention_default_and_identity_exclusion() -> None:
         save_checkpoints=True
     ).save_checkpoints is True
 
-    config = BrainOmniConfig().model_dump(mode="json")
+    config = BrainOmniConfig(fs=TEST_FS).model_dump(mode="json")
     original = get_config_hash(config, multitask=False)
     config["logging"]["save_checkpoints"] = True
     assert get_config_hash(config, multitask=False) == original
@@ -72,7 +75,7 @@ def test_logging_level_is_normalized_and_not_part_of_identity() -> None:
     with pytest.raises(ValueError, match='Input should be'):
         BrainOmniLoggingArgs(level='trace')
 
-    config = BrainOmniConfig().model_dump(mode='json')
+    config = BrainOmniConfig(fs=TEST_FS).model_dump(mode='json')
     original = get_config_hash(config, multitask=False)
     config['logging']['level'] = 'debug'
 
@@ -82,7 +85,7 @@ def test_logging_level_is_normalized_and_not_part_of_identity() -> None:
 
 def test_final_run_identity_excludes_separate_dataset_selection() -> None:
     """Separate tasks share one campaign while multitask retains membership."""
-    config = BrainOmniConfig().model_dump(mode='json')
+    config = BrainOmniConfig(fs=TEST_FS).model_dump(mode='json')
     separate_hash = get_config_hash(config, multitask=False)
     multitask_hash = get_config_hash(config, multitask=True)
     config['data']['datasets'] = {'bcic_1a': 'finetune'}
@@ -93,7 +96,7 @@ def test_final_run_identity_excludes_separate_dataset_selection() -> None:
 
 def test_saved_config_round_trip(tmp_path: Path) -> None:
     """Saved run configurations load without source-YAML merging."""
-    config = BrainOmniConfig().model_dump(mode='json')
+    config = BrainOmniConfig(fs=TEST_FS).model_dump(mode='json')
     save_resolved_config(config, tmp_path / 'configs' / 'run.yaml')
     loaded = load_saved_run_config(tmp_path)
     assert loaded.model_dump(mode='json') == config

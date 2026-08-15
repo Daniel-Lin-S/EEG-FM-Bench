@@ -79,6 +79,7 @@ class BrainOmniDatasetAdapter(AbstractDatasetAdapter):
         dataset: HFDataset,
         dataset_names: List[str],
         dataset_configs: List[str],
+        fs: int,
         normalize_input: bool = True,
         normalize_position: bool = True,
         signal_normalize_eps: float = _SIGNAL_NORMALIZE_EPS_DEFAULT,
@@ -101,7 +102,7 @@ class BrainOmniDatasetAdapter(AbstractDatasetAdapter):
                 "BrainOmni adapter expected finite position_normalize_eps > 0."
             )
         self.electrode_set = ElectrodeSet()
-        super().__init__(dataset, dataset_names, dataset_configs)
+        super().__init__(dataset, dataset_names, dataset_configs, fs)
 
     def _setup_adapter(self) -> None:
         self.model_name = "brainomni"
@@ -435,11 +436,13 @@ class BrainOmniDataLoaderFactory(AbstractDataLoaderFactory):
         dataset: HFDataset,
         dataset_names: List[str],
         dataset_configs: List[str],
+        fs: int,
     ) -> AbstractDatasetAdapter:
         return BrainOmniDatasetAdapter(
             dataset=dataset,
             dataset_names=dataset_names,
             dataset_configs=dataset_configs,
+            fs=fs,
             normalize_input=self.normalize_input,
             normalize_position=self.normalize_position,
             signal_normalize_eps=self.signal_normalize_eps,
@@ -636,6 +639,7 @@ class BrainOmniDataLoaderFactory(AbstractDataLoaderFactory):
             dataset=combined_dataset,
             dataset_names=dataset_names,
             dataset_configs=dataset_configs,
+            fs=fs,
         )
         filtered_dataset = self._filter_invalid_samples(
             combined_dataset,

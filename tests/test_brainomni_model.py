@@ -13,6 +13,9 @@ from baseline.brainomni import model as brainomni_model
 from baseline.brainomni.brainomni_config import BrainOmniConfig
 
 
+TEST_FS = 256
+
+
 @pytest.mark.parametrize(
 	"field,value",
 	[
@@ -27,7 +30,7 @@ def test_config_rejects_nonfinite_normalization_epsilon(
 	value: float,
 ) -> None:
 	"""Normalization safeguards require finite positive epsilon values."""
-	config = BrainOmniConfig()
+	config = BrainOmniConfig(fs=TEST_FS)
 	setattr(config.model, field, value)
 
 	assert config.validate_config() is False

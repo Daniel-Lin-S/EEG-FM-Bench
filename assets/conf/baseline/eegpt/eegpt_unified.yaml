@@ -6,6 +6,7 @@ seeds: [42]
 master_port: 51103
 multitask: true
 model_type: 'eegpt'
+fs: 256    # pre-training sampling frequency (aligned with published EEGPT model)
 
 # Data configuration
 data:

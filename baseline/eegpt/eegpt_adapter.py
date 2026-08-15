@@ -34,6 +34,7 @@ class EegptDataLoaderFactory(AbstractDataLoaderFactory):
         self,
         dataset: HFDataset,
         dataset_names: List[str],
-        dataset_configs: List[str]
+        dataset_configs: List[str],
+        fs: int,
     ) -> EegptDatasetAdapter:
-        return EegptDatasetAdapter(dataset, dataset_names, dataset_configs)
+        return EegptDatasetAdapter(dataset, dataset_names, dataset_configs, fs)

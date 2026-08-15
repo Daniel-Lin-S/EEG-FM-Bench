@@ -106,7 +106,6 @@ class LabramConfig(AbstractConfig):
     """LABRAM configuration that extends AbstractConfig."""
     
     model_type: str = "labram"
-    fs: int = 200
     
     data: LabramDataArgs = Field(default_factory=LabramDataArgs)
     model: LabramModelArgs = Field(default_factory=LabramModelArgs)

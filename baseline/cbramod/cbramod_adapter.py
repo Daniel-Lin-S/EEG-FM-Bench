@@ -53,6 +53,12 @@ class CBraModDataLoaderFactory(AbstractDataLoaderFactory):
             self,
             dataset: HFDataset,
             dataset_names: list[str],
-            dataset_configs: list[str]
+            dataset_configs: list[str],
+            fs: int,
     ) -> AbstractDatasetAdapter:
-        return CBraModDatasetAdapter(dataset, dataset_names, dataset_configs)
+        return CBraModDatasetAdapter(
+            dataset,
+            dataset_names,
+            dataset_configs,
+            fs,
+        )

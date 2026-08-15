@@ -6,6 +6,7 @@ seeds: [42]
 master_port: 51501
 multitask: true
 model_type: 'bendr'
+fs: 256  # pre-training sampling frequency (aligned with published BENDR model)
 
 # Data configuration
 data:

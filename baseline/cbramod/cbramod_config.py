@@ -125,7 +125,6 @@ class CBraModConfig(AbstractConfig):
     :class:`BaseLoggingArgs`.
     """
     model_type: str = "cbramod"
-    fs: int = 200
     
     data: CBraModDataArgs = Field(default_factory=CBraModDataArgs)
     model: CBraModModelArgs = Field(default_factory=CBraModModelArgs)

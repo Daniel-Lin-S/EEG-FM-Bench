@@ -269,6 +269,10 @@ scripts/download_datasets.sh
 python preproc.py conf_file=preproc/preproc_example.yaml
 ```
 
+Every preprocessing YAML must explicitly set a positive top-level `fs`.
+Training YAML must also set `fs` to the same rate, because processed
+artifacts are rate-specific (for example, `fs_256`).
+
 #### Step 2: Model Fine-tuning & Evaluation
 ```bash
 # Fine-Tuning (examples for different models)

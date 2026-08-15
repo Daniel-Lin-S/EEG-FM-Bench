@@ -90,7 +90,6 @@ class CSBrainConfig(AbstractConfig):
     """CSBrain configuration that extends AbstractConfig."""
     
     model_type: str = "csbrain"
-    fs: int = 200
     
     data: CSBrainDataArgs = Field(default_factory=CSBrainDataArgs)
     model: CSBrainModelArgs = Field(default_factory=CSBrainModelArgs)

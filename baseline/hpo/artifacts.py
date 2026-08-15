@@ -1491,6 +1491,7 @@ def _compact_invocation_status(
         "requested",
         "attempted",
         "dataset_attempts",
+        "dataset_outcomes",
         "succeeded",
         "failed",
         "skipped",

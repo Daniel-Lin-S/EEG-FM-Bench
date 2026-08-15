@@ -1,6 +1,7 @@
 seeds: [42]
 multitask: false
 model_type: minirocket
+fs: 256
 
 data:
   datasets:

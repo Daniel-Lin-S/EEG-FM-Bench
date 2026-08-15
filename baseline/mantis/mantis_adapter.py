@@ -32,6 +32,7 @@ class MantisDatasetAdapter(AbstractDatasetAdapter, StandardEEGChannelsMixin):
         dataset: HFDataset, 
         dataset_names: List[str], 
         dataset_configs: List[str],
+        fs: int,
         target_seq_len: int = 512,
         use_zscore: bool = True,
     ):
@@ -56,7 +57,7 @@ class MantisDatasetAdapter(AbstractDatasetAdapter, StandardEEGChannelsMixin):
         self.normalizer = ZScoreNorm() if use_zscore else None
         self.electrode_set = ElectrodeSet()
 
-        super().__init__(dataset, dataset_names, dataset_configs)
+        super().__init__(dataset, dataset_names, dataset_configs, fs)
         self.model_name = 'mantis'
         self.scale = 1.0  # Z-score handles scaling
 
@@ -127,11 +128,13 @@ class MantisDataLoaderFactory(AbstractDataLoaderFactory, StandardEEGChannelsMixi
         dataset: HFDataset,
         dataset_names: List[str],
         dataset_configs: List[str],
+        fs: int,
     ) -> MantisDatasetAdapter:
         return MantisDatasetAdapter(
             dataset=dataset,
             dataset_names=dataset_names,
             dataset_configs=dataset_configs,
+            fs=fs,
             target_seq_len=self.target_seq_len,
             use_zscore=self.use_zscore,
         )

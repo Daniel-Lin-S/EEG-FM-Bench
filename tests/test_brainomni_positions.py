@@ -282,5 +282,39 @@ class BrainOmniPositionTests(unittest.TestCase):
         self.assertEqual(filtered_dataset.column_names, ["montage", "data"])
         self.assertEqual(filtered_dataset["montage"], ["demo/10_20"])
 
+    def test_tuar_montages_keep_signal_and_position_alignment(self):
+        """Each TUAR montage key selects matching persisted XYZ positions."""
+        adapter = self._adapter()
+        montage_names = (
+            "tuar/01_tcp_ar",
+            "tuar/02_tcp_le",
+            "tuar/03_tcp_ar_a",
+        )
+        adapter.montage_mappings = {
+            montage_name: {"idx": [0, 2], "sel": [True, False, True]}
+            for montage_name in montage_names
+        }
+
+        for montage_index, montage_name in enumerate(montage_names):
+            with self.subTest(montage=montage_name):
+                sample = {
+                    "montage": montage_name,
+                    "data": [[1.0, 2.0], [3.0, 4.0], [5.0, 7.0]],
+                    "pos": [
+                        [montage_index + 1.0, 1.0, 1.0],
+                        [9.0, 9.0, 9.0],
+                        [montage_index + 2.0, 2.0, 2.0],
+                    ],
+                }
+                rejection = adapter.get_sample_rejection(sample)
+                self.assertIsNone(rejection)
+                positions = adapter._get_persisted_positions(
+                    sample,
+                    {"montage": montage_name, "chs": [0, 1]},
+                )
+                self.assertEqual(tuple(positions.shape), (2, 6))
+                self.assertEqual(positions[0, 0].item(), montage_index + 1.0)
+                self.assertEqual(positions[1, 0].item(), montage_index + 2.0)
+
 if __name__ == "__main__":
     unittest.main()

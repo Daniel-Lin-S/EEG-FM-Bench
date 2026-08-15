@@ -8,7 +8,7 @@ import mne
 import torch
 import datasets
 from torch import Tensor
-from torch.utils.data import DataLoader
+
 from datasets import Dataset, concatenate_datasets, Value
 
 from data.dataset.adftd import AdftdBuilder
@@ -236,7 +236,7 @@ def get_dataset_shape_info(dataset_name: str, config_name: str, fs: int) -> dict
         Dict mapping montage_key -> (n_timepoints, n_channels)
     """
     builder_cls = DATASET_SELECTOR[dataset_name]
-    builder: EEGDatasetBuilder = builder_cls(config_name=config_name)
+    builder: EEGDatasetBuilder = builder_cls(config_name=config_name, fs=fs)
 
     config: EEGConfig = builder.config
     n_timepoints = int(config.wnd_div_sec * fs)
@@ -259,10 +259,14 @@ def get_dataset_category(dataset_name: str, config_name: str) -> list[str]:
     config: EEGConfig = DATASET_SELECTOR[dataset_name].builder_configs.get(config_name)
     return config.category
 
-def get_dataset_montage(dataset_name: str, config_name: str) -> dict[str, list[str]]:
+def get_dataset_montage(
+        dataset_name: str,
+        config_name: str,
+        fs: float,
+) -> dict[str, list[str]]:
     # Note: This function needs builder instance to call standardize_chs_names()
     builder_cls = DATASET_SELECTOR[dataset_name]
-    builder: EEGDatasetBuilder = builder_cls(config_name=config_name)
+    builder: EEGDatasetBuilder = builder_cls(config_name=config_name, fs=fs)
     montage_names = builder.config.montage.keys()
 
     montages: dict[str, list[str]] = dict()
@@ -270,6 +274,56 @@ def get_dataset_montage(dataset_name: str, config_name: str) -> dict[str, list[s
         montages[f'{dataset_name}/{montage_name}'] = builder.standardize_chs_names(montage_name)
 
     return montages
+
+
+def resolve_common_montage_layout(
+        montages: Mapping[str, list[str]],
+        model_type: str,
+        dataset_name: str,
+) -> list[str]:
+    """Return the ordered channels shared by every dataset montage.
+
+    Fixed-width models require one signal shape per dataset. EEG datasets can
+    legitimately contain multiple montages, so the shared-channel intersection
+    is selected and ordered by the first named montage.
+    """
+    if not montages:
+        raise ValueError(
+            f"{model_type} requires at least one montage for {dataset_name}."
+        )
+    duplicate_layouts = {
+        name: channels
+        for name, channels in montages.items()
+        if len(channels) != len(set(channels))
+    }
+    if duplicate_layouts:
+        details = "; ".join(
+            f"{name}={list(channels)}"
+            for name, channels in sorted(duplicate_layouts.items())
+        )
+        raise ValueError(
+            f"{model_type} cannot align duplicate canonical channels for "
+            f"{dataset_name}: {details}."
+        )
+    montage_items = sorted(montages.items())
+    shared_channels = set(montage_items[0][1])
+    for _, channels in montage_items[1:]:
+        shared_channels.intersection_update(channels)
+    layout = [
+        channel
+        for channel in montage_items[0][1]
+        if channel in shared_channels
+    ]
+    if not layout:
+        details = "; ".join(
+            f"{name}={list(channels)}"
+            for name, channels in montage_items
+        )
+        raise ValueError(
+            f"{model_type} cannot form a nonempty shared canonical channel "
+            f"layout for {dataset_name}: {details}."
+        )
+    return layout
 
 
 def load_concat_eeg_datasets(
@@ -346,13 +400,3 @@ def calc_distribution_weight(n: int, label_cnt: Tensor, option: str):
         return n / label_cnt.float()
     else:
         raise ValueError(f'Unknown option {option}')
-
-
-
-if __name__ == '__main__':
-    # data = load_concat_eeg_datasets(['seed_v', 'tuab'])
-    data, distribution = load_concat_eeg_datasets(['tuab'], ['finetune'], fs=256)
-    loader = DataLoader(data, batch_size=32)
-
-    for batch in loader:
-        pass

@@ -19,8 +19,10 @@ class EegNetDataLoaderFactory(AbstractDataLoaderFactory):
         self,
         dataset: HFDataset,
         dataset_names: List[str],
-        dataset_configs: List[str]
+        dataset_configs: List[str],
+        fs: int,
     ) -> HFDataset:
+        del fs
         return dataset
 
 

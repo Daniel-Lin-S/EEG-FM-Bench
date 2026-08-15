@@ -28,7 +28,6 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 from sklearn.pipeline import Pipeline
-from torch.utils.data import DataLoader
 
 from baseline.abstract.trainer import AbstractTrainer, format_console_log_dict
 from baseline.feature_extractor.classifier import (
@@ -51,6 +50,7 @@ from common.log import setup_log
 from data.processor.wrapper import (
     get_dataset_montage,
     get_dataset_n_class,
+    resolve_common_montage_layout,
     load_concat_eeg_datasets,
 )
 
@@ -287,15 +287,21 @@ class FeatureExtractorTrainer(AbstractTrainer, ABC):
         )
         temporary_path.replace(completion_path)
 
+    def _fixed_channel_layout(
+        self,
+        ds_name: str,
+        ds_config: str,
+    ) -> tuple[list[str], dict[str, list[str]]]:
+        """Return a shared fixed-width layout and every source montage."""
+        montages = get_dataset_montage(ds_name, ds_config, self.cfg.fs)
+        layout = resolve_common_montage_layout(
+            montages, self.model_type, ds_name
+        )
+        return layout, montages
+
     def _validate_montage(self, ds_name: str, ds_config: str) -> None:
-        """Reject datasets that cannot produce one fixed feature width."""
-        montages = get_dataset_montage(ds_name, ds_config)
-        if len(montages) != 1:
-            raise ValueError(
-                f"{self.model_type} requires exactly one montage for "
-                f"{ds_name}, "
-                f"but found {len(montages)} montages."
-            )
+        """Validate that the dataset has a nonempty shared channel layout."""
+        self._fixed_channel_layout(ds_name, ds_config)
 
     def _load_split(
         self,
@@ -303,7 +309,10 @@ class FeatureExtractorTrainer(AbstractTrainer, ABC):
         ds_config: str,
         split: datasets.NamedSplit,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """Load one fixed benchmark split into dense EEG arrays."""
+        """Load one split and align every sample to the shared layout."""
+        channel_layout, montages = self._fixed_channel_layout(
+            ds_name, ds_config
+        )
         dataset, _ = load_concat_eeg_datasets(
             dataset_names=[ds_name],
             builder_configs=[ds_config],
@@ -314,28 +323,38 @@ class FeatureExtractorTrainer(AbstractTrainer, ABC):
         if len(dataset) == 0:
             raise ValueError(f"{ds_name} {split} split contains no trials.")
 
-        dataloader = DataLoader(
-            dataset,
-            batch_size=self.cfg.data.load_batch_size,
-            shuffle=False,
-            num_workers=self.cfg.data.num_workers,
-        )
         data_batches = []
         label_batches = []
-        for batch in dataloader:
-            data = torch.as_tensor(batch["data"], dtype=torch.float32)
-            labels = torch.as_tensor(batch["label"], dtype=torch.long)
-            if data.ndim != 3:
-                raise ValueError(
-                    f"Expected {ds_name} {split} data shape "
-                    "(batch, channels, timepoints), but got "
-                    f"{tuple(data.shape)}."
+        batch_size = self.cfg.data.load_batch_size
+        for start_index in range(0, len(dataset), batch_size):
+            aligned_data = []
+            aligned_labels = []
+            stop_index = min(start_index + batch_size, len(dataset))
+            for sample_index in range(start_index, stop_index):
+                sample = dataset[sample_index]
+                montage = str(sample["montage"])
+                source_layout = montages.get(montage)
+                if source_layout is None:
+                    raise ValueError(
+                        f"{ds_name} {split} has unknown montage {montage}."
+                    )
+                data = torch.as_tensor(sample["data"], dtype=torch.float32)
+                if data.ndim != 2 or data.shape[0] != len(source_layout):
+                    raise ValueError(
+                        f"Expected {montage} data shape ({len(source_layout)}, "
+                        f"timepoints), but got {tuple(data.shape)}."
+                    )
+                selector = torch.tensor(
+                    [
+                        source_layout.index(channel)
+                        for channel in channel_layout
+                    ],
+                    dtype=torch.long,
                 )
-            if data.shape[0] != labels.shape[0]:
-                raise ValueError(
-                    f"{ds_name} {split} has {data.shape[0]} EEG trials but "
-                    f"{labels.shape[0]} labels in one batch."
-                )
+                aligned_data.append(data.index_select(0, selector))
+                aligned_labels.append(int(sample["label"]))
+            data = torch.stack(aligned_data)
+            labels = torch.tensor(aligned_labels, dtype=torch.long)
             if not torch.isfinite(data).all():
                 raise ValueError(
                     f"{ds_name} {split} EEG data contains NaN or inf."

@@ -33,7 +33,6 @@ class EegNetConfig(ClassicalConfig):
     """EegNet configuration that extends AbstractConfig."""
 
     model_type: str = "eegnet"
-    fs: int = 256
 
     data: ClassicalDataArgs = Field(default_factory=ClassicalDataArgs)
     model: ClassicalModelArgs = Field(default_factory=ClassicalModelArgs)

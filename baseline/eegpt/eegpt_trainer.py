@@ -52,6 +52,7 @@ from baseline.utils.common import Conv1dWithConstraint
 
 
 logger = logging.getLogger('baseline')
+MAX_SEQUENCE_SECONDS = 60
 
 
 class EEGPTUnifiedModel(nn.Module):
@@ -115,7 +116,7 @@ class EegptTrainer(AbstractTrainer):
         self.loss_fn = nn.CrossEntropyLoss()
         
         # Model dimensions
-        self.max_seq_length = 60 * 256  # 60 secs with 256Hz
+        self.max_seq_length = MAX_SEQUENCE_SECONDS * self.cfg.fs
         self.max_channels = 64
 
     def setup_model(self):

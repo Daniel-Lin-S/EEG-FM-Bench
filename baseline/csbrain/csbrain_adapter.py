@@ -140,9 +140,10 @@ class CSBrainDatasetAdapter(AbstractDatasetAdapter):
         dataset: HFDataset, 
         dataset_names: List[str], 
         dataset_configs: List[str],
+        fs: int,
         patch_size: int = 200,
     ):
-        super().__init__(dataset, dataset_names, dataset_configs)
+        super().__init__(dataset, dataset_names, dataset_configs, fs)
         self.electrode_set: ElectrodeSet = ElectrodeSet()
         self.patch_size = patch_size
 
@@ -215,11 +216,13 @@ class CSBrainDataLoaderFactory(AbstractDataLoaderFactory):
         self,
         dataset: HFDataset,
         dataset_names: List[str],
-        dataset_configs: List[str]
+        dataset_configs: List[str],
+        fs: int,
     ) -> CSBrainDatasetAdapter:
         return CSBrainDatasetAdapter(
             dataset, 
             dataset_names, 
             dataset_configs,
+            fs,
             patch_size=self.patch_size,
         )

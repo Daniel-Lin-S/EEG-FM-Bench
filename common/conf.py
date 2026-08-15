@@ -13,7 +13,7 @@ class BasePreprocArgs(BaseModel):
 
     Parameters
     ----------
-    fs : int, optional, default=256
+    fs : int
         Sampling rate in Hz supplied to every dataset builder. It defines the
         resampled dataset written to disk and must match the model's requirements
     clean_middle_cache : bool, optional, default=False
@@ -45,7 +45,7 @@ class BasePreprocArgs(BaseModel):
         ``preproc.py`` validates both the key and value.
     """
 
-    fs: int = 256
+    fs: int = Field(gt=0)
     clean_middle_cache: bool = False
     clean_shared_info: bool = False
     # Recompute only these auxiliary field flows when refresh_arrow is true.
@@ -667,7 +667,7 @@ class BaseSetupArgs(BaseModel):
         ``"all"``, defined by ``common.type.TrainStage``; the latter two are
         valid enum values but are rejected by the shared pretraining and
         fine-tuning loader helpers.
-    fs : int, optional, default=256
+    fs : int
         Sampling rate passed to dataset loading and shape discovery; it must
         match the preprocessing rate.
     data : BaseDataLoaderArgs, optional, default=BaseDataLoaderArgs()
@@ -693,8 +693,8 @@ class BaseSetupArgs(BaseModel):
     model_type: str = 'default'
     conf_file: Optional[str] = None
     stage: TrainStage = TrainStage.PRETRAIN
-    # Global sampling rate for data loading (must match preprocessed data)
-    fs: int = 256
+    # Required sampling rate for data loading (must match preprocessing).
+    fs: int = Field(gt=0)
 
     data: BaseDataLoaderArgs = Field(default_factory=BaseDataLoaderArgs)
     model: BaseModelArgs = Field(default_factory=BaseModelArgs)

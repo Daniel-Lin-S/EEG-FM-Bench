@@ -17,6 +17,7 @@ DATASET_NAME = "toy"
 DATASET_CONFIG = "finetune"
 BINARY_CLASS_COUNT = 2
 MULTICLASS_COUNT = 3
+TEST_FS = 256
 
 
 class LabelOnlyDataset:
@@ -42,6 +43,7 @@ class LabelOnlyDataset:
 def make_config(tmp_path: Path) -> NaiveConfig:
     """Build one minimal label-only baseline configuration."""
     return NaiveConfig(
+        fs=TEST_FS,
         data={"datasets": {DATASET_NAME: DATASET_CONFIG}},
         logging={
             "run_dir": str(tmp_path),

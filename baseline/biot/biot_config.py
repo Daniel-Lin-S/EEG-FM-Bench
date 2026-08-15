@@ -78,7 +78,6 @@ class BiotConfig(AbstractConfig):
     """BIOT configuration that extends AbstractConfig."""
     
     model_type: str = "biot"
-    fs: int = 200
     
     data: BiotDataArgs = Field(default_factory=BiotDataArgs)
     model: BiotModelArgs = Field(default_factory=BiotModelArgs)

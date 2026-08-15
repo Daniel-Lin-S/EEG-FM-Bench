@@ -117,5 +117,64 @@ class MontagePositionTests(unittest.TestCase):
                         np.any(np.all(positions == 0.0, axis=1))
                     )
 
+    def test_tuar_uniform_canonical_layout_is_accepted(self):
+        """Equivalent TUAR montage names share one fixed channel layout."""
+        config = TuarConfig()
+        montages = {
+            f"tuar/{name}": self._standardized_tue_channels(channels)
+            for name, channels in config.montage.items()
+        }
+        from data.processor.wrapper import resolve_common_montage_layout
+
+        layout = resolve_common_montage_layout(
+            montages,
+            "catch22",
+            "tuar",
+        )
+
+        self.assertEqual(len(montages), 3)
+        self.assertEqual(layout, next(iter(montages.values())))
+
+    def test_tuep_montages_use_their_shared_canonical_layout(self):
+        """TUEP reference variants align to their common channel sequence."""
+        config = TuepV200Config()
+        montages = {
+            f"{config.dataset_name}/{name}": self._standardized_tue_channels(
+                channels
+            )
+            for name, channels in config.montage.items()
+        }
+        from data.processor.wrapper import resolve_common_montage_layout
+
+        layout = resolve_common_montage_layout(
+            montages, "minirocket", config.dataset_name
+        )
+
+        self.assertEqual(
+            layout,
+            [
+                "FP1", "FP2", "F7", "F3", "FZ", "F4", "F8",
+                "T7", "C3", "CZ", "C4", "T8", "P7", "P3",
+                "PZ", "P4", "P8", "O1", "O2",
+            ],
+        )
+
+    def test_unequal_canonical_layout_reports_each_montage(self):
+        """Fixed-width validation names the layouts that differ."""
+        from data.processor.wrapper import resolve_common_montage_layout
+
+        with self.assertRaisesRegex(
+                ValueError,
+                "tuar/01_tcp_ar=.*tuar/02_tcp_le=",
+        ):
+            resolve_common_montage_layout(
+                {
+                    "tuar/01_tcp_ar": ["FP1", "FP2"],
+                    "tuar/02_tcp_le": ["CZ"],
+                },
+                "minirocket",
+                "tuar",
+            )
+
 if __name__ == "__main__":
     unittest.main()

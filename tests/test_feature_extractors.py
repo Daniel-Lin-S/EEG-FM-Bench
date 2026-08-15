@@ -40,6 +40,7 @@ from baseline.utils.run_artifacts import load_final_checkpoint
 
 DATASET_NAME = "toy"
 DATASET_CONFIG = "finetune"
+TEST_FS = 256
 
 
 class MeanFeatureTrainer(FeatureExtractorTrainer):
@@ -89,6 +90,7 @@ def make_config(
     """Create one minimal feature-extractor configuration."""
     return Catch22Config(
         model_type=model_type,
+        fs=TEST_FS,
         data={"datasets": {DATASET_NAME: DATASET_CONFIG}},
         model=model or {},
         logging={"use_cloud": False, "outputs": ["csv"]},
@@ -313,12 +315,16 @@ def test_supported_ridge_selection_metrics(metric):
     assert np.isfinite(score)
 
 
-def test_feature_extractor_config_rejects_multitask_and_bad_alphas():
+def test_feature_extractor_config_rejects_incompatible_inputs():
     """Feature baselines reject incompatible and ambiguous configuration."""
     multitask_config = make_config()
     multitask_config.multitask = True
     with pytest.raises(ValueError, match="multitask=false"):
         multitask_config.validate_config()
+    multiseed_config = make_config()
+    multiseed_config.seeds = [42, 43]
+    with pytest.raises(ValueError, match="exactly one seed"):
+        multiseed_config.validate_config()
     with pytest.raises(ValueError, match="positive"):
         make_config(model={"classifier": {"alphas": [1.0, 0.0]}})
     with pytest.raises(ValueError, match="duplicates"):
@@ -346,6 +352,7 @@ def test_minirocket_loads_external_multivariate_source(tmp_path):
         encoding="utf-8",
     )
     config = MiniRocketConfig(
+        fs=TEST_FS,
         data={"datasets": {DATASET_NAME: DATASET_CONFIG}},
         model={
             "extractor": {
@@ -378,6 +385,7 @@ def test_minirocket_loads_external_multivariate_source(tmp_path):
 def test_minirocket_requires_source_path():
     """miniROCKET reports a clear error when no clone path is configured."""
     config = MiniRocketConfig(
+        fs=TEST_FS,
         data={"datasets": {DATASET_NAME: DATASET_CONFIG}},
     )
     trainer = MiniRocketTrainer(config)

@@ -69,7 +69,6 @@ class ReveLoggingArgs(BaseLoggingArgs):
 
 class ReveConfig(AbstractConfig):
     model_type: str = "reve"
-    fs: int = 200
 
     data: ReveDataArgs = Field(default_factory=ReveDataArgs)
     model: ReveModelArgs = Field(default_factory=ReveModelArgs)

@@ -26,6 +26,8 @@ from baseline.adaptive_batching import (
 from baseline.brainomni.brainomni_config import BrainOmniConfig
 from baseline.hpo.config import HpoConfig
 
+TEST_FS = 256
+
 
 class DummyTrainer(AbstractTrainer):
     """Minimal CPU trainer exposing the shared accumulation engine."""
@@ -132,7 +134,7 @@ def test_calibrated_selector_uses_largest_predicted_divisor() -> None:
 
 def test_adaptive_configuration_validation_and_defaults() -> None:
     """Training and HPO expose the selected reserve and failure defaults."""
-    config = BrainOmniConfig()
+    config = BrainOmniConfig(fs=TEST_FS)
     assert config.training.adaptive_batching.enabled is True
     assert (
         config.training.adaptive_batching.memory_reserve_fraction
@@ -141,6 +143,7 @@ def test_adaptive_configuration_validation_and_defaults() -> None:
     assert HpoConfig().max_consecutive_failed_trials == 5
     with pytest.raises(ValidationError, match="less than 1"):
         BrainOmniConfig(
+        fs=TEST_FS,
             training={
                 "adaptive_batching": {
                     "memory_reserve_fraction": 1.0,
@@ -150,6 +153,7 @@ def test_adaptive_configuration_validation_and_defaults() -> None:
 
     with pytest.raises(ValidationError, match="less than or equal to 300"):
         BrainOmniConfig(
+        fs=TEST_FS,
             training={
                 "adaptive_batching": {
                     "contention_wait_seconds": 301,
@@ -161,6 +165,7 @@ def test_adaptive_configuration_validation_and_defaults() -> None:
 def test_runtime_micro_batch_does_not_mutate_requested_config() -> None:
     """All adaptive candidates retain one canonical resolved identity."""
     config = BrainOmniConfig(
+        fs=TEST_FS,
         seeds=[7],
         data={"batch_size": 8},
     )
@@ -184,6 +189,7 @@ def test_runtime_micro_batch_does_not_mutate_requested_config() -> None:
 def test_accumulation_normalizes_by_samples() -> None:
     """A short final window receives its own sample-normalized update."""
     config = BrainOmniConfig(
+        fs=TEST_FS,
         seeds=[0],
         data={"batch_size": 4},
         training={"use_amp": False, "max_grad_norm": 100.0},
@@ -239,6 +245,7 @@ def test_checkpoint_cleanup_retains_only_requested_best(
 ) -> None:
     """Final cleanup discards all or retains only the loadable best state."""
     config = BrainOmniConfig(
+        fs=TEST_FS,
         logging={"save_checkpoints": retain},
     )
     trainer = DummyTrainer(config)
@@ -269,7 +276,7 @@ def test_incomplete_dataset_reset_removes_only_partial_artifacts(
     tmp_path: Path,
 ) -> None:
     """Epoch-zero restart clears partial outputs but keeps diagnostics."""
-    trainer = DummyTrainer(BrainOmniConfig())
+    trainer = DummyTrainer(BrainOmniConfig(fs=TEST_FS))
     trainer.log_dir = str(tmp_path / "log")
     trainer.ckpt_dir = str(tmp_path / "checkpoints")
     completion = trainer._completion_path("alpha")

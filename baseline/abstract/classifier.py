@@ -252,10 +252,18 @@ class CrossBlock(nn.Module):
 ###############################################################################
 
 class DynamicChannelConvRouter(nn.Module):
-    def __init__(self, ds_conf: dict[str, str], target_channel, *args, **kwargs):
+    def __init__(
+            self,
+            ds_conf: dict[str, str],
+            target_channel,
+            fs: int,
+            *args,
+            **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.ds_conf = ds_conf
         self.target_channel = target_channel
+        self.fs = fs
 
         self.montage_dict: dict[str, int] = dict()
         self.collect_montage()
@@ -266,7 +274,11 @@ class DynamicChannelConvRouter(nn.Module):
 
     def collect_montage(self):
         for ds_name, conf_name in self.ds_conf.items():
-            montages = get_dataset_montage(dataset_name=ds_name, config_name=conf_name)
+            montages = get_dataset_montage(
+                dataset_name=ds_name,
+                config_name=conf_name,
+                fs=self.fs,
+            )
             for mont_name, montage in montages.items():
                 self.montage_dict.update({mont_name: len(montage)})
 
