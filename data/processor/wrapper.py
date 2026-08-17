@@ -326,6 +326,61 @@ def resolve_common_montage_layout(
     return layout
 
 
+def load_eeg_dataset_for_classical_ml(
+        dataset_name: str,
+        builder_config: str,
+        split: datasets.NamedSplit,
+        fs: int,
+) -> Dataset:
+    """Load one Arrow split without neural-loader transformations.
+
+    Parameters
+    ----------
+    dataset_name : str
+        Registered EEG dataset name.
+    builder_config : str
+        Dataset builder configuration such as ``"finetune"``.
+    split : datasets.NamedSplit
+        Fixed split to load.
+    fs : int
+        Sampling frequency matching the preprocessed Arrow data.
+
+    Returns
+    -------
+    datasets.Dataset
+        Memory-mapped Arrow dataset with its original storage schema.
+
+    Notes
+    -----
+    This path deliberately performs no concatenation, Torch formatting,
+    class-weight calculation, or cached column casting. Classical consumers
+    must request bounded NumPy slices from the returned dataset.
+    """
+    if isinstance(fs, bool) or not isinstance(fs, int) or fs <= 0:
+        raise ValueError(
+            f"Expected a positive integer sampling rate, but got {fs!r}."
+        )
+    builder_cls = resolve_dataset_builder(dataset_name)
+    builder = builder_cls(config_name=builder_config, fs=fs)
+    log.info(
+        "Loading classical %s-%s %s at fs=%sHz from %s",
+        dataset_name,
+        builder_config,
+        split,
+        fs,
+        Path(builder.cache_dir).resolve(),
+    )
+    dataset = builder.as_dataset(split=split)
+    required_columns = {"data", "label", "montage"}
+    missing_columns = required_columns.difference(dataset.column_names)
+    if missing_columns:
+        raise ValueError(
+            f"Classical dataset {dataset_name} {split} is missing required "
+            f"columns: {sorted(missing_columns)}."
+        )
+    return dataset
+
+
 def load_concat_eeg_datasets(
         dataset_names: list[str],
         builder_configs: list[str],

@@ -10,6 +10,10 @@ data:
     tuab: finetune
     # ...
   load_batch_size: 256
+  feature_batch_size: 1024
+  memory_limit_gib: 32.0 # IMPORTANT - avoid OOM errors on large datasets, use lower value for resource-constrained environment.
+  # null uses <local output_root>/scratch/feature_extractors.
+  scratch_dir: null
   num_workers: 1
 
 model:
@@ -17,15 +21,11 @@ model:
     # CPU processes for independent trial-level feature extraction.
     n_jobs: 8
   classifier:
-    # Grid-search for Ridge regression classifier.
-    alphas:
-      - 0.001
-      - 0.01
-      - 0.1
-      - 1.0
-      - 10.0
-      - 100.0
-      - 1000.0
+    # Use `alphas` for a literal grid, or this logspace form, never both.
+    logspace:
+      start: -3
+      stop: 3
+      num: 10
     selection_metric: balanced_accuracy
 
 logging:

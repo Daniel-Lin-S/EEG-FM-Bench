@@ -511,7 +511,11 @@ def resolve_campaign(
                     )
                     continue
                 if candidate_semantic == semantic_config:
-                    matches.append((candidate, manifest != semantic_config))
+                    # This branch is reached only after the requested current
+                    # path was absent. Preserve every selected historical
+                    # directory and its immutable metadata, even when its
+                    # normalized manifest exactly equals current semantics.
+                    matches.append((candidate, True))
 
         if len(matches) > 1:
             candidates = ", ".join(

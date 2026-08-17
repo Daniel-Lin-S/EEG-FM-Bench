@@ -11,6 +11,7 @@ import yaml
 
 from baseline.brainomni.brainomni_config import BrainOmniConfig
 from baseline.catch22.catch22_config import Catch22Config
+from baseline.minirocket.minirocket_config import MiniRocketConfig
 from baseline.hpo.artifacts import (
     build_campaign_paths,
     collect_artifact_test_rows_with_diagnostics,
@@ -20,7 +21,10 @@ from baseline.hpo.artifacts import (
 )
 from baseline.hpo.config import HpoConfig
 from baseline.hpo.orchestrator import CampaignRunner
-from baseline.utils.identity import build_campaign_semantic_config
+from baseline.utils.identity import (
+    build_campaign_semantic_config,
+    build_run_semantic_config,
+)
 
 
 TEST_FS = 256
@@ -119,7 +123,201 @@ def test_campaign_identity_marks_searched_leaves_and_excludes_loaders(
     assert get_campaign_hash(config, search_change) != original
 
 
-@pytest.mark.parametrize("path", ("data.num_workers", "data.pin_memory"))
+def test_runtime_paths_are_model_agnostic_for_future_models() -> None:
+    """Shared invocation fields never enter a future model's identity."""
+    config = {
+        "model_type": "future_model",
+        "multitask": False,
+        "seeds": [42],
+        "data": {
+            "datasets": {"adftd": "finetune"},
+            "feature_batch_size": 1024,
+            "load_batch_size": 256,
+            "memory_limit_gib": 64.0,
+            "num_workers": 1,
+            "pin_memory": False,
+            "scratch_dir": None,
+        },
+        "model": {"extractor": {"n_jobs": 8}},
+        "training": {},
+    }
+    original = get_campaign_hash(config, {})
+    changed = copy.deepcopy(config)
+    changed["data"].update({
+        "feature_batch_size": 17,
+        "load_batch_size": 19,
+        "memory_limit_gib": 23.0,
+        "num_workers": 29,
+        "pin_memory": True,
+        "scratch_dir": "runtime-scratch",
+    })
+    changed["model"]["extractor"]["n_jobs"] = 31
+
+    assert get_campaign_hash(changed, {}) == original
+    assert build_run_semantic_config(
+        changed,
+        False,
+    ) == build_run_semantic_config(config, False)
+
+    omitted = copy.deepcopy(config)
+    for field in (
+        "feature_batch_size",
+        "load_batch_size",
+        "memory_limit_gib",
+        "num_workers",
+        "pin_memory",
+        "scratch_dir",
+    ):
+        omitted["data"].pop(field)
+    omitted["model"]["extractor"]["n_jobs"] = 37
+    assert get_campaign_hash(omitted, {}) == original
+    assert build_run_semantic_config(
+        omitted,
+        False,
+    ) == build_run_semantic_config(config, False)
+
+    semantic_change = copy.deepcopy(config)
+    semantic_change["data"]["batch_size"] = 32
+    assert get_campaign_hash(semantic_change, {}) != original
+
+
+def test_legacy_semantic_paths_normalize_for_campaigns_and_runs() -> None:
+    """Historical parameter nesting resolves to the current structure."""
+    current = MiniRocketConfig(
+        fs=TEST_FS,
+        data={"datasets": {"adftd": "finetune"}},
+        model={
+            "extractor": {
+                "source_path": None,
+                "num_features": 9996,
+                "max_dilations_per_kernel": 16,
+            },
+            "classifier": {
+                "alphas": [0.1, 1.0],
+                "selection_metric": "accuracy",
+            },
+        },
+    ).model_dump(mode="json")
+    legacy = copy.deepcopy(current)
+    model = legacy["model"]
+    classifier = model.pop("classifier")
+    extractor = model.pop("extractor")
+    model["ridge_alphas"] = classifier["alphas"]
+    model["ridge_selection_metric"] = classifier["selection_metric"]
+    model["minirocket_source_path"] = extractor["source_path"]
+    model["minirocket_num_features"] = extractor["num_features"]
+    model["minirocket_max_dilations_per_kernel"] = (
+        extractor["max_dilations_per_kernel"]
+    )
+
+    assert build_campaign_semantic_config(
+        legacy,
+        {},
+    ) == build_campaign_semantic_config(current, {})
+    assert build_run_semantic_config(
+        legacy,
+        False,
+    ) == build_run_semantic_config(current, False)
+
+
+def test_logspace_and_explicit_alpha_grids_have_one_identity() -> None:
+    """Equivalent Ridge grid forms resolve to the same campaign and run."""
+    logspace = Catch22Config(
+        fs=TEST_FS,
+        data={"datasets": {"adftd": "finetune"}},
+        model={
+            "classifier": {
+                "logspace": {"start": -3, "stop": 3, "num": 10},
+            }
+        },
+    ).model_dump(mode="json")
+    explicit = Catch22Config(
+        fs=TEST_FS,
+        data={"datasets": {"adftd": "finetune"}},
+        model={
+            "classifier": {
+                "alphas": logspace["model"]["classifier"]["alphas"],
+            }
+        },
+    ).model_dump(mode="json")
+
+    assert build_campaign_semantic_config(
+        logspace,
+        {},
+    ) == build_campaign_semantic_config(explicit, {})
+    assert build_run_semantic_config(
+        logspace,
+        False,
+    ) == build_run_semantic_config(explicit, False)
+
+
+def test_legacy_hpo_search_paths_normalize_to_current_names() -> None:
+    """Renamed searched fields preserve an HPO campaign identity."""
+    config = {
+        "model_type": "future_model",
+        "multitask": False,
+        "seeds": [42],
+        "data": {"datasets": {"adftd": "finetune"}},
+        "model": {"classifier": {"alphas": [0.1, 1.0]}},
+        "training": {},
+    }
+    current_hpo = {
+        "enabled": True,
+        "search_space": {
+            "model.classifier.alphas": {
+                "distribution": "categorical",
+                "choices": [[0.1], [1.0]],
+            }
+        },
+    }
+    legacy_config = copy.deepcopy(config)
+    classifier = legacy_config["model"]["classifier"]
+    classifier["ridge_alphas"] = classifier.pop("alphas")
+    legacy_hpo = copy.deepcopy(current_hpo)
+    distribution = legacy_hpo["search_space"].pop(
+        "model.classifier.alphas"
+    )
+    legacy_hpo["search_space"]["model.classifier.ridge_alphas"] = (
+        distribution
+    )
+
+    assert build_campaign_semantic_config(
+        legacy_config,
+        legacy_hpo,
+    ) == build_campaign_semantic_config(config, current_hpo)
+
+
+def test_conflicting_legacy_and_current_paths_fail_closed() -> None:
+    """A structural alias cannot hide genuinely different semantics."""
+    config = {
+        "model_type": "future_model",
+        "multitask": False,
+        "data": {"datasets": {}},
+        "model": {
+            "classifier": {
+                "alphas": [0.1],
+                "ridge_alphas": [1.0],
+            }
+        },
+        "training": {},
+    }
+
+    with pytest.raises(ValueError, match="Conflicting semantic values"):
+        build_campaign_semantic_config(config, {})
+
+
+@pytest.mark.parametrize(
+    "path",
+    (
+        "data.feature_batch_size",
+        "data.load_batch_size",
+        "data.memory_limit_gib",
+        "data.scratch_dir",
+        "data.num_workers",
+        "data.pin_memory",
+        "model.extractor.n_jobs",
+    ),
+)
 def test_hpo_rejects_runtime_only_loader_paths(path: str) -> None:
     """Runtime-only loader settings cannot be HPO search parameters."""
     with pytest.raises(ValueError, match="runtime-only data-loader field"):
@@ -127,11 +325,18 @@ def test_hpo_rejects_runtime_only_loader_paths(path: str) -> None:
             "enabled": True,
             "n_trials": 1,
             "search_space": {
-                path: {
-                    "distribution": "int",
-                    "low": 1,
-                    "high": 2,
-                },
+                path: (
+                    {
+                        "distribution": "categorical",
+                        "choices": ["first", "second"],
+                    }
+                    if path == "data.scratch_dir"
+                    else {
+                        "distribution": "int",
+                        "low": 1,
+                        "high": 2,
+                    }
+                ),
             },
         })
 
@@ -167,6 +372,55 @@ def _write_legacy_campaign(
         encoding="utf-8",
     )
     return path.read_bytes()
+
+
+def test_resolver_reuses_legacy_semantic_structure_without_rewriting(
+    tmp_path: Path,
+) -> None:
+    """Current nesting selects one immutable historical Catch22 manifest."""
+    config = Catch22Config(
+        fs=TEST_FS,
+        data={"datasets": {"adftd": "finetune"}},
+        model={
+            "classifier": {
+                "alphas": [0.1, 1.0],
+                "selection_metric": "accuracy",
+            }
+        },
+        logging={
+            "run_dir": str(tmp_path),
+            "experiment_name": "catch22",
+        },
+    ).model_dump(mode="json")
+    legacy_config = copy.deepcopy(config)
+    classifier = legacy_config["model"].pop("classifier")
+    legacy_config["model"]["ridge_alphas"] = classifier["alphas"]
+    legacy_config["model"]["ridge_selection_metric"] = (
+        classifier["selection_metric"]
+    )
+    legacy_config["data"].pop("feature_batch_size")
+    legacy_config["data"].pop("memory_limit_gib")
+    legacy_config["data"].pop("scratch_dir")
+    legacy_root = (
+        tmp_path
+        / "log"
+        / "baseline"
+        / "catch22"
+        / "catch22-historical"
+    )
+    original = _write_legacy_campaign(legacy_root, legacy_config, {})
+
+    resolution = resolve_campaign(
+        str(tmp_path),
+        "catch22",
+        "catch22",
+        config,
+        {},
+    )
+
+    assert resolution.paths.log_root == legacy_root
+    assert resolution.legacy is True
+    assert (legacy_root / "campaign.yaml").read_bytes() == original
 
 
 def test_resolver_reuses_unique_legacy_root_without_rewriting(
@@ -229,6 +483,50 @@ def test_resolver_reuses_unique_legacy_root_without_rewriting(
     assert "a" * 64 in resolution.aliases
     assert "3f68277ec5ec" in resolution.aliases
     assert (legacy_root / "campaign.yaml").read_bytes() == original
+    assert identity_path.read_bytes() == original_identity
+
+
+def test_historical_semantic_directory_preserves_old_identity_metadata(
+    tmp_path: Path,
+) -> None:
+    """An old directory alias is immutable even with current semantics."""
+    config = _model_config(tmp_path)
+    config_dict = config.model_dump(mode="json")
+    hpo = HpoConfig()
+    hpo_dict = hpo.model_dump(mode="json")
+    campaign_hash = get_campaign_hash(config_dict, hpo_dict)
+    legacy_root = (
+        tmp_path
+        / "log"
+        / "baseline"
+        / "brainomni"
+        / "historical-directory"
+    )
+    legacy_root.mkdir(parents=True)
+    campaign_path = legacy_root / "campaign.yaml"
+    campaign_path.write_text(
+        yaml.safe_dump(
+            build_campaign_semantic_config(config_dict, hpo_dict),
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    identity_path = legacy_root / "identity.json"
+    identity_path.write_text(
+        json.dumps({
+            "campaign_identity": campaign_hash,
+            "display_id": campaign_hash[:12],
+            "identity_version": 4,
+        }),
+        encoding="utf-8",
+    )
+    original_identity = identity_path.read_bytes()
+
+    runner = CampaignRunner(config, hpo, BrainOmniConfig)
+
+    assert runner.paths.log_root == legacy_root
+    assert runner.resolution.legacy is True
+    runner._save_campaign_config()
     assert identity_path.read_bytes() == original_identity
 
 
@@ -396,8 +694,11 @@ def test_deterministic_identity_excludes_declared_runtime_fields(
     original = get_campaign_hash(config, {})
     changed = copy.deepcopy(config)
     changed["data"]["batch_size"] = 64
+    changed["data"]["feature_batch_size"] = 128
     changed["data"]["load_batch_size"] = 64
+    changed["data"]["memory_limit_gib"] = 32.0
     changed["data"]["num_workers"] = 8
+    changed["data"]["scratch_dir"] = "/runtime/only"
     changed["data"]["datasets"]["bcic_2a"] = "finetune"
     changed["model"]["extractor"]["n_jobs"] = 2
     assert get_campaign_hash(changed, {}) == original

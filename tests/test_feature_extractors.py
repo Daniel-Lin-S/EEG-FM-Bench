@@ -3,6 +3,7 @@
 import json
 import sys
 import types
+from concurrent.futures import Future
 from pathlib import Path
 from typing import Any
 
@@ -95,6 +96,78 @@ def make_config(
         model=model or {},
         logging={"use_cloud": False, "outputs": ["csv"]},
     )
+
+
+def test_feature_configs_accept_historical_semantic_field_names() -> None:
+    """Legacy YAML model fields validate as the current nested schema."""
+    catch22 = Catch22Config(
+        fs=TEST_FS,
+        data={"datasets": {DATASET_NAME: DATASET_CONFIG}},
+        model={
+            "ridge_alphas": [0.1, 1.0],
+            "ridge_selection_metric": "accuracy",
+        },
+    )
+    minirocket = MiniRocketConfig(
+        fs=TEST_FS,
+        data={"datasets": {DATASET_NAME: DATASET_CONFIG}},
+        model={
+            "minirocket_source_path": None,
+            "minirocket_num_features": 9996,
+            "minirocket_max_dilations_per_kernel": 16,
+            "ridge_alphas": [0.1, 1.0],
+            "ridge_selection_metric": "accuracy",
+        },
+    )
+
+    assert catch22.model.classifier.alphas == [0.1, 1.0]
+    assert catch22.model.classifier.selection_metric == "accuracy"
+    assert minirocket.model.extractor.source_path is None
+    assert minirocket.model.extractor.num_features == 9996
+    assert minirocket.model.extractor.max_dilations_per_kernel == 16
+    assert minirocket.model.classifier.alphas == [0.1, 1.0]
+    assert minirocket.model.classifier.selection_metric == "accuracy"
+
+
+def test_ridge_config_accepts_historical_nested_field_names() -> None:
+    """Legacy classifier keys validate without changing their semantics."""
+    args = RidgeClassifierArgs.model_validate({
+        "ridge_alphas": [0.1, 1.0],
+        "ridge_selection_metric": "accuracy",
+    })
+
+    assert args.alphas == [0.1, 1.0]
+    assert args.selection_metric == "accuracy"
+
+
+def test_ridge_logspace_expands_to_persisted_alpha_values() -> None:
+    """A declared log-space grid is stored as its exact fitted candidates."""
+    args = RidgeClassifierArgs.model_validate({
+        "logspace": {"start": -3, "stop": 3, "num": 10},
+        "selection_metric": "accuracy",
+    })
+
+    np.testing.assert_array_equal(
+        args.alphas,
+        np.logspace(-3, 3, 10),
+    )
+    assert args.model_dump() == {
+        "alphas": np.logspace(-3, 3, 10).tolist(),
+        "selection_metric": "accuracy",
+    }
+
+
+def test_ridge_config_rejects_ambiguous_or_unknown_alpha_inputs() -> None:
+    """Ridge grid input must be unambiguous and fail closed on typos."""
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        RidgeClassifierArgs.model_validate({
+            "alphas": [0.1, 1.0],
+            "logspace": {"start": -3, "stop": 3, "num": 10},
+        })
+    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
+        RidgeClassifierArgs.model_validate({
+            "alpha": [0.1, 1.0],
+        })
 
 
 def test_feature_extractor_logging_honors_configured_level(
@@ -229,7 +302,7 @@ def test_ridge_alpha_search_fits_scaler_once(monkeypatch):
 
 
 def test_catch22_parallel_dispatch_uses_trial_chunks(monkeypatch):
-    """Parallel catch22 extraction batches independent trial tasks."""
+    """Parallel catch22 extraction submits bounded trial chunks."""
     fake_module = types.ModuleType("pycatch22")
 
     def catch22_all(values, catch24):
@@ -239,21 +312,23 @@ def test_catch22_parallel_dispatch_uses_trial_chunks(monkeypatch):
     fake_module.catch22_all = catch22_all
 
     class ImmediateExecutor:
-        chunksize = None
+        submitted_shapes = []
+        shutdown_calls = 0
 
         def __init__(self, max_workers, mp_context):
             self.max_workers = max_workers
             self.mp_context = mp_context
 
-        def __enter__(self):
-            return self
+        def submit(self, function, indexed_chunk):
+            type(self).submitted_shapes.append(indexed_chunk[1].shape)
+            future = Future()
+            future.set_result(function(indexed_chunk))
+            return future
 
-        def __exit__(self, exception_type, exception, traceback):
-            return False
-
-        def map(self, function, items, chunksize):
-            type(self).chunksize = chunksize
-            return map(function, items)
+        def shutdown(self, wait, cancel_futures):
+            assert wait
+            assert cancel_futures
+            type(self).shutdown_calls += 1
 
     monkeypatch.setitem(sys.modules, "pycatch22", fake_module)
     monkeypatch.setattr(
@@ -261,10 +336,16 @@ def test_catch22_parallel_dispatch_uses_trial_chunks(monkeypatch):
         "ProcessPoolExecutor",
         ImmediateExecutor,
     )
+    contexts = []
+
+    def get_spawn_context(name):
+        contexts.append(name)
+        return object()
+
     monkeypatch.setattr(
         catch22_extractor_module,
         "get_context",
-        lambda _: object(),
+        get_spawn_context,
     )
     data = np.array([[[1.0]], [[2.0]]], dtype=np.float32)
     serial_extractor = Catch22FeatureExtractor(n_jobs=1)
@@ -276,7 +357,11 @@ def test_catch22_parallel_dispatch_uses_trial_chunks(monkeypatch):
     parallel_features = parallel_extractor.transform(data)
 
     np.testing.assert_array_equal(serial_features, parallel_features)
-    assert ImmediateExecutor.chunksize == CATCH22_TRIAL_CHUNKSIZE
+    assert ImmediateExecutor.submitted_shapes == [(2, 1, 1)]
+    assert CATCH22_TRIAL_CHUNKSIZE == 8
+    assert contexts == ["spawn"]
+    parallel_extractor.close()
+    assert ImmediateExecutor.shutdown_calls == 1
 
 
 def test_ridge_selection_uses_validation_and_scales_features():
@@ -329,6 +414,14 @@ def test_feature_extractor_config_rejects_incompatible_inputs():
         make_config(model={"classifier": {"alphas": [1.0, 0.0]}})
     with pytest.raises(ValueError, match="duplicates"):
         make_config(model={"classifier": {"alphas": [1.0, 1.0]}})
+    with pytest.raises(ValueError, match="must not be booleans"):
+        Catch22Config(
+            fs=TEST_FS,
+            data={
+                "datasets": {DATASET_NAME: DATASET_CONFIG},
+                "load_batch_size": True,
+            },
+        )
 
 
 def test_minirocket_loads_external_multivariate_source(tmp_path):
@@ -638,8 +731,9 @@ def test_matching_artifact_root_rejects_ambiguity(tmp_path):
         find_matching_artifact_root(config)
 
 
-def test_all_skipped_feature_rerun_writes_summary(tmp_path):
+def test_all_skipped_feature_rerun_writes_summary(tmp_path, monkeypatch):
     """Completed extractor datasets are skipped and summaries refresh."""
+    monkeypatch.setattr(trainer_module, "OUTPUT_ROOT", str(tmp_path))
     config = make_config()
     trainer = MeanFeatureTrainer(config)
     trainer.log_dir = str(tmp_path)

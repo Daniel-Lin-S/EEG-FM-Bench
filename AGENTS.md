@@ -22,6 +22,12 @@ AVOID writing codes in a way that destroy or overwrite artifacts of already comp
 
 Deterministic models like Catch22, MiniROCKET should NEVER be executed for multiple times even if multiple seeds are provided. There should be only one csv file saved for each dataset under `{artifact_root}/csv`.
 
+Invocation parameters that doesn't change the model's performance (e.g., `load_batch_size`, `feature_batch_size` for non-neural models, and `memory_limit_gib`) should NEVER be used in model hashing. Every change in the structure of semantic parameters should still recognise legacy configurations to avoid ignoring previously completed runs. This should apply to ALL models and ALL future implementations.
+
+- Different user interfaces to set the same semantic parameter should NOT resolve to different hash identity. For example, user can directly specify alpha grid or specify log-space. If the resolved alpha grid is the same, the hash identity should be the same.
+
+- Artifacts of experiment should ONLY save the actual configurations used. For example, a default value should be filled, even if user did not provide that in yaml.
+
 ## Open-closed principle
 
 This benchmark integrates multiple models, datasets, and training schemes. Any code implementation should allow extension to any of the 3 dimensions WITHOUT causing cascading changes.

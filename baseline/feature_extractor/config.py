@@ -5,7 +5,8 @@ These baselines consume preprocessed EEG arrays shaped
 write metrics and completion metadata but intentionally do not save models.
 """
 
-from typing import List, Literal, Optional
+import math
+from typing import Any, List, Literal, Mapping, Optional
 
 import numpy as np
 from pydantic import BaseModel, Field, field_validator
@@ -20,6 +21,50 @@ from baseline.abstract.config import (
 RIDGE_ALPHA_MIN_EXPONENT = -3
 RIDGE_ALPHA_MAX_EXPONENT = 3
 RIDGE_ALPHA_COUNT = 10
+
+
+def normalize_model_field_aliases(
+    value: Any,
+    aliases: Mapping[str, tuple[str, str]],
+) -> Any:
+    """Move historical model fields into current nested sections.
+
+    Parameters
+    ----------
+    value : Any
+        Raw Pydantic model input.
+    aliases : Mapping[str, tuple[str, str]]
+        Legacy field names mapped to ``(section, canonical_field)``.
+
+    Returns
+    -------
+    Any
+        Canonicalized input, or the original non-mapping value.
+    """
+    if not isinstance(value, Mapping):
+        return value
+    normalized = dict(value)
+    for legacy_field, (section_name, canonical_field) in aliases.items():
+        if legacy_field not in normalized:
+            continue
+        section_value = normalized.get(section_name, {})
+        if not isinstance(section_value, Mapping):
+            raise ValueError(
+                f"Expected model.{section_name} to be a mapping."
+            )
+        section = dict(section_value)
+        legacy_value = normalized.pop(legacy_field)
+        if (
+            canonical_field in section
+            and section[canonical_field] != legacy_value
+        ):
+            raise ValueError(
+                f"Conflicting values exist for model.{legacy_field} and "
+                f"model.{section_name}.{canonical_field}."
+            )
+        section.setdefault(canonical_field, legacy_value)
+        normalized[section_name] = section
+    return normalized
 
 
 def get_default_ridge_alphas() -> List[float]:
@@ -109,16 +154,69 @@ class FeatureExtractorLoggingArgs(BaseLoggingArgs):
 
 
 class FeatureExtractorDataArgs(BaseDataArgs):
-    """Data-loading settings for non-neural feature extractors."""
+    """Data and resource settings for classical feature extractors.
 
-    load_batch_size: int = 32
+    Parameters
+    ----------
+    load_batch_size : int, optional, default=256
+        Arrow rows converted to NumPy together.
+    feature_batch_size : int, optional, default=1024
+        Trials transformed or predicted together after Arrow loading.
+    memory_limit_gib : float, optional, default=64.0
+        Linux address-space ceiling applied to one baseline process.
+    scratch_dir : str or None, optional, default=None
+        Temporary memmap root. ``None`` resolves below the ignored local
+        project output root.
+    """
 
-    @field_validator("load_batch_size")
+    load_batch_size: int = 256
+    feature_batch_size: int = 1024
+    memory_limit_gib: float = 64.0
+    scratch_dir: Optional[str] = None
+
+    @field_validator(
+        "load_batch_size",
+        "feature_batch_size",
+        "memory_limit_gib",
+        mode="before",
+    )
     @classmethod
-    def validate_load_batch_size(cls, value: int) -> int:
-        """Require a positive raw-data loading batch size."""
+    def reject_boolean_numeric_settings(cls, value: Any) -> Any:
+        """Reject booleans masquerading as classical numeric settings."""
+        if isinstance(value, bool):
+            raise ValueError(
+                "Classical numeric runtime settings must not be booleans."
+            )
+        return value
+
+    @field_validator("load_batch_size", "feature_batch_size")
+    @classmethod
+    def validate_batch_size(cls, value: int) -> int:
+        """Require positive classical processing batch sizes."""
         if value <= 0:
-            raise ValueError("data.load_batch_size must be positive.")
+            raise ValueError(
+                "Classical data and feature batch sizes must be positive."
+            )
+        return value
+
+    @field_validator("memory_limit_gib")
+    @classmethod
+    def validate_memory_limit_gib(cls, value: float) -> float:
+        """Require a finite positive address-space limit."""
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(
+                "data.memory_limit_gib must be finite and positive."
+            )
+        return value
+
+    @field_validator("scratch_dir")
+    @classmethod
+    def validate_scratch_dir(cls, value: Optional[str]) -> Optional[str]:
+        """Reject an explicitly empty scratch-directory setting."""
+        if value is not None and not value.strip():
+            raise ValueError(
+                "data.scratch_dir must be null or a non-empty path."
+            )
         return value
 
 
@@ -154,4 +252,3 @@ class FeatureExtractorConfig(AbstractConfig):
                 "deterministic."
             )
         return True
-

@@ -12,7 +12,7 @@ import json
 from typing import Any, Mapping, MutableMapping, Optional
 
 
-IDENTITY_VERSION = 4
+IDENTITY_VERSION = 5
 DISPLAY_ID_LENGTH = 12
 HPO_SEARCH_MARKER_KEY = "__hpo_search_parameter__"
 DETERMINISTIC_MODEL_TYPES = frozenset({"catch22", "minirocket", "naive"})
@@ -22,28 +22,44 @@ INVOCATION_CONFIG_FIELDS = frozenset({
     "master_port",
     "seeds",
 })
-DETERMINISTIC_RUNTIME_CONFIG_FIELDS = {
+RUNTIME_CONFIG_PATHS = frozenset({
+    "data.feature_batch_size",
+    "data.load_batch_size",
+    "data.memory_limit_gib",
+    "data.num_workers",
+    "data.pin_memory",
+    "data.scratch_dir",
+    "model.extractor.n_jobs",
+})
+MODEL_RUNTIME_CONFIG_PATHS = {
     "catch22": frozenset({
         "data.batch_size",
-        "data.load_batch_size",
-        "model.extractor.n_jobs",
     }),
     "minirocket": frozenset({
         "data.batch_size",
-        "data.load_batch_size",
-        "model.extractor.n_jobs",
     }),
     "naive": frozenset({
         "data.batch_size",
     }),
 }
+# Keep every historical path alias permanently. Future semantic schema moves
+# must add an old-to-current entry so immutable campaign manifests still match.
+SEMANTIC_CONFIG_PATH_ALIASES = {
+    "model.classifier.ridge_alphas": "model.classifier.alphas",
+    "model.classifier.ridge_selection_metric": (
+        "model.classifier.selection_metric"
+    ),
+    "model.minirocket_max_dilations_per_kernel": (
+        "model.extractor.max_dilations_per_kernel"
+    ),
+    "model.minirocket_num_features": "model.extractor.num_features",
+    "model.minirocket_source_path": "model.extractor.source_path",
+    "model.ridge_alphas": "model.classifier.alphas",
+    "model.ridge_selection_metric": "model.classifier.selection_metric",
+}
 INVOCATION_HPO_FIELDS = frozenset({
     "max_consecutive_failed_trials",
     "n_trials",
-})
-RUNTIME_DATA_CONFIG_FIELDS = frozenset({
-    "num_workers",
-    "pin_memory",
 })
 
 
@@ -142,15 +158,123 @@ def is_runtime_only_config_path(dotted_path: str) -> bool:
     bool
         Whether the path names a runtime-only data-loader setting.
     """
-    return dotted_path in {
-        f"data.{field}" for field in RUNTIME_DATA_CONFIG_FIELDS
-    }
+    runtime_paths = set(RUNTIME_CONFIG_PATHS)
+    for model_paths in MODEL_RUNTIME_CONFIG_PATHS.values():
+        runtime_paths.update(model_paths)
+    return _canonical_config_path(dotted_path) in runtime_paths
 
 
-def _remove_runtime_data_fields(
+def _pop_dotted_path(
+    config: MutableMapping[str, Any],
+    dotted_path: str,
+) -> tuple[bool, Any]:
+    """Remove and return one dotted path when it exists."""
+    parts = dotted_path.split(".")
+    parent: MutableMapping[str, Any] = config
+    for part in parts[:-1]:
+        child = parent.get(part)
+        if not isinstance(child, MutableMapping):
+            return False, None
+        parent = child
+    leaf = parts[-1]
+    if leaf not in parent:
+        return False, None
+    return True, parent.pop(leaf)
+
+
+def _get_dotted_path(
+    config: Mapping[str, Any],
+    dotted_path: str,
+) -> tuple[bool, Any]:
+    """Return one dotted path and whether it exists."""
+    parts = dotted_path.split(".")
+    parent: Mapping[str, Any] = config
+    for part in parts[:-1]:
+        child = parent.get(part)
+        if not isinstance(child, Mapping):
+            return False, None
+        parent = child
+    leaf = parts[-1]
+    if leaf not in parent:
+        return False, None
+    return True, parent[leaf]
+
+
+def _set_dotted_path(
+    config: MutableMapping[str, Any],
+    dotted_path: str,
+    value: Any,
+) -> None:
+    """Set one dotted path, creating missing mapping parents."""
+    parts = dotted_path.split(".")
+    parent: MutableMapping[str, Any] = config
+    for part in parts[:-1]:
+        child = parent.get(part)
+        if child is None:
+            child = {}
+            parent[part] = child
+        if not isinstance(child, MutableMapping):
+            raise ValueError(
+                f"Cannot create semantic path {dotted_path!r} because "
+                f"{part!r} is not a mapping."
+            )
+        parent = child
+    parent[parts[-1]] = value
+
+
+def _normalize_semantic_config_paths(
     semantic: MutableMapping[str, Any],
 ) -> None:
-    """Remove data-loader settings that cannot affect evaluation semantics.
+    """Canonicalize all registered historical semantic parameter paths."""
+    for legacy_path, canonical_path in SEMANTIC_CONFIG_PATH_ALIASES.items():
+        legacy_exists, legacy_value = _get_dotted_path(
+            semantic,
+            legacy_path,
+        )
+        if not legacy_exists:
+            continue
+        canonical_exists, canonical_value = _get_dotted_path(
+            semantic,
+            canonical_path,
+        )
+        if canonical_exists and canonical_value != legacy_value:
+            raise ValueError(
+                f"Conflicting semantic values exist at {legacy_path!r} and "
+                f"{canonical_path!r}."
+            )
+        _pop_dotted_path(semantic, legacy_path)
+        if not canonical_exists:
+            _set_dotted_path(semantic, canonical_path, legacy_value)
+
+
+def _canonical_config_path(dotted_path: str) -> str:
+    """Return the current canonical name for one configuration path."""
+    return SEMANTIC_CONFIG_PATH_ALIASES.get(dotted_path, dotted_path)
+
+
+def _normalize_search_space_paths(
+    search_space: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Canonicalize historical HPO paths and reject conflicting aliases."""
+    normalized: dict[str, Any] = {}
+    for dotted_path, distribution in search_space.items():
+        canonical_path = _canonical_config_path(dotted_path)
+        if (
+            canonical_path in normalized
+            and normalized[canonical_path] != distribution
+        ):
+            raise ValueError(
+                f"Conflicting HPO distributions target canonical path "
+                f"{canonical_path!r}."
+            )
+        normalized[canonical_path] = distribution
+    return normalized
+
+
+def _remove_runtime_fields(
+    semantic: MutableMapping[str, Any],
+) -> None:
+    """Remove universal result-invariant invocation settings.
 
     Parameters
     ----------
@@ -162,11 +286,8 @@ def _remove_runtime_data_fields(
     Add a field only when it cannot change samples, splits, windows, seeds,
     optimization semantics, or metrics.
     """
-    data_config = semantic.get("data")
-    if not isinstance(data_config, MutableMapping):
-        return
-    for field in RUNTIME_DATA_CONFIG_FIELDS:
-        data_config.pop(field, None)
+    for dotted_path in RUNTIME_CONFIG_PATHS:
+        _remove_dotted_path(semantic, dotted_path)
 
 
 def _remove_dotted_path(
@@ -182,14 +303,7 @@ def _remove_dotted_path(
     dotted_path : str
         Runtime-only path declared by one model implementation.
     """
-    parts = dotted_path.split(".")
-    parent: MutableMapping[str, Any] = config
-    for part in parts[:-1]:
-        child = parent.get(part)
-        if not isinstance(child, MutableMapping):
-            return
-        parent = child
-    parent.pop(parts[-1], None)
+    _pop_dotted_path(config, dotted_path)
 
 
 def _remove_model_runtime_fields(
@@ -204,7 +318,7 @@ def _remove_model_runtime_fields(
     model_type = semantic.get("model_type")
     if not isinstance(model_type, str):
         return
-    for path in DETERMINISTIC_RUNTIME_CONFIG_FIELDS.get(model_type, ()):
+    for path in MODEL_RUNTIME_CONFIG_PATHS.get(model_type, ()):
         _remove_dotted_path(semantic, path)
 
 
@@ -228,7 +342,8 @@ def _base_semantic_config(
         raise TypeError("Expected the resolved configuration to be a mapping.")
     for field in INVOCATION_CONFIG_FIELDS:
         semantic.pop(field, None)
-    _remove_runtime_data_fields(semantic)
+    _normalize_semantic_config_paths(semantic)
+    _remove_runtime_fields(semantic)
     _remove_model_runtime_fields(semantic)
     return semantic
 
@@ -315,6 +430,8 @@ def build_campaign_semantic_config(
             raise ValueError(
                 "Enabled HPO requires a non-empty search_space mapping."
             )
+        search_space = _normalize_search_space_paths(search_space)
+        hpo_semantic["search_space"] = search_space
         for dotted_path in sorted(search_space):
             _replace_search_value(semantic, dotted_path)
     if not semantic.get("multitask"):

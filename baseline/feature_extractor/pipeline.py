@@ -81,6 +81,10 @@ class FeatureExtractionPipeline:
         """Extract features and return classifier decision scores."""
         return self.classifier.decision_function(self._extract(data, "scoring"))
 
+    def close(self) -> None:
+        """Release runtime resources held by the feature extractor."""
+        self.extractor.close()
+
     def _extract(self, data: np.ndarray, split_name: str) -> np.ndarray:
         """Extract and validate one dense numeric feature matrix."""
         features = np.asarray(self.extractor.transform(data))

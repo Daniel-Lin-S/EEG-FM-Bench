@@ -9,8 +9,21 @@ from abc import ABC, abstractmethod
 import numpy as np
 
 
+EEG_FINITE_CHECK_BATCH_SIZE = 256
+
+
 class EEGFeatureExtractor(ABC):
     """Convert batches of EEG trials into one feature vector per trial."""
+
+    @property
+    def requires_random_access_training_data(self) -> bool:
+        """Return whether fitting requires the complete training EEG array.
+
+        Stateless or genuinely streaming extractors should override this
+        property with ``False``. The trainer otherwise supplies a temporary
+        disk-backed C-contiguous array rather than a RAM-resident split.
+        """
+        return True
 
     def fit(self, train_data: np.ndarray) -> "EEGFeatureExtractor":
         """Fit state from training EEG data.
@@ -47,6 +60,9 @@ class EEGFeatureExtractor(ABC):
         self._validate_eeg(data, "input")
         return self._transform(data)
 
+    def close(self) -> None:
+        """Release optional runtime resources owned by the extractor."""
+
     @staticmethod
     def _validate_eeg(data: np.ndarray, name: str) -> None:
         """Validate one dense EEG batch before extractor use."""
@@ -59,8 +75,12 @@ class EEGFeatureExtractor(ABC):
             raise ValueError(
                 f"Expected {name} EEG dtype float32, but got {data.dtype}."
             )
-        if not np.isfinite(data).all():
-            raise ValueError(f"{name} EEG data contains NaN or inf.")
+        if len(data) == 0:
+            raise ValueError(f"Expected non-empty {name} EEG data.")
+        for start in range(0, len(data), EEG_FINITE_CHECK_BATCH_SIZE):
+            stop = min(start + EEG_FINITE_CHECK_BATCH_SIZE, len(data))
+            if not np.isfinite(data[start:stop]).all():
+                raise ValueError(f"{name} EEG data contains NaN or inf.")
 
     @abstractmethod
     def _fit(self, train_data: np.ndarray) -> None:
