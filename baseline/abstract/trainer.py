@@ -8,6 +8,7 @@ import time
 from contextlib import nullcontext
 import datetime
 import os
+from enum import Enum
 import math
 import logging
 import warnings
@@ -59,6 +60,14 @@ COMPLETION_CONFIG_HASH_VERSION = IDENTITY_VERSION
 
 
 logger = logging.getLogger("baseline")
+
+
+class HpoStopReason(str, Enum):
+    """Terminal reason requested by an HPO validation callback."""
+
+    NONE = "none"
+    OPTUNA_PRUNED = "optuna_pruned"
+    PATIENCE = "patience"
 
 
 class ChainableSequentialLR(torch.optim.lr_scheduler.SequentialLR):
@@ -184,7 +193,9 @@ class AbstractTrainer(ABC):
         self.campaign_aliases: frozenset[str] = frozenset()
         self.log_dir_override: Optional[Path] = None
         self.ckpt_dir_override: Optional[Path] = None
-        self.validation_callback: Optional[Callable[..., bool]] = None
+        self.validation_callback: Optional[
+            Callable[..., Union[HpoStopReason, str, bool]]
+        ] = None
         self.external_distributed = False
         self.external_cloud = False
         self.training_result: Dict[str, Any] = {}
@@ -286,7 +297,9 @@ class AbstractTrainer(ABC):
         campaign_hash: str,
         run_mode: str,
         campaign_aliases: Optional[Iterable[str]] = None,
-        validation_callback: Optional[Callable[..., bool]] = None,
+        validation_callback: Optional[
+            Callable[..., Union[HpoStopReason, str, bool]]
+        ] = None,
         selection_provenance: Optional[Mapping[str, Any]] = None,
         invocation_id: Optional[str] = None,
         external_distributed: bool = False,
@@ -2617,31 +2630,37 @@ class AbstractTrainer(ABC):
             return score < best_score - args.min_delta
         return score > best_score + args.min_delta
 
-    def _callback_requests_stop(
+    def _callback_stop_reason(
         self,
         metrics: Dict[str, Dict[str, float]],
         train_sizes: Dict[str, int],
-    ) -> bool:
-        """Run a master-only validation callback and synchronize its result."""
+    ) -> HpoStopReason:
+        """Run the HPO callback and synchronize its explicit stop reason."""
         payload: Optional[Dict[str, Any]] = None
         if get_is_master():
             try:
-                should_stop = False
+                reason = HpoStopReason.NONE
                 if self.validation_callback is not None:
-                    should_stop = bool(
-                        self.validation_callback(
-                            self.epoch,
-                            metrics,
-                            train_sizes,
-                        )
+                    response = self.validation_callback(
+                        self.epoch,
+                        metrics,
+                        train_sizes,
                     )
+                    if isinstance(response, bool):
+                        reason = (
+                            HpoStopReason.OPTUNA_PRUNED
+                            if response
+                            else HpoStopReason.NONE
+                        )
+                    else:
+                        reason = HpoStopReason(response)
                 payload = {
-                    "should_stop": should_stop,
+                    "stop_reason": reason.value,
                     "error": None,
                 }
             except Exception as exc:
                 payload = {
-                    "should_stop": False,
+                    "stop_reason": HpoStopReason.NONE.value,
                     "error": (
                         f"{type(exc).__module__}."
                         f"{type(exc).__name__}: {exc}"
@@ -2664,7 +2683,7 @@ class AbstractTrainer(ABC):
                 "Validation callback failed: "
                 f"{payload['error']}."
             )
-        return bool(payload["should_stop"])
+        return HpoStopReason(str(payload["stop_reason"]))
 
     def _managed_epoch_loop(
         self,
@@ -2675,7 +2694,7 @@ class AbstractTrainer(ABC):
     ) -> tuple[
         Dict[str, Dict[str, float]],
         Optional[Path],
-        bool,
+        HpoStopReason,
     ]:
         """Train one model and return best validation state."""
         train_sizes = self._training_sizes(train_loader)
@@ -2683,7 +2702,7 @@ class AbstractTrainer(ABC):
         best_metrics: Dict[str, Dict[str, float]] = {}
         best_checkpoint: Optional[Path] = None
         epochs_without_improvement = 0
-        stopped_by_callback = False
+        stop_reason = HpoStopReason.NONE
 
         for epoch in range(self.cfg.training.max_epochs):
             self.epoch = epoch
@@ -2701,11 +2720,11 @@ class AbstractTrainer(ABC):
                 )
 
             if self.run_mode == "hpo":
-                if self._callback_requests_stop(
+                stop_reason = self._callback_stop_reason(
                     validation_metrics,
                     train_sizes,
-                ):
-                    stopped_by_callback = True
+                )
+                if stop_reason is not HpoStopReason.NONE:
                     break
                 best_metrics = validation_metrics
                 continue
@@ -2766,7 +2785,7 @@ class AbstractTrainer(ABC):
             ):
                 torch.distributed.barrier()
             self.load_training_checkpoint(best_checkpoint)
-        return best_metrics, best_checkpoint, stopped_by_callback
+        return best_metrics, best_checkpoint, stop_reason
 
     def run(self) -> Dict[str, Any]:
         """Execute one seed-scoped neural training run."""
@@ -2958,7 +2977,7 @@ class AbstractTrainer(ABC):
             )
 
         self.setup_optimizer_and_scheduler(model, train_loader)
-        validation_metrics, checkpoint_path, pruned = (
+        validation_metrics, checkpoint_path, stop_reason = (
             self._managed_epoch_loop(
                 train_loader,
                 train_sampler,
@@ -2968,7 +2987,8 @@ class AbstractTrainer(ABC):
         )
         result: Dict[str, Any] = {
             "validation_metrics": validation_metrics,
-            "pruned": pruned,
+            "hpo_stop_reason": stop_reason.value,
+            "pruned": stop_reason is HpoStopReason.OPTUNA_PRUNED,
         }
         if self.run_mode == "hpo":
             return result
@@ -3012,7 +3032,7 @@ class AbstractTrainer(ABC):
 
         all_validation: Dict[str, Dict[str, float]] = {}
         all_test: Dict[str, Dict[str, float]] = {}
-        pruned = False
+        hpo_stop_reason = HpoStopReason.NONE
         for dataset_name, dataset_config in self.ds_conf.items():
             if (
                 self.run_mode != "hpo"
@@ -3075,7 +3095,7 @@ class AbstractTrainer(ABC):
                 raise TypeError("valid_loader must be a DataLoader.")
 
             self.setup_optimizer_and_scheduler(model, train_loader)
-            validation_metrics, checkpoint_path, dataset_pruned = (
+            validation_metrics, checkpoint_path, dataset_stop_reason = (
                 self._managed_epoch_loop(
                     train_loader,
                     train_sampler,
@@ -3084,9 +3104,9 @@ class AbstractTrainer(ABC):
                 )
             )
             all_validation.update(validation_metrics)
-            pruned = pruned or dataset_pruned
+            hpo_stop_reason = dataset_stop_reason
             if self.run_mode == "hpo":
-                if dataset_pruned:
+                if dataset_stop_reason is not HpoStopReason.NONE:
                     break
                 continue
 
@@ -3124,5 +3144,6 @@ class AbstractTrainer(ABC):
             ),
             "validation_metrics": all_validation,
             "test_metrics": all_test,
-            "pruned": pruned,
+            "hpo_stop_reason": hpo_stop_reason.value,
+            "pruned": hpo_stop_reason is HpoStopReason.OPTUNA_PRUNED,
         }

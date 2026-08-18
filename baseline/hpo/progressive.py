@@ -92,7 +92,7 @@ def has_complete_progressive_evidence(
     Parameters
     ----------
     completed_trials : sequence of mappings
-        Complete-or-pruned trials in chronological order.
+        Completed trials in chronological order.
     args : ProgressiveHpoArgs
         Progressive history settings.
 
@@ -119,7 +119,7 @@ def has_complete_progressive_evidence(
 
 def progressive_assessment_block(
     completed_trials: Sequence[Mapping[str, Any]],
-    budgeted: int,
+    completed_count: int,
     args: ProgressiveHpoArgs,
 ) -> list[Mapping[str, Any]] | None:
     """Return the latest completed allocation block at a decision boundary.
@@ -127,42 +127,43 @@ def progressive_assessment_block(
     Parameters
     ----------
     completed_trials : sequence of mappings
-        Complete-or-pruned trials in chronological order.
-    budgeted : int
-        Number of trials charged to the study budget.
+        Completed trials in chronological order.
+    completed_count : int
+        Number of selectable completed trials in the study.
     args : ProgressiveHpoArgs
         Initial and incremental allocation sizes.
 
     Returns
     -------
     list of mappings or None
-        First block at ``initial_trials``, the latest incremental block at a
-        later boundary, or ``None`` within an incomplete block.
+        First block at ``initial_trials`` or the latest incremental block at
+        a later completed-trial boundary; otherwise ``None``.
 
     Raises
     ------
     ValueError
-        If ``budgeted`` is invalid for ``completed_trials``.
+        If ``completed_count`` is invalid for ``completed_trials``.
     """
-    if budgeted < 0:
+    if completed_count < 0:
         raise ValueError(
-            f"Expected non-negative budgeted trials, got {budgeted}."
+            "Expected a non-negative completed-trial count, got "
+            f"{completed_count}."
         )
-    if budgeted > len(completed_trials):
+    if completed_count != len(completed_trials):
         raise ValueError(
-            "Budgeted trial count exceeds collected trials: "
-            f"{budgeted} > {len(completed_trials)}."
+            "Completed-trial count does not match collected trials: "
+            f"{completed_count} != {len(completed_trials)}."
         )
-    if budgeted < args.initial_trials:
+    if completed_count < args.initial_trials:
         return None
-    if budgeted == args.initial_trials:
+    if completed_count == args.initial_trials:
         start = 0
     else:
-        completed_after_initial = budgeted - args.initial_trials
+        completed_after_initial = completed_count - args.initial_trials
         if completed_after_initial % args.increment_trials:
             return None
-        start = budgeted - args.increment_trials
-    return list(completed_trials[start:budgeted])
+        start = completed_count - args.increment_trials
+    return list(completed_trials[start:completed_count])
 
 
 def _resolution_threshold(

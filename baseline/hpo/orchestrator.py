@@ -35,6 +35,7 @@ from baseline.adaptive_batching import (
     select_safe_micro_batch,
 )
 from baseline.abstract.factory import ModelRegistry
+from baseline.abstract.trainer import HpoStopReason
 from baseline.hpo.artifacts import (
     CampaignPaths,
     CampaignResolution,
@@ -91,6 +92,17 @@ UNBUDGETED_TRIAL_STATES = frozenset({
     "RUNNING",
     "WAITING",
 })
+HPO_RECOVERY_SEMANTICS_VERSION = 1
+MAX_HPO_RECOVERY_GENERATIONS = 100
+
+
+def _study_has_pruned_without_completion(study: Any) -> bool:
+    """Return whether a study has terminal pruning but no selectable trial."""
+    states = [
+        trial.state.name
+        for trial in study.get_trials(deepcopy=False)
+    ]
+    return "COMPLETE" not in states and "PRUNED" in states
 
 
 @dataclass
@@ -1638,6 +1650,7 @@ def _top_study_records(
             else -1
         )
         return (
+            int(record["complete"] > 0),
             int(budgeted >= requested_budget),
             budgeted,
             int(record.get("study_name") == study_identity),
@@ -1700,11 +1713,11 @@ def _collect_completed_trials(
     Returns
     -------
     list[dict[str, Any]]
-        Completed-or-pruned trials with objective and objective_history.
+        Completed trials with objective and objective_history.
     """
     completed: list[dict[str, Any]] = []
     for trial in study.get_trials(deepcopy=False):
-        if trial.state.name not in {"COMPLETE", "PRUNED"}:
+        if trial.state.name != "COMPLETE":
             continue
         trial_dict = {
             "objective": trial.value,
@@ -2041,6 +2054,7 @@ class CampaignRunner:
         self._ignored_namespace_warnings: set[Path] = set()
         self.adaptive_batch_cache: Dict[str, Dict[str, Any]] = {}
         self.last_adaptive_memory_profile: Dict[str, Any] = {}
+        self.hpo_outcomes: list[Dict[str, Any]] = []
 
     def _configure_campaign_logging(self) -> None:
         """Configure campaign console logging and Optuna verbosity."""
@@ -2673,13 +2687,19 @@ class CampaignRunner:
             self.paths.log_root.resolve(),
         )
 
-    def _study_identity(self, scope: str) -> tuple[str, Dict[str, Any]]:
+    def _study_identity(
+        self,
+        scope: str,
+        recovery_generation: int = 0,
+    ) -> tuple[str, Dict[str, Any]]:
         """Return the semantic identity and payload for one HPO scope.
 
         Parameters
         ----------
         scope : str
             Dataset name or ``multitask``.
+        recovery_generation : int, optional
+            Immutable recovery generation for a pruned-only study, default=0.
 
         Returns
         -------
@@ -2691,7 +2711,22 @@ class CampaignRunner:
             "campaign_identity": self.campaign_hash,
             "scope": scope,
         }
+        if recovery_generation > 0:
+            payload["hpo_recovery_semantics_version"] = (
+                HPO_RECOVERY_SEMANTICS_VERSION
+            )
+            payload["recovery_generation"] = recovery_generation
         return semantic_digest(payload), payload
+
+    def _effective_pruner_startup_trials(self) -> int:
+        """Return the minimum completed trials before Optuna may prune."""
+        startup_trials = self.hpo_config.pruner.n_startup_trials
+        if self.hpo_config.progressive.enabled:
+            startup_trials = max(
+                startup_trials,
+                self.hpo_config.progressive.initial_trials,
+            )
+        return startup_trials
 
     def _study_sampler_and_pruner(self) -> tuple[Any, Any]:
         """Construct the configured Optuna sampler and pruner.
@@ -2710,9 +2745,7 @@ class CampaignRunner:
             ),
         )
         pruner = optuna.pruners.MedianPruner(
-            n_startup_trials=(
-                self.hpo_config.pruner.n_startup_trials
-            ),
+            n_startup_trials=self._effective_pruner_startup_trials(),
             n_warmup_steps=self.hpo_config.pruner.n_warmup_epochs,
             interval_steps=self.hpo_config.pruner.interval_epochs,
         )
@@ -2904,6 +2937,50 @@ class CampaignRunner:
                 scope,
                 study_identity,
             )
+            if study is not None and _study_has_pruned_without_completion(
+                study
+            ):
+                quarantined_name = study.study_name
+                recovery_generation = 1
+                while recovery_generation <= MAX_HPO_RECOVERY_GENERATIONS:
+                    study_identity, identity_payload = self._study_identity(
+                        scope,
+                        recovery_generation,
+                    )
+                    requested_artifact_root = (
+                        scope_root / "studies" / study_identity
+                    )
+                    requested_checkpoint_root = (
+                        _hpo_scope_root(self.paths.checkpoint_root, scope)
+                        / "studies"
+                        / study_identity
+                    )
+                    requested_storage_path = (
+                        requested_artifact_root / "study.sqlite3"
+                    ).resolve()
+                    if not requested_storage_path.exists():
+                        logger.warning(
+                            "HPO scope %s has no completed trial in study "
+                            "%s; preserving it and creating recovery "
+                            "generation %d.",
+                            scope,
+                            quarantined_name,
+                            recovery_generation,
+                        )
+                        study = None
+                        selected_path = None
+                        duplicates = tuple(sorted({
+                            *duplicates,
+                            quarantined_name,
+                        }))
+                        break
+                    recovery_generation += 1
+                else:
+                    raise RuntimeError(
+                        "Unable to allocate an unused HPO recovery study "
+                        f"for scope '{scope}' after "
+                        f"{MAX_HPO_RECOVERY_GENERATIONS} generations."
+                    )
             if study is not None:
                 if selected_path is None:
                     raise RuntimeError(
@@ -3047,6 +3124,7 @@ class CampaignRunner:
         objective_history: Optional[list[Mapping[str, Any]]] = None,
         memory_information: Optional[Mapping[str, Any]] = None,
         performance: Optional[Mapping[str, Any]] = None,
+        stop_reason: Optional[str] = None,
     ) -> None:
         """Persist one trial's decoded parameters and terminal state."""
         if not get_is_master():
@@ -3065,6 +3143,8 @@ class CampaignRunner:
             payload["memory_information"] = dict(memory_information)
         if performance is not None:
             payload["performance"] = dict(performance)
+        if stop_reason is not None:
+            payload["stop_reason"] = stop_reason
         _exclusive_json(trial_root / "trial.json", payload)
 
     def _run_hpo_scope(
@@ -3123,6 +3203,12 @@ class CampaignRunner:
                 self.hpo_config.n_trials,
                 study_path,
             )
+            logger.info(
+                "HPO scope %s uses Optuna pruning after %d completed "
+                "trials.",
+                scope,
+                self._effective_pruner_startup_trials(),
+            )
         failure_limit = self.hpo_config.max_consecutive_failed_trials
         if consecutive_failures >= failure_limit:
             raise RuntimeError(
@@ -3132,6 +3218,8 @@ class CampaignRunner:
             )
 
         progressive_bypass = False
+        last_assessment = None
+        last_assessed_completed_count = 0
         if (
             budgeted > 0
             and budgeted < self.hpo_config.n_trials
@@ -3145,12 +3233,10 @@ class CampaignRunner:
             )
             if progressive_bypass:
                 logger.warning(
-                    "HPO scope %s has %d persisted budgeted trials without "
-                    "complete progressive objective history; continuing "
-                    "the original selection procedure to the hard ceiling "
-                    "of %d trials.",
+                    "HPO scope %s has persisted completed trials without "
+                    "usable progressive objective history; continuing to "
+                    "the hard ceiling of %d trials.",
                     scope,
-                    budgeted,
                     self.hpo_config.n_trials,
                 )
 
@@ -3161,24 +3247,31 @@ class CampaignRunner:
                 and not progressive_bypass
             ):
                 completed_trials = _collect_completed_trials(study)
+                completed_count = len(completed_trials)
                 assessment_trials = progressive_assessment_block(
                     completed_trials,
-                    budgeted,
+                    completed_count,
                     self.hpo_config.progressive,
                 )
-                if assessment_trials is not None:
+                if (
+                    assessment_trials is not None
+                    and completed_count != last_assessed_completed_count
+                ):
                     assessment = assess_progressive_study(
                         assessment_trials,
                         self.hpo_config.objective.direction,
                         self.hpo_config.progressive,
                     )
+                    last_assessment = assessment
+                    last_assessed_completed_count = completed_count
                     if not assessment.should_expand:
                         logger.info(
-                            "HPO scope %s: progressive stop at block "
-                            "boundary %d/%d (outcome: %s, threshold: %.6g, "
-                            "between-trial SD: %s, winner gap: %s, "
-                            "stable: %s).",
+                            "HPO scope %s: progressive stop at completed "
+                            "block %d, budget %d/%d (outcome: %s, "
+                            "threshold: %.6g, between-trial SD: %s, "
+                            "winner gap: %s, stable: %s).",
                             scope,
+                            completed_count,
                             budgeted,
                             self.hpo_config.n_trials,
                             assessment.outcome,
@@ -3198,10 +3291,13 @@ class CampaignRunner:
                         break
                     logger.info(
                         "HPO scope %s: progressive allocation expanded "
-                        "after block ending at %d trials (outcome: %s, "
-                        "threshold: %.6g, between-trial SD: %s).",
+                        "after %d completed trials at budget %d/%d "
+                        "(outcome: %s, threshold: %.6g, "
+                        "between-trial SD: %s).",
                         scope,
+                        completed_count,
                         budgeted,
+                        self.hpo_config.n_trials,
                         assessment.outcome,
                         assessment.resolution_threshold,
                         (
@@ -3267,7 +3363,7 @@ class CampaignRunner:
                 epoch: int,
                 metrics: Mapping[str, Mapping[str, float]],
                 train_sizes: Mapping[str, int],
-            ) -> bool:
+            ) -> HpoStopReason:
                 nonlocal best_value, patience_counter, patience_best
                 values = objective_values(
                     metrics,
@@ -3294,13 +3390,14 @@ class CampaignRunner:
                 })
                 trial.report(value, step=epoch)
 
-                # Check Optuna pruning first
                 if trial.should_prune():
-                    return True
+                    return HpoStopReason.OPTUNA_PRUNED
 
                 # Check patience stopping if enabled
                 if self.hpo_config.patience.enabled:
-                    is_minimize = self.hpo_config.objective.direction == "minimize"
+                    is_minimize = (
+                        self.hpo_config.objective.direction == "minimize"
+                    )
                     min_delta = self.hpo_config.patience.min_delta
 
                     if patience_best is None:
@@ -3319,16 +3416,20 @@ class CampaignRunner:
                         else:
                             patience_counter += 1
 
-                        if patience_counter >= self.hpo_config.patience.patience:
+                        if (
+                            patience_counter
+                            >= self.hpo_config.patience.patience
+                        ):
                             logger.info(
-                                "Trial %d stopped by patience at epoch %d (no improvement for %d epochs).",
+                                "Trial %d stopped by patience at epoch %d "
+                                "after %d non-improving epochs.",
                                 trial_number,
                                 epoch,
                                 patience_counter,
                             )
-                            return True
+                            return HpoStopReason.PATIENCE
 
-                return False
+                return HpoStopReason.NONE
 
             if self.base_dict["logging"].get("level") != "debug":
                 logger.setLevel(logging.WARNING)
@@ -3361,7 +3462,18 @@ class CampaignRunner:
                     trial_config,
                     prepare_trial,
                 )
-                pruned = bool(result.get("pruned"))
+                raw_stop_reason = result.get("hpo_stop_reason")
+                if raw_stop_reason is None:
+                    stop_reason = (
+                        HpoStopReason.OPTUNA_PRUNED
+                        if bool(result.get("pruned"))
+                        else HpoStopReason.NONE
+                    )
+                elif isinstance(raw_stop_reason, HpoStopReason):
+                    stop_reason = raw_stop_reason
+                else:
+                    stop_reason = HpoStopReason(str(raw_stop_reason))
+                pruned = stop_reason is HpoStopReason.OPTUNA_PRUNED
                 performance = result.get("performance")
                 if not isinstance(performance, Mapping):
                     raise TypeError(
@@ -3375,6 +3487,7 @@ class CampaignRunner:
                         )
                     trial.set_user_attr("decoded_params", decoded)
                     trial.set_user_attr("objective_history", objective_history)
+                    trial.set_user_attr("stop_reason", stop_reason.value)
                     if pruned:
                         study.tell(
                             trial,
@@ -3387,6 +3500,7 @@ class CampaignRunner:
                             objective=best_value,
                             objective_history=objective_history,
                             performance=performance,
+                            stop_reason=stop_reason.value,
                         )
                     else:
                         study.tell(trial, best_value)
@@ -3397,6 +3511,7 @@ class CampaignRunner:
                             objective=best_value,
                             objective_history=objective_history,
                             performance=performance,
+                            stop_reason=stop_reason.value,
                         )
                 trial_budgeted = True
             except Exception as exc:
@@ -3453,6 +3568,25 @@ class CampaignRunner:
                         f"{consecutive_failures} consecutive failed trials. "
                         "Correct the configuration or search space."
                     )
+
+        if (
+            self.hpo_config.progressive.enabled
+            and budgeted >= self.hpo_config.n_trials
+            and not progressive_bypass
+            and (
+                last_assessment is None
+                or last_assessment.should_expand
+            )
+            and get_is_master()
+        ):
+            logger.warning(
+                "HPO scope %s reached hard cap %d with %d completed and "
+                "%d pruned trials before a conclusive progressive stop.",
+                scope,
+                self.hpo_config.n_trials,
+                len(_collect_completed_trials(study)),
+                budgeted - len(_collect_completed_trials(study)),
+            )
 
         self._configure_campaign_logging()
         if get_is_master():
@@ -3557,13 +3691,15 @@ class CampaignRunner:
         return selected
 
     def _run_hpo(self) -> Dict[str, Dict[str, Any]]:
-        """Run all configured studies and return selected scope configs."""
+        """Run all HPO scopes and isolate independent scope failures."""
         validate_search_space(
             self.base_dict,
             self.hpo_config,
             self.config_class,
         )
         selected: Dict[str, Dict[str, Any]] = {}
+        self.hpo_outcomes = []
+        multitask = bool(self.base_dict["multitask"])
         for scope, scope_config in _study_scope_configs(
             self.base_dict
         ).items():
@@ -3572,6 +3708,29 @@ class CampaignRunner:
                     scope,
                     scope_config,
                 )
+            except Exception as exc:
+                if multitask:
+                    raise
+                runtime = self._active_study_runtime
+                self.hpo_outcomes.append({
+                    "scope": scope,
+                    "status": "failed",
+                    "fingerprint": failure_fingerprint(exc),
+                    "study_identity": (
+                        runtime.study_identity if runtime is not None else None
+                    ),
+                })
+                logger.exception(
+                    "HPO scope %s failed; continuing independent scopes.",
+                    scope,
+                )
+            else:
+                provenance = self.selection_provenance.get(scope, {})
+                self.hpo_outcomes.append({
+                    "scope": scope,
+                    "status": "selected",
+                    "study_identity": provenance.get("study_identity"),
+                })
             finally:
                 runtime = self._active_study_runtime
                 if runtime is not None and get_is_master():
@@ -4830,6 +4989,17 @@ class CampaignRunner:
                 else self._fixed_scopes()
             )
             invocation, _ = self._run_seeds(selected)
+            hpo_outcomes = list(getattr(self, "hpo_outcomes", []))
+            hpo_failures = [
+                outcome
+                for outcome in hpo_outcomes
+                if outcome["status"] == "failed"
+            ]
+            if hpo_outcomes:
+                invocation["hpo_outcomes"] = hpo_outcomes
+            if hpo_failures:
+                invocation["hpo_failed"] = hpo_failures
+                invocation["complete"] = False
             self._configure_campaign_logging()
             summary_result: Optional[CampaignSummaryResult] = None
             invocation_summary: Optional[CampaignSummaryResult] = None
@@ -4850,10 +5020,15 @@ class CampaignRunner:
                 if invocation_summary.written:
                     self._update_cloud_summary(invocation_summary)
 
-            if invocation["failed"]:
+            has_hpo_failures = bool(invocation.get("hpo_failed"))
+            has_seed_failures = bool(invocation["failed"])
+            if has_hpo_failures or has_seed_failures:
                 state = (
                     "partial"
-                    if invocation["succeeded"]
+                    if selected and (
+                        has_hpo_failures
+                        or invocation["succeeded"]
+                    )
                     else "failed"
                 )
             else:
@@ -4869,10 +5044,11 @@ class CampaignRunner:
                 dataset_pairs=pair_status,
             )
             status_recorded = True
-            if invocation["failed"]:
+            if has_hpo_failures or has_seed_failures:
                 raise CampaignExecutionError(
-                    "One or more seed executions failed. See campaign "
-                    f"artifacts at {self.paths.log_root.resolve()}."
+                    "One or more HPO scopes or seed executions failed. "
+                    "See campaign artifacts at "
+                    f"{self.paths.log_root.resolve()}."
                 )
             return {
                 "campaign_hash": self.campaign_hash,

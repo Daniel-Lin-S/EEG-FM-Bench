@@ -13,7 +13,9 @@ import pytest
 from omegaconf import OmegaConf
 from pydantic import ValidationError
 
+import baseline.abstract.trainer as trainer_module
 import baseline.hpo.orchestrator as orchestrator_module
+from baseline.abstract.trainer import AbstractTrainer, HpoStopReason
 from baseline.brainomni.brainomni_config import BrainOmniConfig
 from baseline.hpo.artifacts import (
     CampaignPaths,
@@ -29,6 +31,7 @@ from baseline.hpo.progressive import (
     progressive_assessment_block,
 )
 from baseline.hpo.orchestrator import (
+    CampaignExecutionError,
     CampaignRunner,
     ENCODER_LR_SCALE_PATH,
     _collect_completed_trials,
@@ -1097,8 +1100,8 @@ def test_failed_trials_do_not_consume_resumed_hpo_budget() -> None:
     assert consecutive_failures == 2
 
 
-def test_progressive_collection_uses_optuna_trial_states() -> None:
-    """Completed and pruned trials are collected from Optuna state enums."""
+def test_progressive_collection_uses_completed_optuna_trials() -> None:
+    """Progressive assessment excludes pruned Optuna trials."""
     import optuna
 
     study = optuna.create_study()
@@ -1116,13 +1119,193 @@ def test_progressive_collection_uses_optuna_trial_states() -> None:
 
     collected = _collect_completed_trials(study)
 
-    assert [trial["state"] for trial in collected] == [
-        "COMPLETE",
-        "PRUNED",
-    ]
+    assert [trial["state"] for trial in collected] == ["COMPLETE"]
     assert collected[0]["objective_history"] == [
         {"epoch": 0, "value": 1.0},
     ]
+
+
+@pytest.mark.parametrize(
+    ("callback_result", "expected"),
+    [
+        (HpoStopReason.PATIENCE, HpoStopReason.PATIENCE),
+        (HpoStopReason.OPTUNA_PRUNED, HpoStopReason.OPTUNA_PRUNED),
+    ],
+)
+def test_callback_stop_reason_preserves_hpo_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+    callback_result: HpoStopReason,
+    expected: HpoStopReason,
+) -> None:
+    """Patience and Optuna pruning remain distinct trainer outcomes."""
+
+    class CallbackTrainer(AbstractTrainer):
+        """Minimal concrete trainer exposing the managed callback contract."""
+
+        def setup_model(self) -> None:
+            """Satisfy the abstract model-construction contract."""
+            return None
+
+        def load_checkpoint(self, *args: Any, **kwargs: Any) -> None:
+            """Satisfy the abstract checkpoint-loading contract."""
+            del args, kwargs
+            return None
+
+    trainer = CallbackTrainer.__new__(CallbackTrainer)
+    trainer.epoch = 3
+    monkeypatch.setattr(trainer_module, "get_is_master", lambda: True)
+    trainer.validation_callback = lambda *args: callback_result
+
+    reason = trainer._callback_stop_reason({}, {})
+
+    assert reason is expected
+
+
+def test_progressive_pruner_waits_for_initial_evidence() -> None:
+    """Progressive HPO delays pruning until its first evidence block."""
+    runner = CampaignRunner.__new__(CampaignRunner)
+    runner.hpo_config = make_hpo_config().model_copy(
+        update={
+            "progressive": ProgressiveHpoArgs(
+                initial_trials=10,
+                increment_trials=10,
+            ),
+        }
+    )
+
+    assert runner._effective_pruner_startup_trials() == 10
+
+
+def test_pruned_only_study_uses_immutable_recovery_namespace(
+    tmp_path: Path,
+) -> None:
+    """A pruned-only study is retained while a recovery study is created."""
+    import optuna
+
+    runner = _study_test_runner(tmp_path)
+    initial = runner._create_study("alpha")
+    initial_trial = initial.study.ask()
+    initial.study.tell(
+        initial_trial,
+        state=optuna.trial.TrialState.PRUNED,
+    )
+    initial_identity = initial.study_identity
+    initial_path = initial.storage_path
+    runner._release_study(initial)
+
+    recovery = runner._create_study("alpha")
+    try:
+        assert recovery.study_identity != initial_identity
+        payload = json.loads(
+            recovery.study.user_attrs["semantic_payload"]
+        )
+        assert payload["recovery_generation"] == 1
+        assert initial_path.is_file()
+        assert recovery.storage_path.is_file()
+    finally:
+        runner._release_study(recovery)
+
+
+def test_nonmultitask_hpo_failures_are_isolated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed HPO scope does not prevent independent selection."""
+    runner = CampaignRunner.__new__(CampaignRunner)
+    runner.base_dict = {"multitask": False}
+    runner.hpo_config = make_hpo_config()
+    runner.config_class = BrainOmniConfig
+    runner.selection_provenance = {}
+    runner._active_study_runtime = None
+
+    monkeypatch.setattr(
+        orchestrator_module,
+        "validate_search_space",
+        lambda *args: None,
+    )
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_study_scope_configs",
+        lambda *args: {"bad": {}, "good": {}},
+    )
+
+    def run_scope(scope: str, scope_config: dict[str, Any]) -> dict[str, Any]:
+        del scope_config
+        if scope == "bad":
+            raise RuntimeError("intentional HPO failure")
+        runner.selection_provenance[scope] = {"study_identity": "good"}
+        return {"selected": scope}
+
+    runner._run_hpo_scope = run_scope
+
+    selected = runner._run_hpo()
+
+    assert selected == {"good": {"selected": "good"}}
+    assert runner.hpo_outcomes[0]["status"] == "failed"
+    assert runner.hpo_outcomes[1] == {
+        "scope": "good",
+        "status": "selected",
+        "study_identity": "good",
+    }
+
+
+def test_campaign_finishes_selected_scopes_after_hpo_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An HPO scope failure yields partial status after other scopes run."""
+    runner = CampaignRunner.__new__(CampaignRunner)
+    runner.hpo_config = make_hpo_config()
+    runner.base_dict = {
+        "model_type": "brainomni",
+        "seeds": [42],
+    }
+    runner.campaign_hash = "campaign"
+    runner.campaign_aliases = frozenset()
+    runner.distributed_initialized = False
+    runner.paths = CampaignPaths(
+        log_root=tmp_path / "log",
+        checkpoint_root=tmp_path / "ckpt",
+    )
+    runner.hpo_outcomes = []
+    calls: list[str] = []
+    statuses: list[dict[str, Any]] = []
+    runner._configure_campaign_logging = lambda: None
+    runner._save_campaign_config = lambda: None
+    runner._initialize_distributed = lambda seed: calls.append("init")
+
+    def run_hpo() -> dict[str, dict[str, str]]:
+        calls.append("hpo")
+        runner.hpo_outcomes = [
+            {"scope": "bad", "status": "failed", "fingerprint": "x"},
+            {"scope": "good", "status": "selected"},
+        ]
+        return {"good": {"selected": "good"}}
+
+    def run_seeds(
+        selected: dict[str, dict[str, str]],
+    ) -> tuple[dict[str, Any], bool]:
+        calls.append("seeds")
+        assert selected == {"good": {"selected": "good"}}
+        return {
+            "failed": [],
+            "succeeded": [42],
+            "complete": True,
+        }, True
+
+    def update_status(state: str, **kwargs: Any) -> None:
+        statuses.append({"state": state, **kwargs})
+
+    runner._run_hpo = run_hpo
+    runner._run_seeds = run_seeds
+    runner._update_invocation_status = update_status
+    monkeypatch.setattr(orchestrator_module, "get_is_master", lambda: False)
+
+    with pytest.raises(CampaignExecutionError):
+        runner.run()
+
+    assert calls == ["init", "hpo", "seeds"]
+    assert statuses[-1]["state"] == "partial"
+    assert statuses[-1]["invocation"]["hpo_failed"][0]["scope"] == "bad"
 
 
 def test_campaign_runs_hpo_once_before_all_evaluation_seeds() -> None:
@@ -1321,9 +1504,9 @@ def test_progressive_resume_detects_missing_historical_evidence() -> None:
     assert not has_complete_progressive_evidence(historical, args)
 
 
-def test_progressive_block_rejects_inconsistent_budget() -> None:
-    """A budget larger than collected trials fails instead of truncating."""
-    with pytest.raises(ValueError, match="exceeds collected trials"):
+def test_progressive_block_rejects_inconsistent_completed_count() -> None:
+    """A mismatched completed-trial count fails instead of truncating."""
+    with pytest.raises(ValueError, match="does not match collected trials"):
         progressive_assessment_block(
             [_progressive_trial(0)],
             2,
