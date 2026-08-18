@@ -123,6 +123,7 @@ def select_safe_micro_batch(
     calibration_peak_bytes: int,
     calibration_batch_size: int,
     process_limit_bytes: int,
+    uncertainty_factor: float = 1.0,
 ) -> tuple[int, int]:
     """Select the largest candidate predicted to fit the process ceiling.
 
@@ -138,6 +139,8 @@ def select_safe_micro_batch(
         Per-rank micro-batch used for calibration.
     process_limit_bytes : int
         Current allocator ceiling after external occupancy and headroom.
+    uncertainty_factor : float, optional, default=1.0
+        Conservative multiplier applied to sample-scaled memory.
 
     Returns
     -------
@@ -151,8 +154,17 @@ def select_safe_micro_batch(
             "Expected a positive calibration batch size, but got "
             f"{calibration_batch_size}."
         )
+    if not math.isfinite(uncertainty_factor) or uncertainty_factor < 1.0:
+        raise ValueError(
+            "Expected uncertainty_factor >= 1, but got "
+            f"{uncertainty_factor}."
+        )
     variable_bytes = max(calibration_peak_bytes - fixed_bytes, 0)
-    bytes_per_sample = variable_bytes / calibration_batch_size
+    bytes_per_sample = (
+        variable_bytes
+        * uncertainty_factor
+        / calibration_batch_size
+    )
     for candidate in candidates:
         predicted = math.ceil(fixed_bytes + bytes_per_sample * candidate)
         if predicted <= process_limit_bytes:

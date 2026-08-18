@@ -162,7 +162,32 @@ def validate_search_space(
     hpo_config: HpoConfig,
     config_class: Type[BaseModel],
 ) -> None:
-    """Validate paths, representative values, and LR range compatibility."""
+    """Validate paths, representative values, and LR range compatibility.
+
+    Also auto-filters encoder_lr_scale from frozen encoder searches with a warning.
+    """
+    import logging
+
+    logger = logging.getLogger("baseline")
+
+    # Check if encoder is frozen and encoder_lr_scale is in search space
+    encoder_lr_scale_path = "training.encoder_lr_scale"
+    freeze_encoder = base_config.get("training", {}).get("freeze_encoder", False)
+
+    if freeze_encoder and encoder_lr_scale_path in hpo_config.search_space:
+        logger.warning(
+            "Encoder is frozen (training.freeze_encoder=True), but "
+            "training.encoder_lr_scale is in the HPO search space. "
+            "Removing encoder_lr_scale from search space because it cannot "
+            "affect an excluded encoder parameter group."
+        )
+        # Remove from search space
+        hpo_config.search_space = {
+            path: dist
+            for path, dist in hpo_config.search_space.items()
+            if path != encoder_lr_scale_path
+        }
+
     for path, distribution in hpo_config.search_space.items():
         original = get_dotted_value(base_config, path)
         candidates: list[Any]

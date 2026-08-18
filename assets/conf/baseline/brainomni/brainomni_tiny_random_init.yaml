@@ -143,6 +143,19 @@ hpo:
     n_warmup_epochs: 3
     interval_epochs: 1
 
+  progressive:
+    enabled: true
+    initial_trials: 10
+    increment_trials: 10
+    residual_epochs: 5
+    minimum_resolution: 1.0e-3
+    noise_multiplier: 2.0
+
+  patience:
+    enabled: true
+    patience: 5
+    min_delta: 0.0
+
   search_space:
     training.max_lr:
       distribution: float

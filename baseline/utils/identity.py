@@ -15,6 +15,7 @@ from typing import Any, Mapping, MutableMapping, Optional
 IDENTITY_VERSION = 5
 DISPLAY_ID_LENGTH = 12
 HPO_SEARCH_MARKER_KEY = "__hpo_search_parameter__"
+ENCODER_LR_SCALE_PATH = "training.encoder_lr_scale"
 DETERMINISTIC_MODEL_TYPES = frozenset({"catch22", "minirocket", "naive"})
 INVOCATION_CONFIG_FIELDS = frozenset({
     "conf_file",
@@ -30,6 +31,7 @@ RUNTIME_CONFIG_PATHS = frozenset({
     "data.pin_memory",
     "data.scratch_dir",
     "model.extractor.n_jobs",
+    "training.adaptive_batching",
 })
 MODEL_RUNTIME_CONFIG_PATHS = {
     "catch22": frozenset({
@@ -58,8 +60,13 @@ SEMANTIC_CONFIG_PATH_ALIASES = {
     "model.ridge_selection_metric": "model.classifier.selection_metric",
 }
 INVOCATION_HPO_FIELDS = frozenset({
+    "artifact_reserve_gib",
+    "estimated_trial_artifact_gib",
+    "logging_mode",
     "max_consecutive_failed_trials",
     "n_trials",
+    "patience",
+    "progressive",
 })
 
 
@@ -322,6 +329,20 @@ def _remove_model_runtime_fields(
         _remove_dotted_path(semantic, path)
 
 
+def _remove_inactive_training_fields(
+    semantic: MutableMapping[str, Any],
+) -> None:
+    """Remove optimizer fields that cannot affect the resolved training."""
+    training = semantic.get("training")
+    if not isinstance(training, Mapping):
+        return
+    if training.get("freeze_encoder") is True:
+        _remove_dotted_path(
+            semantic,
+            ENCODER_LR_SCALE_PATH,
+        )
+
+
 def _base_semantic_config(
     config: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -345,6 +366,7 @@ def _base_semantic_config(
     _normalize_semantic_config_paths(semantic)
     _remove_runtime_fields(semantic)
     _remove_model_runtime_fields(semantic)
+    _remove_inactive_training_fields(semantic)
     return semantic
 
 
@@ -431,6 +453,15 @@ def build_campaign_semantic_config(
                 "Enabled HPO requires a non-empty search_space mapping."
             )
         search_space = _normalize_search_space_paths(search_space)
+        training = semantic.get("training", {})
+        encoder_frozen = training.get("freeze_encoder") is True
+        if encoder_frozen and ENCODER_LR_SCALE_PATH in search_space:
+            search_space = {
+                path: dist
+                for path, dist in search_space.items()
+                if path != ENCODER_LR_SCALE_PATH
+            }
+
         hpo_semantic["search_space"] = search_space
         for dotted_path in sorted(search_space):
             _replace_search_value(semantic, dotted_path)

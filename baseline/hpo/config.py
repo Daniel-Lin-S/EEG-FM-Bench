@@ -200,6 +200,41 @@ class MedianPrunerArgs(BaseModel):
     interval_epochs: int = Field(default=1, ge=1)
 
 
+class ProgressiveHpoArgs(BaseModel):
+    """Progressive study-allocation settings.
+
+    Parameters
+    ----------
+    enabled : bool, optional, default=True
+        Whether objective diagnostics may stop below ``hpo.n_trials``.
+    initial_trials : int, optional, default=10
+        Complete-or-pruned trials allocated before the first assessment.
+    increment_trials : int, optional, default=10
+        Additional trials allocated only for responsive unresolved studies.
+    residual_epochs : int, optional, default=5
+        Final objective observations used for detrending and stability.
+    minimum_resolution : float, optional, default=1e-3
+        Absolute lower bound for meaningful objective differences.
+    noise_multiplier : float, optional, default=2.0
+        Pooled residual standard-deviation multiplier.
+    """
+
+    enabled: bool = True
+    initial_trials: int = Field(default=10, ge=2)
+    increment_trials: int = Field(default=10, ge=1)
+    residual_epochs: int = Field(default=5, ge=3)
+    minimum_resolution: float = Field(default=1.0e-3, gt=0.0)
+    noise_multiplier: float = Field(default=2.0, gt=0.0)
+
+
+class HpoPatienceArgs(BaseModel):
+    """Optional objective-patience stopping for individual HPO trials."""
+
+    enabled: bool = False
+    patience: int = Field(default=5, ge=1)
+    min_delta: float = Field(default=0.0, ge=0.0)
+
+
 class HpoConfig(BaseModel):
     """Top-level hyperparameter optimization settings.
 
@@ -225,6 +260,17 @@ class HpoConfig(BaseModel):
         Optuna TPE sampler configuration.
     pruner : MedianPrunerArgs, optional, default=MedianPrunerArgs()
         Optuna median-pruner configuration.
+    progressive : ProgressiveHpoArgs, optional
+        Block allocation and objective-resolution diagnostics.
+    patience : HpoPatienceArgs, optional
+        Per-trial objective patience independent of Optuna pruning.
+    logging_mode : {"full", "reduced"}, optional, default="full"
+        Trial artifact verbosity. Reduced mode keeps terminal diagnostics and
+        epoch objectives without optimizer-step traces.
+    artifact_reserve_gib : float, optional, default=5.0
+        Free filesystem capacity preserved before starting another trial.
+    estimated_trial_artifact_gib : float, optional, default=0.1
+        Conservative estimate used before historical trial sizes exist.
     search_space : dict[str, SearchDistribution], optional, default={}
         Mapping from dotted model-configuration paths to distributions. Only
         listed leaves are sampled; every unlisted resolved value stays fixed.
@@ -242,6 +288,13 @@ class HpoConfig(BaseModel):
     objective: HpoObjectiveArgs = Field(default_factory=HpoObjectiveArgs)
     sampler: TpeSamplerArgs = Field(default_factory=TpeSamplerArgs)
     pruner: MedianPrunerArgs = Field(default_factory=MedianPrunerArgs)
+    progressive: ProgressiveHpoArgs = Field(
+        default_factory=ProgressiveHpoArgs
+    )
+    patience: HpoPatienceArgs = Field(default_factory=HpoPatienceArgs)
+    logging_mode: Literal["full", "reduced"] = "full"
+    artifact_reserve_gib: float = Field(default=5.0, ge=0.0)
+    estimated_trial_artifact_gib: float = Field(default=0.1, gt=0.0)
     search_space: Dict[str, SearchDistribution] = Field(default_factory=dict)
 
     @model_validator(mode="after")

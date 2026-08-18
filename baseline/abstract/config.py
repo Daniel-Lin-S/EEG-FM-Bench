@@ -219,6 +219,14 @@ class AdaptiveBatchingArgs(BaseModel):
     contention_wait_seconds : int, optional, default=300
         Delay from zero through 300 seconds before the one permitted retry
         when micro-batch one cannot fit. Zero retries immediately.
+    memory_uncertainty_factor : float, optional, default=1.5
+        Multiplier applied to the calibrated sample-scaled memory estimate.
+    conservative_divisor_steps : int, optional, default=1
+        Exact-divisor levels stepped below the predicted safe candidate.
+    max_probe_failures : int, optional, default=2
+        CUDA OOM probe failures permitted before falling back to batch one.
+    temporary_cap_seconds : int, optional, default=300
+        Lifetime of an occupancy-specific OOM cap in the current process.
     """
 
     enabled: bool = True
@@ -231,6 +239,26 @@ class AdaptiveBatchingArgs(BaseModel):
         default=300,
         ge=0,
         le=300,
+    )
+    memory_uncertainty_factor: float = Field(
+        default=1.5,
+        ge=1.0,
+        le=4.0,
+    )
+    conservative_divisor_steps: int = Field(
+        default=1,
+        ge=0,
+        le=3,
+    )
+    max_probe_failures: int = Field(
+        default=2,
+        ge=0,
+        le=4,
+    )
+    temporary_cap_seconds: int = Field(
+        default=300,
+        ge=0,
+        le=3600,
     )
 
 

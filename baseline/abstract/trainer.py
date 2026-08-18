@@ -130,7 +130,7 @@ def format_console_log_dict(log_data: dict, prefix: str = 'train') -> str:
 
 class AbstractTrainer(ABC):
     """Abstract base trainer for all baseline models."""
-    
+
     def __init__(self, cfg: AbstractConfig):
         self.cfg = cfg
         self.model_type = cfg.model_type
@@ -149,7 +149,7 @@ class AbstractTrainer(ABC):
         self.world_size = 1
         self.rank = 0
         self.local_rank = 0
-        
+
         # Dataset information
         self.ds_conf = cfg.data.datasets
         self.num_ds = len(self.ds_conf)
@@ -161,7 +161,7 @@ class AbstractTrainer(ABC):
         self.start_time = datetime.datetime.now()
         self.comet_experiment = None
         self.tensorboard_writer: Optional[Any] = None
-        
+
         self.ckpt_dir: str = ""
         self.log_dir: str = ""
         self.execution_id: str = ""
@@ -176,6 +176,7 @@ class AbstractTrainer(ABC):
         self._loader_build_seconds: Dict[str, float] = {}
         self._evaluation_timings: Dict[str, Dict[str, float]] = {}
         self.run_mode = "legacy"
+        self.hpo_logging_mode = "full"  # Options: "full", "reduced"
         self.campaign_hash: Optional[str] = None
         self.selection_provenance: Optional[Mapping[str, Any]] = None
         self.campaign_invocation_id: Optional[str] = None
@@ -194,13 +195,13 @@ class AbstractTrainer(ABC):
         self.adaptive_batch_profile: Dict[str, Any] = {}
         self._runtime_batch_configured = False
 
-        
+
         # LoRA tracking
         self.lora_modules: List[str] = []
 
         # Lazy-created pretrain reconstruction head (registered on model)
         self._pretrain_recon_head = None
-    
+
     def setup_distributed(self):
         """Setup distributed training environment."""
         rank = get_global_rank()
@@ -259,7 +260,7 @@ class AbstractTrainer(ABC):
                 model, device_ids=[self.local_rank], find_unused_parameters=find_unused_parameters
             )
         return model
-    
+
     def encode_str(self, s: str, max_length=512):
         """Encode string to tensor for distributed broadcasting."""
         encoded = s.encode()[:max_length]
@@ -290,10 +291,13 @@ class AbstractTrainer(ABC):
         invocation_id: Optional[str] = None,
         external_distributed: bool = False,
         external_cloud: bool = False,
+        hpo_logging_mode: str = "full",
     ) -> None:
         """Configure one campaign-controlled trainer execution."""
         if run_mode not in {"hpo", "final", "recovery"}:
             raise ValueError(f"Unsupported managed run mode: {run_mode}.")
+        if hpo_logging_mode not in {"full", "reduced"}:
+            raise ValueError(f"Unsupported HPO logging mode: {hpo_logging_mode}.")
         self.log_dir_override = log_dir.resolve()
         self.ckpt_dir_override = checkpoint_dir.resolve()
         self.campaign_hash = campaign_hash
@@ -301,6 +305,7 @@ class AbstractTrainer(ABC):
             campaign_aliases or ()
         )
         self.run_mode = run_mode
+        self.hpo_logging_mode = hpo_logging_mode
         self.validation_callback = validation_callback
         self.external_distributed = external_distributed
         self.selection_provenance = (
@@ -1034,7 +1039,7 @@ class AbstractTrainer(ABC):
 
         self.ckpt_dir = ckpt_dir
         self.log_dir = log_dir
-        
+
         if get_is_master():
             file_path = None
             if self._has_output('log'):
@@ -1160,13 +1165,13 @@ class AbstractTrainer(ABC):
                 ])
 
             wandb_dir = os.path.join(self.cfg.logging.run_dir, 'log', 'baseline', 'wandb')
-            
+
             if self.cfg.logging.project is None:
                 logger.warning("Project name not set, using experiment_name as fallback")
-            
+
             # Use unified run name from log directory
             run_name = os.path.basename(self.log_dir)
-            
+
             # Setup wandb configuration with unified parameters
             wandb_config = {
                 'dir': wandb_dir,
@@ -1595,44 +1600,44 @@ class AbstractTrainer(ABC):
     def get_lora_target_modules(self) -> List[str]:
         """
         Get LoRA target modules for this model.
-        
+
         Can be overridden by subclasses to provide model-specific targets.
         By default, uses the configuration or model-type specific defaults.
         """
         lora_cfg = self.cfg.training.lora
-        
+
         # If explicit target modules specified (not just ["default"])
         if lora_cfg.lora_target_modules != ["default"]:
             return lora_cfg.lora_target_modules
-        
+
         # Otherwise, use model-type specific defaults
         return get_model_lora_targets(self.model_type, lora_cfg.lora_target_type)
 
     def apply_lora(self, model: nn.Module) -> nn.Module:
         """
         Apply LoRA to the model if enabled in configuration.
-        
+
         Args:
             model: The model to apply LoRA to
-            
+
         Returns:
             Model with LoRA layers injected (or original model if LoRA disabled)
         """
         lora_cfg = self.cfg.training.lora
-        
+
         if not lora_cfg.use_lora:
             return model
-        
+
         logger.debug(
             "Applying LoRA with r=%d, alpha=%d, scope=%s",
             lora_cfg.lora_r,
             lora_cfg.lora_alpha,
             lora_cfg.lora_scope,
         )
-        
+
         target_modules = self.get_lora_target_modules()
         logger.debug(f"LoRA target modules: {target_modules}")
-        
+
         model, injected_modules = inject_lora(
             model=model,
             target_modules=target_modules,
@@ -1643,24 +1648,24 @@ class AbstractTrainer(ABC):
             scope=lora_cfg.lora_scope,
             verbose=get_is_master(),
         )
-        
+
         self.lora_modules = injected_modules
-        
+
         return model
 
     def setup_optim_params(self, model):
         """
         Setup optimizer parameters with support for LoRA.
-        
+
         When LoRA is enabled:
         - Only LoRA parameters and classifier/head parameters are trainable
         - Base encoder parameters are frozen
-        
+
         When LoRA is disabled:
         - Uses original freeze_encoder logic
         """
         lora_cfg = self.cfg.training.lora
-        
+
         head_params = []
         encoder_params = []
         lora_params = []
@@ -1680,15 +1685,15 @@ class AbstractTrainer(ABC):
             # LoRA mode: train LoRA params + head, freeze encoder
             lora_lr = self.cfg.training.max_lr * lora_cfg.lora_lr_scale
             params.append({'params': lora_params, 'lr': lora_lr})
-            
+
             # Freeze non-LoRA encoder parameters
             for param in encoder_params:
                 param.requires_grad = False
-            
+
             lora_param_count = sum(p.numel() for p in lora_params)
             head_param_count = sum(p.numel() for p in head_params)
             frozen_param_count = sum(p.numel() for p in encoder_params)
-            
+
             logger.debug(f"LoRA training mode:")
             logger.debug(
                 "  - LoRA params: %s (lr=%.2e)",
@@ -2083,7 +2088,7 @@ class AbstractTrainer(ABC):
         self.scheduler.step()
 
         return loss_val, grad_norm
-    
+
     def setup_analysis_mode(self):
         """Configure trainer for gradient/feature analysis mode.
 
@@ -2099,7 +2104,7 @@ class AbstractTrainer(ABC):
     # ===========================================
     # Fine-tuning Training Interface
     # ===========================================
-    
+
     def train_step(self, batch, labels):
         with torch.amp.autocast('cuda', enabled=self.cfg.training.use_amp, dtype=torch.bfloat16):
             logits = self.model(batch)
@@ -2187,8 +2192,12 @@ class AbstractTrainer(ABC):
             }
         if self.cfg.logging.use_cloud:
             self._log_to_cloud(log_data)
-        self._log_to_tensorboard(log_data, self.current_step)
-        self._write_csv_metrics(log_data, self.current_step)
+
+        # Suppress per-step logging in reduced HPO mode
+        if not (self.run_mode == "hpo" and self.hpo_logging_mode == "reduced"):
+            self._log_to_tensorboard(log_data, self.current_step)
+            self._write_csv_metrics(log_data, self.current_step)
+
         logger.debug(format_console_log_dict(log_data, prefix="train"))
 
     def _run_accumulated_epoch(
@@ -2400,28 +2409,28 @@ class AbstractTrainer(ABC):
     def load_lora_checkpoint(self, lora_checkpoint_path: str):
         """
         Load LoRA weights from a checkpoint file.
-        
+
         Args:
             lora_checkpoint_path: Path to the LoRA checkpoint file
         """
         if not self.cfg.training.lora.use_lora:
             logger.warning("LoRA is not enabled, skipping LoRA checkpoint loading")
             return
-        
+
         logger.debug(f"Loading LoRA checkpoint from {lora_checkpoint_path}")
         lora_state_dict = torch.load(lora_checkpoint_path, map_location=self.device, weights_only=True)
-        
+
         missing_keys, unexpected_keys = load_lora_state_dict(
             self.model, lora_state_dict, strict=False
         )
-        
+
         if missing_keys:
             logger.warning(f"Missing LoRA keys: {missing_keys}")
         if unexpected_keys:
             logger.warning(f"Unexpected LoRA keys: {unexpected_keys}")
-        
+
         logger.debug("LoRA checkpoint loaded successfully")
-    
+
     def save_checkpoint(self, ds_name: Optional[str] = None, is_milestone: bool = False, **kwargs):
         """Save checkpoint with unified path management."""
         if not get_is_master():
@@ -2460,11 +2469,11 @@ class AbstractTrainer(ABC):
         if self.cfg.training.lora.use_lora:
             self.save_lora_checkpoint(checkpoint_dir, ds_name, suffix)
         return checkpoint_path
-    
+
     def save_lora_checkpoint(self, checkpoint_dir: Path, ds_name: str, suffix: str):
         """
         Save LoRA weights separately from the main checkpoint.
-        
+
         Args:
             checkpoint_dir: Directory to save the checkpoint
             ds_name: Dataset name
@@ -2472,16 +2481,16 @@ class AbstractTrainer(ABC):
         """
         if not get_is_master():
             return
-        
+
         lora_state_dict = get_lora_state_dict(self.model)
-        
+
         if not lora_state_dict:
             logger.warning("No LoRA parameters found to save")
             return
-        
+
         lora_checkpoint_path = checkpoint_dir / f'{self.model_type}_{ds_name}_{suffix}_lora.pt'
         torch.save(lora_state_dict, lora_checkpoint_path)
-        
+
         lora_param_count = sum(v.numel() for v in lora_state_dict.values())
         logger.debug(
             "LoRA checkpoint saved: %s (%s params)",

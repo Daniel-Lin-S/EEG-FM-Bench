@@ -46,6 +46,11 @@ from baseline.hpo.artifacts import (
     write_campaign_summary,
 )
 from baseline.hpo.config import HpoConfig
+from baseline.hpo.progressive import (
+    assess_progressive_study,
+    has_complete_progressive_evidence,
+    progressive_assessment_block,
+)
 from baseline.hpo.search import (
     objective_values,
     reduce_objective,
@@ -78,6 +83,9 @@ OOM_MESSAGE_PARTS = (
     "out of memory",
     "cuda error: memory allocation",
 )
+BYTES_PER_GIB = 1024 ** 3
+ENCODER_LR_SCALE_PATH = "training.encoder_lr_scale"
+OCCUPANCY_BAND_FRACTION = 0.1
 UNBUDGETED_TRIAL_STATES = frozenset({
     "FAIL",
     "RUNNING",
@@ -251,6 +259,23 @@ def _exclusive_yaml(path: Path, payload: Mapping[str, Any]) -> None:
     )
 
 
+def _load_immutable_json(path: Path) -> Dict[str, Any]:
+    """Load an immutable JSON mapping without changing its artifact."""
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"Immutable JSON artifact at {path.resolve()} is invalid: "
+            f"{exc}."
+        ) from exc
+    if not isinstance(existing, dict):
+        raise RuntimeError(
+            "Immutable JSON artifact must contain a mapping at "
+            f"{path.resolve()}."
+        )
+    return existing
+
+
 def _validate_immutable_json(
     path: Path,
     expected: Mapping[str, Any],
@@ -269,15 +294,74 @@ def _validate_immutable_json(
     RuntimeError
         If the artifact is invalid or differs from ``expected``.
     """
-    try:
-        existing = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError(
-            f"Immutable JSON artifact at {path.resolve()} is invalid: {exc}."
-        ) from exc
+    existing = _load_immutable_json(path)
     if existing != dict(expected):
         raise RuntimeError(
             f"Refusing to overwrite mismatching immutable artifact at "
+            f"{path.resolve()}."
+        )
+
+
+def _validate_immutable_hpo_best(
+    path: Path,
+    expected: Mapping[str, Any],
+    hpo_config: HpoConfig,
+    inactive_paths: frozenset[str],
+) -> None:
+    """Validate a historical HPO winner modulo inactive parameters.
+
+    Parameters
+    ----------
+    path : Path
+        Existing immutable best-trial artifact.
+    expected : Mapping[str, Any]
+        Winner payload resolved from the selected Optuna study.
+    hpo_config : HpoConfig
+        Effective HPO configuration containing active search parameters.
+    inactive_paths : frozenset[str]
+        Historical search paths that cannot affect resolved training.
+
+    Raises
+    ------
+    RuntimeError
+        If winner metadata or active parameters differ.
+    """
+    existing = _load_immutable_json(path)
+    existing_parameters = existing.get("parameters")
+    expected_parameters = expected.get("parameters")
+    if not isinstance(existing_parameters, Mapping):
+        raise RuntimeError(
+            "Immutable HPO winner parameters must be a mapping at "
+            f"{path.resolve()}."
+        )
+    if not isinstance(expected_parameters, Mapping):
+        raise RuntimeError("Expected HPO winner parameters must be a mapping.")
+    try:
+        projected_existing = _project_hpo_parameters(
+            existing_parameters,
+            hpo_config,
+            inactive_paths,
+        )
+        projected_expected = _project_hpo_parameters(
+            expected_parameters,
+            hpo_config,
+            inactive_paths,
+        )
+    except ValueError as exc:
+        raise RuntimeError(
+            "Refusing to reuse incompatible immutable HPO winner at "
+            f"{path.resolve()}: {exc}"
+        ) from exc
+    existing_metadata = dict(existing)
+    expected_metadata = dict(expected)
+    existing_metadata.pop("parameters")
+    expected_metadata.pop("parameters")
+    if (
+        existing_metadata != expected_metadata
+        or projected_existing != projected_expected
+    ):
+        raise RuntimeError(
+            "Refusing to overwrite mismatching immutable HPO winner at "
             f"{path.resolve()}."
         )
 
@@ -307,11 +391,38 @@ def _scoped_config(
     return scoped
 
 
-def _force_local_trial_logging(config: Dict[str, Any]) -> None:
-    """Disable cloud trial logging and ensure a CSV validation trace."""
+def _effective_hpo_config(
+    config: BaseModel,
+    hpo_config: HpoConfig,
+) -> HpoConfig:
+    """Remove search parameters that cannot affect the resolved model."""
+    payload = hpo_config.model_dump(mode="json")
+    if bool(config.training.freeze_encoder):
+        payload["search_space"].pop(ENCODER_LR_SCALE_PATH, None)
+    return HpoConfig.model_validate(payload)
+
+
+def _inactive_hpo_search_paths(config: BaseModel) -> frozenset[str]:
+    """Return search paths that cannot affect the resolved training."""
+    if bool(config.training.freeze_encoder):
+        return frozenset({ENCODER_LR_SCALE_PATH})
+    return frozenset()
+
+
+def _force_local_trial_logging(
+    config: Dict[str, Any],
+    mode: str = "full",
+) -> None:
+    """Disable cloud logging and configure local HPO trial artifacts."""
     logging_config = config["logging"]
     logging_config["use_cloud"] = False
     outputs = list(logging_config.get("outputs", []))
+    if mode == "reduced":
+        logging_config["use_tensorboard"] = False
+        logging_config["outputs"] = []
+        return
+    if mode != "full":
+        raise ValueError(f"Unsupported HPO logging mode: {mode}.")
     if logging_config.get("level", "info") != "debug":
         outputs = [output for output in outputs if output != "log"]
     if "csv" not in outputs:
@@ -1443,6 +1554,7 @@ def _study_record_matches_semantics(
     scope: str,
     study_identity: str,
     campaign_aliases: frozenset[str],
+    allow_historical_campaign_identity: bool = False,
 ) -> bool:
     """Return whether persisted metadata identifies the requested study.
 
@@ -1456,6 +1568,9 @@ def _study_record_matches_semantics(
         Current semantic study identity.
     campaign_aliases : frozenset[str]
         Current and verified historical campaign identities.
+    allow_historical_campaign_identity : bool, optional, default=False
+        Whether a semantically matched legacy campaign root may contain a
+        study written by an older identity schema.
 
     Returns
     -------
@@ -1466,7 +1581,10 @@ def _study_record_matches_semantics(
         return bool(
             record.get("semantic_payload_valid")
             and record.get("scope") == scope
-            and record.get("campaign_identity") in campaign_aliases
+            and (
+                allow_historical_campaign_identity
+                or record.get("campaign_identity") in campaign_aliases
+            )
         )
     study_name = record.get("study_name")
     return bool(
@@ -1532,6 +1650,71 @@ def _top_study_records(
         record for record in records
         if priority(record) == best_priority
     ]
+
+
+def _check_disk_space(
+    artifact_root: Path,
+    reserve_gib: float,
+    estimated_trial_gib: float,
+) -> None:
+    """Abort if projected trial artifacts would exceed the configured reserve.
+
+    Parameters
+    ----------
+    artifact_root : Path
+        Study artifact directory whose filesystem is checked.
+    reserve_gib : float
+        Required free capacity in GiB.
+    estimated_trial_gib : float
+        Conservative trial artifact size in GiB.
+
+    Raises
+    ------
+    RuntimeError
+        If free space is insufficient for the next trial.
+    """
+    import shutil as disk_util
+    stat = disk_util.disk_usage(artifact_root)
+    free_gib = stat.free / BYTES_PER_GIB
+    required_gib = reserve_gib + estimated_trial_gib
+    if free_gib < required_gib:
+        raise RuntimeError(
+            f"Insufficient disk space for next trial. "
+            f"Free: {free_gib:.2f} GiB, "
+            f"Required: {required_gib:.2f} GiB "
+            f"(reserve: {reserve_gib:.2f} GiB, "
+            f"trial estimate: {estimated_trial_gib:.2f} GiB)."
+        )
+
+
+def _collect_completed_trials(
+    study: Any,
+) -> list[dict[str, Any]]:
+    """Extract completed trials for progressive assessment.
+
+    Parameters
+    ----------
+    study : Any
+        Optuna study with persisted trials.
+
+    Returns
+    -------
+    list[dict[str, Any]]
+        Completed-or-pruned trials with objective and objective_history.
+    """
+    completed: list[dict[str, Any]] = []
+    for trial in study.get_trials(deepcopy=False):
+        if trial.state.name not in {"COMPLETE", "PRUNED"}:
+            continue
+        trial_dict = {
+            "objective": trial.value,
+            "state": trial.state.name,
+        }
+        history = trial.user_attrs.get("objective_history")
+        if isinstance(history, list):
+            trial_dict["objective_history"] = history
+        completed.append(trial_dict)
+    return completed
 
 
 def _study_progress(trials: list[Any]) -> tuple[int, int]:
@@ -1647,6 +1830,7 @@ def _serialized_trial_distributions(
 def _decoded_trial_parameters_match(
     trial: Any,
     hpo_config: HpoConfig,
+    inactive_paths: frozenset[str] = frozenset(),
 ) -> bool:
     """Return whether persisted decoded values match Optuna parameters.
 
@@ -1668,7 +1852,11 @@ def _decoded_trial_parameters_match(
         return trial.state.name not in {"COMPLETE", "PRUNED"}
     if not isinstance(decoded, dict):
         return False
-    if set(decoded) != set(hpo_config.search_space):
+    decoded_paths = set(decoded)
+    expected_paths = set(hpo_config.search_space)
+    if not expected_paths.issubset(decoded_paths):
+        return False
+    if decoded_paths - expected_paths - inactive_paths:
         return False
     for path, distribution in hpo_config.search_space.items():
         raw_value = trial.params.get(path)
@@ -1692,6 +1880,7 @@ def _decoded_trial_parameters_match(
 def _trial_metadata_matches(
     trials: list[Any],
     hpo_config: HpoConfig,
+    inactive_paths: frozenset[str] = frozenset(),
 ) -> bool:
     """Return whether trials prove exact search-space compatibility.
 
@@ -1712,10 +1901,57 @@ def _trial_metadata_matches(
     if not parameterized:
         return False
     return all(
-        trial.distributions == expected
-        and _decoded_trial_parameters_match(trial, hpo_config)
+        set(expected).issubset(trial.distributions)
+        and not (
+            set(trial.distributions) - set(expected) - inactive_paths
+        )
+        and all(
+            trial.distributions[path] == distribution
+            for path, distribution in expected.items()
+        )
+        and _decoded_trial_parameters_match(
+            trial,
+            hpo_config,
+            inactive_paths,
+        )
         for trial in parameterized
     )
+
+
+def _serialized_distributions_match(
+    actual: Mapping[str, Any],
+    expected: Mapping[str, Any],
+    inactive_paths: frozenset[str],
+) -> bool:
+    """Return whether persisted distributions differ only by inactive paths."""
+    actual_paths = set(actual)
+    expected_paths = set(expected)
+    if not expected_paths.issubset(actual_paths):
+        return False
+    if actual_paths - expected_paths - inactive_paths:
+        return False
+    return all(actual[path] == value for path, value in expected.items())
+
+
+def _project_hpo_parameters(
+    parameters: Mapping[str, Any],
+    hpo_config: HpoConfig,
+    inactive_paths: frozenset[str],
+) -> Dict[str, Any]:
+    """Project a compatible historical winner onto the active search space."""
+    parameter_paths = set(parameters)
+    expected_paths = set(hpo_config.search_space)
+    missing = expected_paths - parameter_paths
+    unexpected = parameter_paths - expected_paths - inactive_paths
+    if missing or unexpected:
+        raise ValueError(
+            "HPO winner parameters are incompatible: missing "
+            f"{sorted(missing)}, unexpected {sorted(unexpected)}."
+        )
+    return {
+        path: copy.deepcopy(parameters[path])
+        for path in hpo_config.search_space
+    }
 
 
 def _synchronize_micro_batch(micro_batch: int) -> int:
@@ -1775,8 +2011,9 @@ class CampaignRunner:
         self.config = config
         self.config_class = config_class
         self.base_dict = config.model_dump(mode="json")
-        self.hpo_config = hpo_config
-        self.hpo_dict = hpo_config.model_dump(mode="json")
+        self.inactive_hpo_search_paths = _inactive_hpo_search_paths(config)
+        self.hpo_config = _effective_hpo_config(config, hpo_config)
+        self.hpo_dict = self.hpo_config.model_dump(mode="json")
         self.resolution: CampaignResolution = resolve_campaign(
             run_dir=self.base_dict["logging"]["run_dir"],
             model_type=self.base_dict["model_type"],
@@ -1907,10 +2144,12 @@ class CampaignRunner:
         self,
         candidates: list[int],
         memory_model: Mapping[str, Any],
+        uncertainty_factor: float,
+        conservative_steps: int,
     ) -> tuple[list[int], int]:
-        """Return candidates starting at the DDP-wide predicted maximum."""
+        """Return candidates starting below the predicted memory ceiling."""
         eligible = candidates
-        oom_cap = memory_model.get("oom_cap")
+        oom_cap = memory_model.get("temporary_oom_cap")
         if oom_cap is not None:
             eligible = [
                 candidate
@@ -1923,16 +2162,109 @@ class CampaignRunner:
             int(memory_model["calibration_peak_reserved_bytes"]),
             int(memory_model["calibration_batch_size"]),
             int(memory_model["process_limit_bytes"]),
+            uncertainty_factor,
         )
         selected = _synchronize_micro_batch(selected)
+        selected_index = candidates.index(selected)
+        conservative_index = min(
+            selected_index + conservative_steps,
+            len(candidates) - 1,
+        )
+        selected = _synchronize_micro_batch(
+            candidates[conservative_index]
+        )
         _, predicted_peak = select_safe_micro_batch(
             [selected],
             int(memory_model["estimated_fixed_bytes"]),
             int(memory_model["calibration_peak_reserved_bytes"]),
             int(memory_model["calibration_batch_size"]),
             int(memory_model["process_limit_bytes"]),
+            uncertainty_factor,
         )
         return candidates[candidates.index(selected):], predicted_peak
+
+    @staticmethod
+    def _occupancy_band(memory_profile: Mapping[str, Any]) -> str:
+        """Return a stable external-memory occupancy band identifier."""
+        total_bytes = int(memory_profile["total_bytes"])
+        external_bytes = int(memory_profile["external_bytes"])
+        if total_bytes <= 0:
+            raise ValueError(
+                f"Expected positive total GPU memory, got {total_bytes}."
+            )
+        fraction = external_bytes / total_bytes
+        band = int(fraction / OCCUPANCY_BAND_FRACTION)
+        return str(max(band, 0))
+
+    def _apply_temporary_oom_cap(
+        self,
+        memory_profile: Dict[str, Any],
+    ) -> None:
+        """Apply and prune the current occupancy-specific temporary cap."""
+        caps = memory_profile.get("temporary_oom_caps")
+        if not isinstance(caps, dict):
+            return
+        now = time.monotonic()
+        active_caps = {
+            band: payload
+            for band, payload in caps.items()
+            if isinstance(payload, Mapping)
+            and float(payload.get("expires_at", -1.0)) > now
+        }
+        memory_profile["temporary_oom_caps"] = active_caps
+        band = self._occupancy_band(memory_profile)
+        active = active_caps.get(band)
+        if active is not None:
+            memory_profile["temporary_oom_cap"] = int(
+                active["max_micro_batch_size"]
+            )
+            memory_profile["temporary_oom_cap_band"] = band
+
+    def _record_temporary_oom_cap(
+        self,
+        signature: str,
+        cache: Dict[str, Dict[str, Any]],
+        memory_profile: Dict[str, Any],
+        max_micro_batch_size: int,
+        reason: str,
+        lifetime_seconds: int,
+    ) -> None:
+        """Cache one expiring cap for the current occupancy band."""
+        band = self._occupancy_band(memory_profile)
+        caps = dict(memory_profile.get("temporary_oom_caps", {}))
+        caps[band] = {
+            "max_micro_batch_size": max_micro_batch_size,
+            "expires_at": time.monotonic() + lifetime_seconds,
+            "reason": reason,
+        }
+        memory_profile["temporary_oom_caps"] = caps
+        memory_profile["temporary_oom_cap"] = max_micro_batch_size
+        memory_profile["temporary_oom_cap_band"] = band
+        cached = dict(cache.get(signature, {}))
+        cached["temporary_oom_caps"] = caps
+        cache[signature] = cached
+        self.adaptive_batch_cache = cache
+
+    def _probe_micro_batch(
+        self,
+        config: BaseModel,
+        global_batch_size: int,
+        micro_batch_size: int,
+        world_size: int,
+    ) -> Dict[str, Any]:
+        """Run one disposable optimizer update at a conservative candidate."""
+        probe_config = config.model_copy(deep=True)
+        probe = ModelRegistry.create_trainer(probe_config)
+        probe.configure_runtime_batching(
+            global_batch_size,
+            micro_batch_size,
+            world_size,
+        )
+        try:
+            return probe.calibrate_cuda_memory()
+        finally:
+            probe = None
+            _release_training_state()
 
     def _run_adaptive_trainer(
         self,
@@ -1974,22 +2306,88 @@ class CampaignRunner:
                 )
             memory_profile = dict(memory_profile)
             memory_profile.update(current_limit.as_dict())
+            self._apply_temporary_oom_cap(memory_profile)
             candidates, predicted_peak = self._predicted_candidates(
                 candidates,
                 memory_profile,
+                batching.memory_uncertainty_factor,
+                batching.conservative_divisor_steps,
             )
             memory_profile["estimated_selected_peak_bytes"] = (
                 predicted_peak
+            )
+            memory_profile["memory_uncertainty_factor"] = (
+                batching.memory_uncertainty_factor
+            )
+            memory_profile["conservative_divisor_steps"] = (
+                batching.conservative_divisor_steps
             )
             self.last_adaptive_memory_profile = dict(
                 memory_profile
             )
         batch_one_retried = False
+        probe_failures = 0
+        probe_attempts: list[Dict[str, Any]] = []
+        force_batch_one = False
         last_error: Optional[BaseException] = None
+        if candidates == [1]:
+            memory_profile["fallback_reason"] = (
+                "resource_limited_prediction"
+            )
+            logger.warning(
+                "Adaptive batching selected micro-batch one under current "
+                "GPU occupancy; throughput may be severely degraded."
+            )
         for candidate_index, micro_batch in enumerate(candidates):
+            if (
+                batching.enabled
+                and torch.cuda.is_available()
+                and micro_batch > 1
+            ):
+                try:
+                    probe_profile = self._probe_micro_batch(
+                        config,
+                        global_batch_size,
+                        micro_batch,
+                        world_size,
+                    )
+                    probe_attempts.append({
+                        "micro_batch_size": micro_batch,
+                        "status": "success",
+                        "measured_peak_reserved_bytes": probe_profile.get(
+                            "calibration_peak_reserved_bytes"
+                        ),
+                    })
+                except BaseException as exc:
+                    if not is_cuda_oom(exc):
+                        raise
+                    probe_failures += 1
+                    probe_attempts.append({
+                        "micro_batch_size": micro_batch,
+                        "status": "cuda_oom",
+                    })
+                    next_micro_batch = (
+                        1
+                        if probe_failures >= batching.max_probe_failures
+                        else candidates[candidate_index + 1]
+                    )
+                    self._record_temporary_oom_cap(
+                        signature,
+                        cache,
+                        memory_profile,
+                        next_micro_batch,
+                        "probe_cuda_oom",
+                        batching.temporary_cap_seconds,
+                    )
+                    if probe_failures >= batching.max_probe_failures:
+                        force_batch_one = True
+                        break
+                    continue
+            memory_profile["probe_attempts"] = list(probe_attempts)
             while True:
                 attempt_config = config.model_copy(deep=True)
                 trainer = ModelRegistry.create_trainer(attempt_config)
+                trainer.adaptive_batch_profile.update(memory_profile)
                 trainer.configure_runtime_batching(
                     global_batch_size,
                     micro_batch,
@@ -1998,7 +2396,6 @@ class CampaignRunner:
                 trainer.adaptive_batch_profile["adaptive_retry"] = (
                     candidate_index
                 )
-                trainer.adaptive_batch_profile.update(memory_profile)
                 try:
                     prepare(trainer)
                     result = trainer.run()
@@ -2009,19 +2406,29 @@ class CampaignRunner:
                     )
                     if not is_cuda_oom(exc):
                         raise
+                    probe_failures += 1
                     logger.warning(
                         "CUDA OOM at micro-batch %d; recalibrating within "
                         "the same run attempt.",
                         micro_batch,
                     )
                     if micro_batch != 1:
-                        next_micro_batch = candidates[
-                            candidate_index + 1
-                        ]
+                        next_micro_batch = (
+                            1
+                            if probe_failures >= batching.max_probe_failures
+                            else candidates[candidate_index + 1]
+                        )
                         if memory_profile:
-                            memory_profile["oom_cap"] = next_micro_batch
-                            cache[signature] = dict(memory_profile)
-                            self.adaptive_batch_cache = cache
+                            self._record_temporary_oom_cap(
+                                signature,
+                                cache,
+                                memory_profile,
+                                next_micro_batch,
+                                "training_cuda_oom",
+                                batching.temporary_cap_seconds,
+                            )
+                        if probe_failures >= batching.max_probe_failures:
+                            force_batch_one = True
                         break
                     if batch_one_retried:
                         raise torch.cuda.OutOfMemoryError(
@@ -2045,6 +2452,49 @@ class CampaignRunner:
                     trainer = None
                     _release_training_state()
                 return result
+            if force_batch_one:
+                break
+        if force_batch_one:
+            memory_profile["probe_attempts"] = list(probe_attempts)
+            memory_profile["fallback_reason"] = "probe_failure_limit"
+            logger.warning(
+                "Adaptive batching is falling back to micro-batch one after "
+                "%d conservative probe failure(s); throughput may be "
+                "severely degraded.",
+                probe_failures,
+            )
+            for fallback_attempt in range(2):
+                trainer = ModelRegistry.create_trainer(
+                    config.model_copy(deep=True)
+                )
+                trainer.adaptive_batch_profile.update(memory_profile)
+                trainer.configure_runtime_batching(
+                    global_batch_size,
+                    1,
+                    world_size,
+                )
+                try:
+                    prepare(trainer)
+                    return trainer.run()
+                except BaseException as exc:
+                    self.last_adaptive_memory_profile = dict(
+                        trainer.adaptive_batch_profile
+                    )
+                    if not is_cuda_oom(exc) or fallback_attempt == 1:
+                        raise
+                    wait_seconds = batching.contention_wait_seconds
+                    logger.warning(
+                        "Micro-batch one cannot fit; retrying after %d "
+                        "seconds.",
+                        wait_seconds,
+                    )
+                    trainer = None
+                    _release_training_state()
+                    if wait_seconds:
+                        time.sleep(wait_seconds)
+                finally:
+                    trainer = None
+                    _release_training_state()
         if last_error is None:
             raise RuntimeError("Adaptive batching produced no candidates.")
         raise last_error
@@ -2349,6 +2799,11 @@ class CampaignRunner:
                     scope,
                     study_identity,
                     aliases,
+                    getattr(
+                        getattr(self, "resolution", None),
+                        "legacy",
+                        False,
+                    ),
                 ):
                     continue
                 parameterized = any(
@@ -2357,6 +2812,11 @@ class CampaignRunner:
                 if parameterized and not _trial_metadata_matches(
                     trials,
                     self.hpo_config,
+                    getattr(
+                        self,
+                        "inactive_hpo_search_paths",
+                        frozenset(),
+                    ),
                 ):
                     continue
                 if not parameterized and summary.study_name != study_identity:
@@ -2671,7 +3131,94 @@ class CampaignRunner:
                 "search space before resuming."
             )
 
+        progressive_bypass = False
+        if (
+            budgeted > 0
+            and budgeted < self.hpo_config.n_trials
+            and self.hpo_config.progressive.enabled
+            and get_is_master()
+        ):
+            completed_on_resume = _collect_completed_trials(study)
+            progressive_bypass = not has_complete_progressive_evidence(
+                completed_on_resume,
+                self.hpo_config.progressive,
+            )
+            if progressive_bypass:
+                logger.warning(
+                    "HPO scope %s has %d persisted budgeted trials without "
+                    "complete progressive objective history; continuing "
+                    "the original selection procedure to the hard ceiling "
+                    "of %d trials.",
+                    scope,
+                    budgeted,
+                    self.hpo_config.n_trials,
+                )
+
         while budgeted < self.hpo_config.n_trials:
+            if (
+                self.hpo_config.progressive.enabled
+                and get_is_master()
+                and not progressive_bypass
+            ):
+                completed_trials = _collect_completed_trials(study)
+                assessment_trials = progressive_assessment_block(
+                    completed_trials,
+                    budgeted,
+                    self.hpo_config.progressive,
+                )
+                if assessment_trials is not None:
+                    assessment = assess_progressive_study(
+                        assessment_trials,
+                        self.hpo_config.objective.direction,
+                        self.hpo_config.progressive,
+                    )
+                    if not assessment.should_expand:
+                        logger.info(
+                            "HPO scope %s: progressive stop at block "
+                            "boundary %d/%d (outcome: %s, threshold: %.6g, "
+                            "between-trial SD: %s, winner gap: %s, "
+                            "stable: %s).",
+                            scope,
+                            budgeted,
+                            self.hpo_config.n_trials,
+                            assessment.outcome,
+                            assessment.resolution_threshold,
+                            (
+                                f"{assessment.between_trial_sd:.6g}"
+                                if assessment.between_trial_sd is not None
+                                else "N/A"
+                            ),
+                            (
+                                f"{assessment.winner_gap:.6g}"
+                                if assessment.winner_gap is not None
+                                else "N/A"
+                            ),
+                            assessment.incumbent_stable,
+                        )
+                        break
+                    logger.info(
+                        "HPO scope %s: progressive allocation expanded "
+                        "after block ending at %d trials (outcome: %s, "
+                        "threshold: %.6g, between-trial SD: %s).",
+                        scope,
+                        budgeted,
+                        assessment.outcome,
+                        assessment.resolution_threshold,
+                        (
+                            f"{assessment.between_trial_sd:.6g}"
+                            if assessment.between_trial_sd is not None
+                            else "N/A"
+                        ),
+                    )
+
+            # Check disk space before starting next trial
+            if get_is_master():
+                _check_disk_space(
+                    artifact_root,
+                    self.hpo_config.artifact_reserve_gib,
+                    self.hpo_config.estimated_trial_artifact_gib,
+                )
+
             if get_is_master():
                 trial = study.ask()
                 sampled, decoded = sample_config(
@@ -2713,13 +3260,15 @@ class CampaignRunner:
             objective_history: list[Dict[str, Any]] = []
             trial_budgeted = False
             self.last_adaptive_memory_profile = {}
+            patience_counter = 0
+            patience_best: Optional[float] = None
 
             def validation_callback(
                 epoch: int,
                 metrics: Mapping[str, Mapping[str, float]],
                 train_sizes: Mapping[str, int],
             ) -> bool:
-                nonlocal best_value
+                nonlocal best_value, patience_counter, patience_best
                 values = objective_values(
                     metrics,
                     self.hpo_config.objective.metric,
@@ -2744,7 +3293,42 @@ class CampaignRunner:
                     "value": value,
                 })
                 trial.report(value, step=epoch)
-                return trial.should_prune()
+
+                # Check Optuna pruning first
+                if trial.should_prune():
+                    return True
+
+                # Check patience stopping if enabled
+                if self.hpo_config.patience.enabled:
+                    is_minimize = self.hpo_config.objective.direction == "minimize"
+                    min_delta = self.hpo_config.patience.min_delta
+
+                    if patience_best is None:
+                        patience_best = value
+                        patience_counter = 0
+                    else:
+                        improved = False
+                        if is_minimize:
+                            improved = value < (patience_best - min_delta)
+                        else:
+                            improved = value > (patience_best + min_delta)
+
+                        if improved:
+                            patience_best = value
+                            patience_counter = 0
+                        else:
+                            patience_counter += 1
+
+                        if patience_counter >= self.hpo_config.patience.patience:
+                            logger.info(
+                                "Trial %d stopped by patience at epoch %d (no improvement for %d epochs).",
+                                trial_number,
+                                epoch,
+                                patience_counter,
+                            )
+                            return True
+
+                return False
 
             if self.base_dict["logging"].get("level") != "debug":
                 logger.setLevel(logging.WARNING)
@@ -2770,6 +3354,7 @@ class CampaignRunner:
                             else None
                         ),
                         external_distributed=True,
+                        hpo_logging_mode=self.hpo_config.logging_mode,
                     )
 
                 result = self._run_adaptive_trainer(
@@ -2789,6 +3374,7 @@ class CampaignRunner:
                             "Trial completed without a validation objective."
                         )
                     trial.set_user_attr("decoded_params", decoded)
+                    trial.set_user_attr("objective_history", objective_history)
                     if pruned:
                         study.tell(
                             trial,
@@ -2889,6 +3475,15 @@ class CampaignRunner:
                         )
                     else:
                         decoded[path] = encoded
+            decoded = _project_hpo_parameters(
+                decoded,
+                self.hpo_config,
+                getattr(
+                    self,
+                    "inactive_hpo_search_paths",
+                    frozenset(),
+                ),
+            )
             best_payload = {
                 "study_identity": study_identity,
                 "trial_number": best_trial.number,
@@ -2910,7 +3505,16 @@ class CampaignRunner:
                 / f"best_trial_{best_trial.number:05d}.json"
             )
             if best_path.exists():
-                _validate_immutable_json(best_path, best_payload)
+                _validate_immutable_hpo_best(
+                    best_path,
+                    best_payload,
+                    self.hpo_config,
+                    getattr(
+                        self,
+                        "inactive_hpo_search_paths",
+                        frozenset(),
+                    ),
+                )
             else:
                 _exclusive_json(best_path, best_payload)
             _exclusive_json(
@@ -4001,12 +4605,24 @@ class CampaignRunner:
                 scope,
                 study_identity,
                 campaign_aliases,
+                getattr(
+                    getattr(self, "resolution", None),
+                    "legacy",
+                    False,
+                ),
             )
             and str(record["direction"]).lower()
             == self.hpo_config.objective.direction
             and record["distributions_consistent"]
-            and record["distributions"]
-            == expected_distributions
+            and _serialized_distributions_match(
+                record["distributions"],
+                expected_distributions,
+                getattr(
+                    self,
+                    "inactive_hpo_search_paths",
+                    frozenset(),
+                ),
+            )
         ]
         eligible = _top_study_records(
             compatible,
@@ -4066,6 +4682,20 @@ class CampaignRunner:
         parameters = best_payload.get("parameters")
         if not isinstance(parameters, dict):
             report["status"] = "winner_parameters_invalid"
+            return report, None
+        try:
+            parameters = _project_hpo_parameters(
+                parameters,
+                self.hpo_config,
+                getattr(
+                    self,
+                    "inactive_hpo_search_paths",
+                    frozenset(),
+                ),
+            )
+        except ValueError as exc:
+            report["status"] = "winner_parameters_invalid"
+            report["error"] = str(exc)
             return report, None
         selected = copy.deepcopy(dict(scope_config))
         for path, value in parameters.items():

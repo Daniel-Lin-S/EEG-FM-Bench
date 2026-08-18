@@ -22,12 +22,23 @@ from baseline.hpo.artifacts import (
     get_campaign_hash,
     summarize_test_rows,
 )
-from baseline.hpo.config import HpoConfig
+from baseline.hpo.config import HpoConfig, ProgressiveHpoArgs
+from baseline.hpo.progressive import (
+    assess_progressive_study,
+    has_complete_progressive_evidence,
+    progressive_assessment_block,
+)
 from baseline.hpo.orchestrator import (
     CampaignRunner,
+    ENCODER_LR_SCALE_PATH,
+    _collect_completed_trials,
+    _project_hpo_parameters,
     _hpo_scope_root,
+    _study_record_matches_semantics,
     _study_progress,
     _study_scope_configs,
+    _trial_metadata_matches,
+    _validate_immutable_hpo_best,
 )
 from baseline.hpo.search import (
     reduce_objective,
@@ -526,6 +537,191 @@ def test_optuna_sqlite_study_resumes_existing_trials(
     ).is_file()
 
 
+def test_frozen_hpo_accepts_legacy_inactive_trial_parameter() -> None:
+    """A frozen trial may contain the historical inert encoder LR scale."""
+    import optuna
+
+    requested = make_hpo_config()
+    effective_payload = requested.model_dump(mode="json")
+    effective_payload["search_space"].pop(ENCODER_LR_SCALE_PATH)
+    effective = HpoConfig.model_validate(effective_payload)
+    study = optuna.create_study(direction="minimize")
+    trial = study.ask()
+    decoded = {}
+    for path, distribution in requested.search_space.items():
+        if distribution.distribution == "categorical":
+            encoded = trial.suggest_categorical(
+                path,
+                ["choice_0000", "choice_0001", "choice_0002"],
+            )
+            index = int(encoded.rsplit("_", maxsplit=1)[-1])
+            decoded[path] = distribution.choices[index]
+        else:
+            decoded[path] = trial.suggest_float(
+                path,
+                float(distribution.low),
+                float(distribution.high),
+                log=distribution.log,
+            )
+    trial.set_user_attr("decoded_params", decoded)
+    study.tell(trial, 1.0)
+
+    assert _trial_metadata_matches(
+        study.trials,
+        effective,
+        frozenset({ENCODER_LR_SCALE_PATH}),
+    )
+    projected = _project_hpo_parameters(
+        decoded,
+        effective,
+        frozenset({ENCODER_LR_SCALE_PATH}),
+    )
+    assert set(projected) == set(effective.search_space)
+    assert ENCODER_LR_SCALE_PATH not in projected
+
+
+def _frozen_effective_hpo_config() -> HpoConfig:
+    """Return the test HPO space without its inactive frozen parameter."""
+    payload = make_hpo_config().model_dump(mode="json")
+    payload["search_space"].pop(ENCODER_LR_SCALE_PATH)
+    return HpoConfig.model_validate(payload)
+
+
+def _winner_payload(parameters: dict[str, Any]) -> dict[str, Any]:
+    """Return one deterministic immutable HPO winner payload."""
+    return {
+        "study_identity": "historical-study",
+        "trial_number": 27,
+        "objective": 0.5,
+        "parameters": parameters,
+    }
+
+
+def test_immutable_winner_accepts_inactive_historical_parameter(
+    tmp_path: Path,
+) -> None:
+    """An inactive historical parameter does not block winner reuse."""
+    hpo = _frozen_effective_hpo_config()
+    active_parameters = {
+        "model.classifier_head.hidden_dims": [128],
+        "training.max_lr": 5e-4,
+        "training.min_lr": 5e-6,
+    }
+    historical_parameters = {
+        **active_parameters,
+        ENCODER_LR_SCALE_PATH: 0.75,
+    }
+    path = tmp_path / "best_trial_00027.json"
+    original = json.dumps(
+        _winner_payload(historical_parameters),
+        indent=2,
+        sort_keys=True,
+    )
+    path.write_text(original, encoding="utf-8")
+
+    _validate_immutable_hpo_best(
+        path,
+        _winner_payload(active_parameters),
+        hpo,
+        frozenset({ENCODER_LR_SCALE_PATH}),
+    )
+
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_immutable_winner_rejects_active_parameter_mismatch(
+    tmp_path: Path,
+) -> None:
+    """A changed active parameter still blocks historical winner reuse."""
+    hpo = _frozen_effective_hpo_config()
+    expected_parameters = {
+        "model.classifier_head.hidden_dims": [128],
+        "training.max_lr": 5e-4,
+        "training.min_lr": 5e-6,
+    }
+    historical_parameters = {
+        **expected_parameters,
+        "training.max_lr": 8e-4,
+        ENCODER_LR_SCALE_PATH: 0.75,
+    }
+    path = tmp_path / "best_trial_00027.json"
+    path.write_text(
+        json.dumps(
+            _winner_payload(historical_parameters),
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="mismatching immutable HPO winner",
+    ):
+        _validate_immutable_hpo_best(
+            path,
+            _winner_payload(expected_parameters),
+            hpo,
+            frozenset({ENCODER_LR_SCALE_PATH}),
+        )
+
+
+def test_unfrozen_hpo_rejects_legacy_extra_trial_parameter() -> None:
+    """An active search cannot silently accept an unrelated extra path."""
+    import optuna
+
+    hpo = make_hpo_config()
+    study = optuna.create_study(direction="minimize")
+    trial = study.ask()
+    trial.suggest_float("training.unrelated", 0.1, 1.0)
+    trial.set_user_attr("decoded_params", {"training.unrelated": 0.1})
+    study.tell(trial, 1.0)
+
+    assert not _trial_metadata_matches(study.trials, hpo)
+
+
+def test_legacy_root_accepts_older_campaign_identity() -> None:
+    """A compatible legacy root may contain an older identity schema."""
+    record = {
+        "semantic_payload_present": True,
+        "semantic_payload_valid": True,
+        "scope": "alpha",
+        "campaign_identity": "older-campaign",
+    }
+
+    assert not _study_record_matches_semantics(
+        record,
+        "alpha",
+        "current-study",
+        frozenset({"current-campaign"}),
+    )
+    assert _study_record_matches_semantics(
+        record,
+        "alpha",
+        "current-study",
+        frozenset({"current-campaign"}),
+        allow_historical_campaign_identity=True,
+    )
+
+
+def test_legacy_root_still_rejects_wrong_scope() -> None:
+    """Legacy identity compatibility cannot cross HPO scopes."""
+    record = {
+        "semantic_payload_present": True,
+        "semantic_payload_valid": True,
+        "scope": "beta",
+        "campaign_identity": "older-campaign",
+    }
+
+    assert not _study_record_matches_semantics(
+        record,
+        "alpha",
+        "current-study",
+        frozenset({"current-campaign"}),
+        allow_historical_campaign_identity=True,
+    )
+
+
 def test_resuming_hpo_removes_failed_trials_and_their_artifacts(
     tmp_path: Path,
 ) -> None:
@@ -613,7 +809,12 @@ def test_completed_hpo_budget_reuses_winner_without_trainer(
     runner._active_study_runtime = None
     runtime = runner._create_study("alpha")
     trial = runtime.study.ask()
-    trial.set_user_attr("decoded_params", {})
+    _, decoded = sample_config(
+        scope_config,
+        runner.hpo_config,
+        trial,
+    )
+    trial.set_user_attr("decoded_params", decoded)
     runtime.study.tell(trial, 1.0)
     runner._release_study(runtime)
 
@@ -625,7 +826,14 @@ def test_completed_hpo_budget_reuses_winner_without_trainer(
 
     selected = runner._run_hpo_scope("alpha", scope_config)
 
-    assert selected == scope_config
+    expected = json.loads(json.dumps(scope_config))
+    for dotted_path, value in decoded.items():
+        orchestrator_module.set_dotted_value(
+            expected,
+            dotted_path,
+            value,
+        )
+    assert selected == expected
     assert (
         tmp_path
         / "log"
@@ -889,6 +1097,34 @@ def test_failed_trials_do_not_consume_resumed_hpo_budget() -> None:
     assert consecutive_failures == 2
 
 
+def test_progressive_collection_uses_optuna_trial_states() -> None:
+    """Completed and pruned trials are collected from Optuna state enums."""
+    import optuna
+
+    study = optuna.create_study()
+    complete = study.ask()
+    complete.set_user_attr(
+        "objective_history",
+        [{"epoch": 0, "value": 1.0}],
+    )
+    study.tell(complete, 1.0)
+    pruned = study.ask()
+    study.tell(pruned, state=optuna.trial.TrialState.PRUNED)
+    failed = study.ask()
+    study.tell(failed, state=optuna.trial.TrialState.FAIL)
+    study.ask()
+
+    collected = _collect_completed_trials(study)
+
+    assert [trial["state"] for trial in collected] == [
+        "COMPLETE",
+        "PRUNED",
+    ]
+    assert collected[0]["objective_history"] == [
+        {"epoch": 0, "value": 1.0},
+    ]
+
+
 def test_campaign_runs_hpo_once_before_all_evaluation_seeds() -> None:
     """Evaluation seeds consume one selected result without repeating HPO."""
     runner = CampaignRunner.__new__(CampaignRunner)
@@ -1031,3 +1267,259 @@ def test_nonmultitask_failures_are_isolated_by_dataset(
         for message in messages
     )
     assert any("/tmp/baseline.err" in message for message in messages)
+
+
+def _progressive_trial(number: int) -> dict[str, Any]:
+    """Return one trial with finite objective and epoch history."""
+    return {
+        "number": number,
+        "objective": float(number),
+        "objective_history": [
+            {"epoch": epoch, "value": float(number) + epoch / 100.0}
+            for epoch in range(5)
+        ],
+    }
+
+
+def test_progressive_resume_waits_for_complete_block() -> None:
+    """A partial study is not assessed until its next block boundary."""
+    args = ProgressiveHpoArgs(
+        initial_trials=10,
+        increment_trials=10,
+    )
+    trials = [_progressive_trial(number) for number in range(30)]
+
+    assert progressive_assessment_block(trials[:9], 9, args) is None
+    first = progressive_assessment_block(trials[:10], 10, args)
+    assert first is not None
+    assert [trial["number"] for trial in first] == list(range(10))
+
+    assert progressive_assessment_block(trials[:19], 19, args) is None
+    second = progressive_assessment_block(trials[:20], 20, args)
+    assert second is not None
+    assert [trial["number"] for trial in second] == list(range(10, 20))
+
+    assert progressive_assessment_block(trials[:26], 26, args) is None
+    third = progressive_assessment_block(trials, 30, args)
+    assert third is not None
+    assert [trial["number"] for trial in third] == list(range(20, 30))
+
+
+def test_progressive_resume_detects_missing_historical_evidence() -> None:
+    """Legacy trials without epoch objectives cannot trigger early stop."""
+    args = ProgressiveHpoArgs()
+    complete = [_progressive_trial(number) for number in range(9)]
+    historical = [
+        {
+            "number": number,
+            "objective": float(number),
+        }
+        for number in range(9)
+    ]
+
+    assert has_complete_progressive_evidence(complete, args)
+    assert not has_complete_progressive_evidence(historical, args)
+
+
+def test_progressive_block_rejects_inconsistent_budget() -> None:
+    """A budget larger than collected trials fails instead of truncating."""
+    with pytest.raises(ValueError, match="exceeds collected trials"):
+        progressive_assessment_block(
+            [_progressive_trial(0)],
+            2,
+            ProgressiveHpoArgs(),
+        )
+
+
+def test_progressive_hpo_flat_outcome_stops_early() -> None:
+    """Flat studies stop when between-trial variance is below threshold."""
+    # Create trials with very similar objectives (flat)
+    trials = [
+        {
+            "objective": 1.0,
+            "objective_history": [
+                {"epoch": 0, "value": 1.2},
+                {"epoch": 1, "value": 1.1},
+                {"epoch": 2, "value": 1.05},
+                {"epoch": 3, "value": 1.02},
+                {"epoch": 4, "value": 1.0},
+            ],
+        },
+        {
+            "objective": 1.001,
+            "objective_history": [
+                {"epoch": 0, "value": 1.15},
+                {"epoch": 1, "value": 1.08},
+                {"epoch": 2, "value": 1.03},
+                {"epoch": 3, "value": 1.01},
+                {"epoch": 4, "value": 1.001},
+            ],
+        },
+    ]
+
+    assessment = assess_progressive_study(
+        trials,
+        "minimize",
+        ProgressiveHpoArgs(),
+    )
+
+    assert assessment.outcome == "flat"
+    assert assessment.should_expand is False
+    assert assessment.completed_trials == 2
+
+
+def test_progressive_hpo_clear_winner_with_gap() -> None:
+    """A clear gap continues when the incumbent remains unstable."""
+    # Create trials with clear winner but not necessarily stable
+    trials = [
+        {
+            "objective": 0.5,  # Clear winner
+            "objective_history": [
+                {"epoch": 0, "value": 0.8},
+                {"epoch": 1, "value": 0.6},
+                {"epoch": 2, "value": 0.501},
+                {"epoch": 3, "value": 0.5005},
+                {"epoch": 4, "value": 0.5},
+            ],
+        },
+        {
+            "objective": 1.5,  # Runner-up
+            "objective_history": [
+                {"epoch": 0, "value": 2.0},
+                {"epoch": 1, "value": 1.8},
+                {"epoch": 2, "value": 1.6},
+                {"epoch": 3, "value": 1.55},
+                {"epoch": 4, "value": 1.5},
+            ],
+        },
+        {
+            "objective": 2.0,
+            "objective_history": [
+                {"epoch": 0, "value": 2.5},
+                {"epoch": 1, "value": 2.3},
+                {"epoch": 2, "value": 2.1},
+                {"epoch": 3, "value": 2.05},
+                {"epoch": 4, "value": 2.0},
+            ],
+        },
+    ]
+
+    assessment = assess_progressive_study(
+        trials,
+        "minimize",
+        ProgressiveHpoArgs(),
+    )
+
+    # Should have good between-trial variance and clear winner gap
+    assert assessment.winner_gap is not None
+    assert assessment.winner_gap > 0.5
+    assert assessment.between_trial_sd is not None
+    assert assessment.between_trial_sd > 0.01
+
+
+def test_progressive_hpo_unresolved_outcome_continues() -> None:
+    """Unresolved variation without a clear winner continues."""
+    # Create trials with high variance but no clear stable winner
+    trials = [
+        {
+            "objective": 0.5,
+            "objective_history": [
+                {"epoch": 0, "value": 1.0},
+                {"epoch": 1, "value": 0.8},
+                {"epoch": 2, "value": 0.6},
+                {"epoch": 3, "value": 0.55},
+                {"epoch": 4, "value": 0.5},
+            ],
+        },
+        {
+            "objective": 0.7,
+            "objective_history": [
+                {"epoch": 0, "value": 1.2},
+                {"epoch": 1, "value": 0.95},
+                {"epoch": 2, "value": 0.75},
+                {"epoch": 3, "value": 0.72},
+                {"epoch": 4, "value": 0.7},
+            ],
+        },
+        {
+            "objective": 1.5,
+            "objective_history": [
+                {"epoch": 0, "value": 2.0},
+                {"epoch": 1, "value": 1.8},
+                {"epoch": 2, "value": 1.6},
+                {"epoch": 3, "value": 1.55},
+                {"epoch": 4, "value": 1.5},
+            ],
+        },
+    ]
+
+    assessment = assess_progressive_study(
+        trials,
+        "minimize",
+        ProgressiveHpoArgs(minimum_resolution=0.01),
+    )
+
+    assert assessment.outcome == "responsive_unresolved"
+    assert assessment.should_expand is True
+
+
+def test_auto_filter_encoder_lr_scale_for_frozen_encoder() -> None:
+    """Frozen encoder searches automatically filter encoder_lr_scale."""
+    from baseline.hpo.search import validate_search_space
+
+    base = BrainOmniConfig(fs=TEST_FS, seeds=[0]).model_dump(mode="json")
+    base["training"]["freeze_encoder"] = True
+
+    hpo = HpoConfig.model_validate({
+        "enabled": True,
+        "n_trials": 5,
+        "search_space": {
+            "training.max_lr": {
+                "distribution": "float",
+                "low": 1e-4,
+                "high": 1e-3,
+            },
+            "training.encoder_lr_scale": {
+                "distribution": "float",
+                "low": 0.1,
+                "high": 1.0,
+            },
+        },
+    })
+
+    # Should auto-filter encoder_lr_scale
+    validate_search_space(base, hpo, BrainOmniConfig)
+
+    assert "training.encoder_lr_scale" not in hpo.search_space
+    assert "training.max_lr" in hpo.search_space
+
+
+def test_unfrozen_encoder_keeps_encoder_lr_scale() -> None:
+    """Unfrozen encoder searches keep encoder_lr_scale in search space."""
+    from baseline.hpo.search import validate_search_space
+
+    base = BrainOmniConfig(fs=TEST_FS, seeds=[0]).model_dump(mode="json")
+    base["training"]["freeze_encoder"] = False
+
+    hpo = HpoConfig.model_validate({
+        "enabled": True,
+        "n_trials": 5,
+        "search_space": {
+            "training.max_lr": {
+                "distribution": "float",
+                "low": 1e-4,
+                "high": 1e-3,
+            },
+            "training.encoder_lr_scale": {
+                "distribution": "float",
+                "low": 0.1,
+                "high": 1.0,
+            },
+        },
+    })
+
+    # Should keep encoder_lr_scale
+    validate_search_space(base, hpo, BrainOmniConfig)
+
+    assert "training.encoder_lr_scale" in hpo.search_space
+    assert "training.max_lr" in hpo.search_space

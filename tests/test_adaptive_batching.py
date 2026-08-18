@@ -172,6 +172,10 @@ def test_runtime_micro_batch_does_not_mutate_requested_config() -> None:
     trainer = DummyTrainer(config)
     trainer.dataloader_factory = SimpleNamespace(batch_size=8)
     original_hash = trainer._resolved_config_hash()
+    trainer.adaptive_batch_profile.update({
+        "micro_batch_size": 1,
+        "accumulation_steps": 8,
+    })
 
     trainer.configure_runtime_batching(
         global_batch_size=8,
@@ -183,6 +187,11 @@ def test_runtime_micro_batch_does_not_mutate_requested_config() -> None:
     assert trainer.dataloader_factory.batch_size == 2
     assert trainer.micro_batch_size == 2
     assert trainer.accumulation_steps == 4
+    assert trainer.adaptive_batch_profile["micro_batch_size"] == 2
+    assert (
+        trainer.adaptive_batch_profile["accumulation_steps"]
+        == 4
+    )
     assert trainer._resolved_config_hash() == original_hash
 
 
