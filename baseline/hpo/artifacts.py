@@ -22,10 +22,13 @@ import yaml
 from baseline.utils.identity import (
     IDENTITY_VERSION,
     DETERMINISTIC_MODEL_TYPES,
+    SUPPORTED_CONFIG_HASH_VERSIONS,
     build_campaign_semantic_config,
     build_run_semantic_config,
+    build_run_semantic_config_for_version,
     get_campaign_identity,
     get_legacy_run_hash,
+    get_run_identity_for_version,
     semantic_digest,
     short_identity,
 )
@@ -48,6 +51,7 @@ VOLATILE_NUMBER_PATTERN = re.compile(
     r"(?:\d+(?:\.\d*)?|\.\d+)"
     r"(?:[eE][-+]?\d+)?"
 )
+MAX_SEMANTIC_DIFFERENCE_PATHS = 5
 
 
 @dataclass(frozen=True)
@@ -716,11 +720,38 @@ def _compatibility_failure(
     )
 
 
+def _stored_config_hash_version(
+    completion: Mapping[str, Any],
+) -> int | None:
+    """Return the stored schema version for one completed result."""
+    version = completion.get("config_hash_version")
+    if version is None:
+        return None
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise ValueError("config_hash_version is not an integer")
+    if version not in SUPPORTED_CONFIG_HASH_VERSIONS:
+        supported = ", ".join(
+            str(item) for item in sorted(SUPPORTED_CONFIG_HASH_VERSIONS)
+        )
+        raise ValueError(
+            f"unsupported config hash version {version}; supported versions "
+            f"are unversioned, {supported}"
+        )
+    return version
+
+
+def _config_hash_version_label(identity_version: int | None) -> str:
+    """Return the diagnostic label for one stored identity schema."""
+    if identity_version is None:
+        return "unversioned"
+    return f"{identity_version}"
+
+
 def _load_saved_completion_config(
     path: Path,
     completion: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Load and validate the resolved configuration for one completion."""
+) -> tuple[dict[str, Any], int | None]:
+    """Load and validate one resolved configuration by its stored schema."""
     execution_id = completion.get("execution_id")
     if (
         not isinstance(execution_id, str)
@@ -743,48 +774,140 @@ def _load_saved_completion_config(
         ) from exc
     if not isinstance(saved_config, dict):
         raise ValueError("resolved configuration is not a mapping")
+    stored_hash = completion.get("config_hash")
+    if not isinstance(stored_hash, str) or not stored_hash:
+        raise ValueError("config_hash is missing or invalid")
     try:
+        identity_version = _stored_config_hash_version(completion)
         multitask = bool(saved_config.get("multitask"))
-        saved_hashes = {
-            _config_identity_hash(saved_config),
-            get_legacy_run_hash(saved_config, multitask),
-        }
+        if len(stored_hash) == 12:
+            computed_hash = get_legacy_run_hash(
+                saved_config,
+                multitask,
+            )
+            identity_version = None
+        elif identity_version is None:
+            matching_versions = [
+                version
+                for version in SUPPORTED_CONFIG_HASH_VERSIONS
+                if get_run_identity_for_version(
+                    saved_config,
+                    multitask,
+                    version,
+                ) == stored_hash
+            ]
+            if not matching_versions:
+                raise ValueError(
+                    "unversioned full config hash does not match any "
+                    "supported historical schema"
+                )
+            identity_version = max(matching_versions)
+            computed_hash = stored_hash
+        else:
+            computed_hash = get_run_identity_for_version(
+                saved_config,
+                multitask,
+                identity_version,
+            )
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(
             f"resolved configuration cannot be hashed: {exc}"
         ) from exc
-    if completion.get("config_hash") not in saved_hashes:
+    if stored_hash != computed_hash:
+        version_label = _config_hash_version_label(identity_version)
         raise ValueError(
-            "stored config hash does not match the resolved configuration"
+            "stored config hash is invalid for config hash version "
+            f"{version_label}: stored {stored_hash}, recomputed "
+            f"{computed_hash}"
         )
-    return saved_config
+    return saved_config, identity_version
 
 
-def _legacy_runtime_batch_compatibility(
+def _semantic_difference_paths(
+    saved: Any,
+    expected: Any,
+    prefix: str = "",
+) -> list[str]:
+    """Return deterministic differing semantic paths."""
+    if isinstance(saved, Mapping) and isinstance(expected, Mapping):
+        differences: list[str] = []
+        for key in sorted(set(saved) | set(expected)):
+            child_prefix = f"{prefix}.{key}" if prefix else str(key)
+            differences.extend(
+                _semantic_difference_paths(
+                    saved.get(key),
+                    expected.get(key),
+                    child_prefix,
+                )
+            )
+        return differences
+    if saved != expected:
+        return [prefix or "<root>"]
+    return []
+
+
+def _semantic_mismatch_reason(
+    identity_version: int | None,
+    saved_semantic: Mapping[str, Any],
+    expected_semantic: Mapping[str, Any],
+    runtime_batch_only: bool = False,
+) -> str:
+    """Describe bounded deterministic semantic differences."""
+    differences = _semantic_difference_paths(saved_semantic, expected_semantic)
+    displayed = differences[:MAX_SEMANTIC_DIFFERENCE_PATHS]
+    remaining = len(differences) - len(displayed)
+    paths = ", ".join(displayed)
+    if remaining:
+        paths = f"{paths}, and {remaining} more"
+    version_label = _config_hash_version_label(identity_version)
+    scope = "beyond the runtime batch" if runtime_batch_only else ""
+    return (
+        "resolved configuration differs semantically "
+        f"{scope} for config hash version {version_label} at {paths}"
+    ).replace("  ", " ")
+
+
+def _versioned_runtime_batch_compatibility(
     path: Path,
     completion: Mapping[str, Any],
     expected_config: Mapping[str, Any],
 ) -> CompletionCompatibility:
-    """Validate a historical config whose batch was runtime-mutated."""
+    """Validate one completed configuration under its stored schema."""
     try:
-        saved_config = _load_saved_completion_config(path, completion)
-        multitask = bool(saved_config.get("multitask"))
-    except ValueError as exc:
-        return _compatibility_failure(
-            str(exc),
+        saved_config, identity_version = _load_saved_completion_config(
+            path,
             completion,
         )
+        multitask = bool(saved_config.get("multitask"))
+        saved_semantic = build_run_semantic_config_for_version(
+            saved_config,
+            multitask,
+            identity_version,
+            apply_historical_defaults=True,
+        )
+        expected_semantic = build_run_semantic_config_for_version(
+            expected_config,
+            bool(expected_config.get("multitask")),
+            identity_version,
+            apply_historical_defaults=True,
+        )
+    except ValueError as exc:
+        return _compatibility_failure(str(exc), completion)
 
-    saved_semantic = build_run_semantic_config(saved_config, multitask)
-    expected_semantic = build_run_semantic_config(
-        expected_config,
-        bool(expected_config.get("multitask")),
-    )
+    version_label = _config_hash_version_label(identity_version)
     if saved_semantic == expected_semantic:
+        mode = (
+            "legacy_semantic_compatible"
+            if identity_version is None
+            else "versioned_semantic_compatible"
+        )
         return CompletionCompatibility(
             compatible=True,
-            mode="legacy_semantic_compatible",
-            reason="accepted a semantically identical legacy completion",
+            mode=mode,
+            reason=(
+                "accepted a semantically identical completion for config "
+                f"hash version {version_label}"
+            ),
             completion=completion,
         )
 
@@ -794,7 +917,11 @@ def _legacy_runtime_batch_compatibility(
     )
     if not isinstance(adaptive, dict) or not adaptive.get("enabled"):
         return _compatibility_failure(
-            "resolved configuration did not enable adaptive batching",
+            _semantic_mismatch_reason(
+                identity_version,
+                saved_semantic,
+                expected_semantic,
+            ),
             completion,
         )
     saved_data = saved_config.get("data")
@@ -823,17 +950,34 @@ def _legacy_runtime_batch_compatibility(
             completion,
         )
 
-    saved_semantic["data"]["batch_size"] = requested_batch
-    if saved_semantic != expected_semantic:
+    semantic_data = saved_semantic.get("data")
+    if not isinstance(semantic_data, dict):
         return _compatibility_failure(
-            "resolved configuration differs beyond the runtime batch",
+            "versioned semantic data configuration is missing or invalid",
             completion,
         )
+    semantic_data["batch_size"] = requested_batch
+    if saved_semantic != expected_semantic:
+        return _compatibility_failure(
+            _semantic_mismatch_reason(
+                identity_version,
+                saved_semantic,
+                expected_semantic,
+                runtime_batch_only=True,
+            ),
+            completion,
+        )
+    mode = (
+        "legacy_runtime_batch_compatible"
+        if identity_version is None
+        else "versioned_runtime_batch_compatible"
+    )
     return CompletionCompatibility(
         compatible=True,
-        mode="legacy_runtime_batch_compatible",
+        mode=mode,
         reason=(
-            "accepted historical completion with runtime-mutated batch"
+            "accepted historical completion with runtime-mutated batch for "
+            f"config hash version {version_label}"
         ),
         completion=completion,
     )
@@ -905,7 +1049,8 @@ def check_completion_compatibility(
 
     canonical_campaign = completion.get("campaign_hash") == campaign_hash
     if (
-        completion.get("config_hash") == expected_hash
+        completion.get("config_hash_version") is None
+        and completion.get("config_hash") == expected_hash
         and canonical_campaign
     ):
         return CompletionCompatibility(
@@ -928,7 +1073,7 @@ def check_completion_compatibility(
             completion,
             terminal=True,
         )
-    legacy = _legacy_runtime_batch_compatibility(
+    legacy = _versioned_runtime_batch_compatibility(
         path,
         completion,
         expected_config,
@@ -1238,7 +1383,7 @@ def _validate_artifact_completion_config(
     ValueError
         If the resolved configuration cannot prove the completion provenance.
     """
-    saved_config = _load_saved_completion_config(path, completion)
+    saved_config, _ = _load_saved_completion_config(path, completion)
     saved_seeds = saved_config.get("seeds")
     if saved_seeds != [seed]:
         raise ValueError(

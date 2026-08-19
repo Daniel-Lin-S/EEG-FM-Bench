@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from types import MappingProxyType
 from typing import Any, Mapping, MutableMapping, Optional
 
 
@@ -68,6 +69,99 @@ INVOCATION_HPO_FIELDS = frozenset({
     "patience",
     "progressive",
 })
+VERSION_FOUR_EXTRACTOR_RUNTIME_PATHS = frozenset({
+    "data.batch_size",
+    "data.load_batch_size",
+    "model.extractor.n_jobs",
+})
+RUN_IDENTITY_RUNTIME_PATHS = MappingProxyType({
+    2: frozenset(),
+    3: frozenset({"data.num_workers", "data.pin_memory"}),
+    4: frozenset({"data.num_workers", "data.pin_memory"}),
+    5: frozenset({
+        "data.feature_batch_size",
+        "data.load_batch_size",
+        "data.memory_limit_gib",
+        "data.num_workers",
+        "data.pin_memory",
+        "data.scratch_dir",
+        "model.extractor.n_jobs",
+        "training.adaptive_batching",
+    }),
+})
+RUN_IDENTITY_MODEL_RUNTIME_PATHS = MappingProxyType({
+    2: MappingProxyType({}),
+    3: MappingProxyType({}),
+    4: MappingProxyType({
+        "catch22": VERSION_FOUR_EXTRACTOR_RUNTIME_PATHS,
+        "minirocket": VERSION_FOUR_EXTRACTOR_RUNTIME_PATHS,
+        "naive": frozenset({"data.batch_size"}),
+    }),
+    5: MappingProxyType({
+        "catch22": frozenset({"data.batch_size"}),
+        "minirocket": frozenset({"data.batch_size"}),
+        "naive": frozenset({"data.batch_size"}),
+    }),
+})
+RUN_IDENTITY_SEMANTIC_ALIASES = MappingProxyType({
+    2: MappingProxyType({}),
+    3: MappingProxyType({}),
+    4: MappingProxyType({}),
+    5: MappingProxyType({
+        "model.classifier.ridge_alphas": "model.classifier.alphas",
+        "model.classifier.ridge_selection_metric": (
+            "model.classifier.selection_metric"
+        ),
+        "model.minirocket_max_dilations_per_kernel": (
+            "model.extractor.max_dilations_per_kernel"
+        ),
+        "model.minirocket_num_features": "model.extractor.num_features",
+        "model.minirocket_source_path": "model.extractor.source_path",
+        "model.ridge_alphas": "model.classifier.alphas",
+        "model.ridge_selection_metric": "model.classifier.selection_metric",
+    }),
+})
+RUN_IDENTITY_INACTIVE_TRAINING_PATHS = MappingProxyType({
+    2: frozenset(),
+    3: frozenset(),
+    4: frozenset(),
+    5: frozenset({"training.encoder_lr_scale"}),
+})
+SUPPORTED_CONFIG_HASH_VERSIONS = frozenset(RUN_IDENTITY_RUNTIME_PATHS)
+HISTORICAL_RUN_SEMANTIC_DEFAULTS = MappingProxyType({
+    2: MappingProxyType({}),
+    3: MappingProxyType({}),
+    4: MappingProxyType({}),
+    5: MappingProxyType({}),
+})
+
+
+def _versioned_runtime_paths(identity_version: int) -> frozenset[str]:
+    """Return runtime-only paths excluded by one historical schema."""
+    try:
+        return RUN_IDENTITY_RUNTIME_PATHS[identity_version]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported identity version: {identity_version}"
+        ) from exc
+
+
+def _versioned_model_runtime_paths(
+    identity_version: int,
+    model_type: object,
+) -> frozenset[str]:
+    """Return model runtime paths excluded by one historical schema."""
+    if not isinstance(model_type, str):
+        return frozenset()
+    try:
+        return RUN_IDENTITY_MODEL_RUNTIME_PATHS[identity_version].get(
+            model_type,
+            frozenset(),
+        )
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported identity version: {identity_version}"
+        ) from exc
 
 
 def _json_copy(value: Any) -> Any:
@@ -231,9 +325,10 @@ def _set_dotted_path(
 
 def _normalize_semantic_config_paths(
     semantic: MutableMapping[str, Any],
+    path_aliases: Mapping[str, str] = SEMANTIC_CONFIG_PATH_ALIASES,
 ) -> None:
-    """Canonicalize all registered historical semantic parameter paths."""
-    for legacy_path, canonical_path in SEMANTIC_CONFIG_PATH_ALIASES.items():
+    """Canonicalize registered semantic parameter paths in place."""
+    for legacy_path, canonical_path in path_aliases.items():
         legacy_exists, legacy_value = _get_dotted_path(
             semantic,
             legacy_path,
@@ -521,6 +616,163 @@ def build_run_semantic_config(
     semantic["effective_seed"] = seeds[0]
     semantic["multitask"] = bool(multitask)
     return semantic
+
+
+def _normalize_historical_run_config(
+    config: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Normalize a scalar historical seed for semantic comparison."""
+    normalized = _json_copy(config)
+    if "seed" not in normalized:
+        return normalized
+    if "seeds" in normalized:
+        raise ValueError("saved configuration contains both seed and seeds")
+    seed = normalized.pop("seed")
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise ValueError(f"saved configuration has invalid seed {seed!r}")
+    normalized["seeds"] = [seed]
+    return normalized
+
+
+def _versioned_base_semantic_config(
+    config: Mapping[str, Any],
+    identity_version: int | None,
+) -> dict[str, Any]:
+    """Return semantic configuration under one immutable schema."""
+    semantic = _json_copy(config)
+    if not isinstance(semantic, dict):
+        raise TypeError("Expected the resolved configuration to be a mapping.")
+    for field in INVOCATION_CONFIG_FIELDS:
+        semantic.pop(field, None)
+    if identity_version is None:
+        _normalize_semantic_config_paths(semantic)
+        _remove_runtime_fields(semantic)
+        _remove_model_runtime_fields(semantic)
+        _remove_inactive_training_fields(semantic)
+        return semantic
+    _normalize_semantic_config_paths(
+        semantic,
+        RUN_IDENTITY_SEMANTIC_ALIASES[identity_version],
+    )
+    for dotted_path in _versioned_runtime_paths(identity_version):
+        _remove_dotted_path(semantic, dotted_path)
+    model_type = semantic.get("model_type")
+    for dotted_path in _versioned_model_runtime_paths(
+        identity_version,
+        model_type,
+    ):
+        _remove_dotted_path(semantic, dotted_path)
+    training = semantic.get("training")
+    if isinstance(training, Mapping) and training.get("freeze_encoder") is True:
+        for dotted_path in RUN_IDENTITY_INACTIVE_TRAINING_PATHS[
+            identity_version
+        ]:
+            _remove_dotted_path(semantic, dotted_path)
+    return semantic
+
+
+def _apply_historical_run_defaults(
+    semantic: MutableMapping[str, Any],
+    identity_version: int | None,
+) -> None:
+    """Apply documented historical behavior for newly added fields."""
+    if identity_version is None:
+        return
+    for dotted_path, default_value in (
+        HISTORICAL_RUN_SEMANTIC_DEFAULTS[identity_version].items()
+    ):
+        exists, _ = _get_dotted_path(semantic, dotted_path)
+        if not exists:
+            _set_dotted_path(
+                semantic,
+                dotted_path,
+                _json_copy(default_value),
+            )
+
+
+def build_run_semantic_config_for_version(
+    config: Mapping[str, Any],
+    multitask: bool,
+    identity_version: int | None,
+    apply_historical_defaults: bool = False,
+) -> dict[str, Any]:
+    """Return semantic configuration under one stored identity schema.
+
+    Parameters
+    ----------
+    config : Mapping[str, Any]
+        Resolved saved or selected trainer configuration.
+    multitask : bool
+        Whether the final trainer jointly evaluates multiple datasets.
+    identity_version : int or None
+        Stored config identity version. ``None`` denotes the original
+        unversioned twelve-character hash format.
+    apply_historical_defaults : bool, optional, default=False
+        Whether defaults declared for fields added after this schema are
+        materialized before semantic comparison.
+
+    Returns
+    -------
+    dict[str, Any]
+        Detached version-specific semantic configuration.
+
+    Raises
+    ------
+    ValueError
+        If the version is unsupported or the effective seed is invalid.
+    """
+    if (
+        identity_version is not None
+        and identity_version not in SUPPORTED_CONFIG_HASH_VERSIONS
+    ):
+        supported = ", ".join(
+            str(version) for version in sorted(SUPPORTED_CONFIG_HASH_VERSIONS)
+        )
+        raise ValueError(
+            "unsupported config hash version "
+            f"{identity_version}; supported versions are {supported}"
+        )
+    normalized = _normalize_historical_run_config(config)
+    seeds = normalized.get("seeds")
+    if (
+        not isinstance(seeds, list)
+        or len(seeds) != 1
+        or isinstance(seeds[0], bool)
+        or not isinstance(seeds[0], int)
+    ):
+        raise ValueError(
+            "A final run identity requires exactly one integer effective seed."
+        )
+    semantic = _versioned_base_semantic_config(normalized, identity_version)
+    if identity_version is None or identity_version >= 4:
+        if not multitask:
+            data_config = semantic.get("data")
+            if not isinstance(data_config, dict):
+                raise ValueError(
+                    "A separate-task run requires a data configuration "
+                    "mapping."
+                )
+            data_config.pop("datasets", None)
+    semantic["effective_seed"] = seeds[0]
+    semantic["multitask"] = bool(multitask)
+    if apply_historical_defaults:
+        _apply_historical_run_defaults(semantic, identity_version)
+    return semantic
+
+
+def get_run_identity_for_version(
+    config: Mapping[str, Any],
+    multitask: bool,
+    identity_version: int,
+) -> str:
+    """Return the stored full identity for one historical schema version."""
+    return semantic_digest(
+        build_run_semantic_config_for_version(
+            config,
+            multitask,
+            identity_version,
+        )
+    )
 
 
 def get_campaign_identity(

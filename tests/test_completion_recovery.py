@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+from types import MappingProxyType
 from pathlib import Path
 
 import pytest
@@ -35,7 +36,12 @@ from baseline.utils.run_artifacts import (
     get_config_hash,
     save_resolved_config,
 )
-from baseline.utils.identity import get_legacy_run_hash
+import baseline.utils.identity as identity_module
+from baseline.utils.identity import (
+    SUPPORTED_CONFIG_HASH_VERSIONS,
+    get_legacy_run_hash,
+    get_run_identity_for_version,
+)
 
 
 DATASET_NAME = "adftd"
@@ -83,6 +89,7 @@ def _write_completion(
     config_identity: str | None = None,
     invocation_id: str | None = None,
     diagnostics: dict | None = None,
+    config_hash_version: int | None = None,
 ) -> Path:
     """Write one completion and its required checkpoint artifact."""
     path = _completion_path(root, config_identity)
@@ -104,6 +111,8 @@ def _write_completion(
         content["invocation_id"] = invocation_id
     if diagnostics is not None:
         content["diagnostics"] = diagnostics
+    if config_hash_version is not None:
+        content["config_hash_version"] = config_hash_version
     path.write_text(json.dumps(content), encoding="utf-8")
     return path
 
@@ -221,7 +230,7 @@ def test_short_campaign_alias_requires_full_semantic_config(
     )
 
     assert accepted.compatible is True
-    assert accepted.mode == "legacy_semantic_compatible"
+    assert accepted.mode == "versioned_semantic_compatible"
 
 
 def test_namespaced_completion_is_ignored(
@@ -316,7 +325,7 @@ def test_legacy_runtime_batch_is_recovered_read_only(
     )
 
     assert result.compatible is True
-    assert result.mode == "legacy_runtime_batch_compatible"
+    assert result.mode == "versioned_runtime_batch_compatible"
     assert path.read_text(encoding="utf-8") == original_completion
 
 
@@ -901,3 +910,249 @@ def test_partial_multitask_completion_recovers_from_shared_csv(
         f"{second_dataset}/test/loss": 0.8,
     }
     assert completion["checkpoint_path"] is None
+
+
+@pytest.mark.parametrize(
+    "identity_version",
+    sorted(SUPPORTED_CONFIG_HASH_VERSIONS),
+)
+def test_versioned_completed_configurations_are_reused(
+    tmp_path: Path,
+    identity_version: int,
+) -> None:
+    """Every recorded identity schema reuses matching final results."""
+    selected = _selected_config()
+    config_hash = get_run_identity_for_version(
+        selected,
+        multitask=False,
+        identity_version=identity_version,
+    )
+    _save_legacy_config(tmp_path, selected)
+    path = _write_completion(
+        tmp_path,
+        config_hash,
+        config_hash_version=identity_version,
+    )
+    original_completion = path.read_bytes()
+
+    result = check_completion_compatibility(
+        path,
+        CAMPAIGN_HASH,
+        SEED,
+        selected,
+    )
+
+    assert result.compatible is True
+    assert result.mode == "versioned_semantic_compatible"
+    assert path.read_bytes() == original_completion
+
+
+def test_unversioned_twelve_character_completion_is_reused(
+    tmp_path: Path,
+) -> None:
+    """The pre-identity twelve-character format remains compatible."""
+    selected = _selected_config()
+    _save_legacy_config(tmp_path, selected)
+    path = _write_completion(
+        tmp_path,
+        get_legacy_run_hash(selected, multitask=False),
+    )
+
+    result = check_completion_compatibility(
+        path,
+        CAMPAIGN_HASH,
+        SEED,
+        selected,
+    )
+
+    assert result.compatible is True
+    assert result.mode == "legacy_semantic_compatible"
+
+
+def test_historical_semantic_defaults_require_the_default_value(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing historical semantic field matches only its old default."""
+    defaults = dict(identity_module.HISTORICAL_RUN_SEMANTIC_DEFAULTS)
+    defaults[2] = MappingProxyType({"model.future_flag": False})
+    monkeypatch.setattr(
+        identity_module,
+        "HISTORICAL_RUN_SEMANTIC_DEFAULTS",
+        MappingProxyType(defaults),
+    )
+    saved = _selected_config()
+    selected = copy.deepcopy(saved)
+    selected["model"]["future_flag"] = False
+    _save_legacy_config(tmp_path, saved)
+    path = _write_completion(
+        tmp_path,
+        get_run_identity_for_version(saved, False, 2),
+        config_hash_version=2,
+    )
+
+    accepted = check_completion_compatibility(
+        path,
+        CAMPAIGN_HASH,
+        SEED,
+        selected,
+    )
+    assert accepted.compatible is True
+
+    selected["model"]["future_flag"] = True
+    rejected = check_completion_compatibility(
+        path,
+        CAMPAIGN_HASH,
+        SEED,
+        selected,
+    )
+    assert rejected.compatible is False
+    assert "model.future_flag" in rejected.reason
+
+
+def test_versioned_hash_failures_explain_the_recorded_schema(
+    tmp_path: Path,
+) -> None:
+    """Unknown and invalid historical hashes fail without ambiguity."""
+    selected = _selected_config()
+    _save_legacy_config(tmp_path, selected)
+    path = _write_completion(
+        tmp_path,
+        "0" * 64,
+        config_hash_version=2,
+    )
+
+    invalid = check_completion_compatibility(
+        path,
+        CAMPAIGN_HASH,
+        SEED,
+        selected,
+    )
+    assert invalid.compatible is False
+    assert "config hash version 2" in invalid.reason
+    assert "recomputed" in invalid.reason
+
+    completion = json.loads(path.read_text(encoding="utf-8"))
+    completion["config_hash_version"] = 99
+    path.write_text(json.dumps(completion), encoding="utf-8")
+    unsupported = check_completion_compatibility(
+        path,
+        CAMPAIGN_HASH,
+        SEED,
+        selected,
+    )
+    assert unsupported.compatible is False
+    assert "unsupported config hash version 99" in unsupported.reason
+
+
+def test_v2_completion_skips_its_resolved_final_scope(
+    tmp_path: Path,
+) -> None:
+    """A v2 completion prevents a duplicate final dataset run."""
+    selected = _selected_config()
+    _save_legacy_config(tmp_path, selected)
+    _write_completion(
+        tmp_path,
+        get_run_identity_for_version(selected, False, 2),
+        config_hash_version=2,
+    )
+    paths = CampaignPaths(tmp_path, tmp_path / "checkpoints")
+
+    _, _, complete = _scope_artifact_roots(
+        paths,
+        CAMPAIGN_HASH,
+        SEED,
+        selected,
+    )
+
+    assert complete is True
+
+
+def test_versioned_semantic_mismatch_protects_final_artifacts(
+    tmp_path: Path,
+) -> None:
+    """A true v2 mismatch remains terminal and identifies its path."""
+    saved = _selected_config()
+    _save_legacy_config(tmp_path, saved)
+    _write_completion(
+        tmp_path,
+        get_run_identity_for_version(saved, False, 2),
+        config_hash_version=2,
+    )
+    selected = copy.deepcopy(saved)
+    selected["model"]["classifier_head"]["hidden_dims"] = [64]
+    paths = CampaignPaths(tmp_path, tmp_path / "checkpoints")
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "config hash version 2 at "
+            "model.classifier_head.hidden_dims"
+        ),
+    ):
+        _scope_artifact_roots(
+            paths,
+            CAMPAIGN_HASH,
+            SEED,
+            selected,
+        )
+
+
+def test_v2_metadata_with_preidentity_hash_is_reused(
+    tmp_path: Path,
+) -> None:
+    """A v2 metadata envelope may preserve a pre-identity hash."""
+    selected = _selected_config()
+    _save_legacy_config(tmp_path, selected)
+    path = _write_completion(
+        tmp_path,
+        get_legacy_run_hash(selected, multitask=False),
+        config_hash_version=2,
+    )
+
+    result = check_completion_compatibility(
+        path,
+        CAMPAIGN_HASH,
+        SEED,
+        selected,
+    )
+
+    assert result.compatible is True
+    assert result.mode == "legacy_semantic_compatible"
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "reason"),
+    [
+        ("seed", SEED + 1, "seed does not match"),
+        ("dataset_config", "different", "dataset configuration does not match"),
+    ],
+)
+def test_versioned_seed_and_dataset_conflicts_are_terminal(
+    tmp_path: Path,
+    field: str,
+    value: int | str,
+    reason: str,
+) -> None:
+    """A versioned completion cannot stand in for another final pair."""
+    selected = _selected_config()
+    _save_legacy_config(tmp_path, selected)
+    path = _write_completion(
+        tmp_path,
+        get_run_identity_for_version(selected, False, 2),
+        config_hash_version=2,
+    )
+    completion = json.loads(path.read_text(encoding="utf-8"))
+    completion[field] = value
+    path.write_text(json.dumps(completion), encoding="utf-8")
+
+    result = check_completion_compatibility(
+        path,
+        CAMPAIGN_HASH,
+        SEED,
+        selected,
+    )
+
+    assert result.compatible is False
+    assert result.terminal is True
+    assert reason in result.reason
