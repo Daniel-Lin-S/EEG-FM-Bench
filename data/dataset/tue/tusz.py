@@ -40,6 +40,7 @@ class TuszConfig(EEGConfig):
     dataset_name: Optional[str] = 'tusz'
     task_type: DatasetTaskType = DatasetTaskType.SEIZURE
     file_ext: str = 'edf'
+    position_montage: Optional[str] = 'standard_1020'
     montage: dict[str, list[str]] = field(default_factory=lambda: {
         '01_tcp_ar': [
             'EEG FP1-REF',

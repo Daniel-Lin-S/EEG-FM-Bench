@@ -8,6 +8,7 @@ from data.dataset.tue.tuab import TuabConfig
 from data.dataset.tue.tuar import TuarConfig
 from data.dataset.tue.tuep import TuepV200Config
 from data.dataset.tue.tusl import TuslConfig
+from data.dataset.tue.tusz import TuszConfig
 from data.dataset.tue.tuev import TuevConfig
 from data.processor.montage import resolve_electrode_positions
 
@@ -88,6 +89,7 @@ class MontagePositionTests(unittest.TestCase):
             TuepV200Config(),
             TuarConfig(),
             TuslConfig(),
+            TuszConfig(),
             TuevConfig(),
         )
         for config in configs:
