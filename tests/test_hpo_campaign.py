@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 import sys
@@ -19,6 +20,7 @@ from baseline.abstract.trainer import AbstractTrainer, HpoStopReason
 from baseline.brainomni.brainomni_config import BrainOmniConfig
 from baseline.hpo.artifacts import (
     CampaignPaths,
+    build_campaign_paths,
     collect_test_rows,
     failure_fingerprint,
     get_campaign_hash,
@@ -49,6 +51,10 @@ from baseline.hpo.search import (
     validate_search_space,
 )
 from baseline.registry import register_builtin_models
+from baseline.utils.identity import (
+    get_campaign_identity,
+    get_run_identity,
+)
 from baseline_main import _load_configs, _normalize_legacy_seed
 from common.utils import setup_yaml
 
@@ -505,6 +511,72 @@ def test_single_task_and_multitask_hpo_scopes_and_paths(
     assert list(_study_scope_configs(base)) == ["multitask"]
     assert _hpo_scope_root(tmp_path, "multitask") == (
         tmp_path / "hpo" / "multitask"
+    )
+
+
+def test_runtime_hpo_controls_preserve_artifact_identities(
+    tmp_path: Path,
+) -> None:
+    """Progressive and memory diagnostics do not create new roots."""
+    config = BrainOmniConfig(
+        fs=TEST_FS,
+        seeds=[42],
+        data={"datasets": {"alpha": "finetune"}},
+    ).model_dump(mode="json")
+    hpo_with_default = make_hpo_config().model_dump(mode="json")
+    hpo_without_top_region = copy.deepcopy(hpo_with_default)
+    hpo_without_top_region["progressive"].pop("top_region_size")
+    hpo_with_top_region = copy.deepcopy(hpo_without_top_region)
+    hpo_with_top_region["progressive"]["top_region_size"] = 3
+
+    current_campaign = get_campaign_identity(
+        config,
+        hpo_without_top_region,
+    )
+    proposed_campaign = get_campaign_identity(
+        config,
+        hpo_with_top_region,
+    )
+    assert proposed_campaign == current_campaign
+
+    current_paths = build_campaign_paths(
+        str(tmp_path),
+        config["model_type"],
+        config["logging"]["experiment_name"],
+        current_campaign,
+    )
+    proposed_paths = build_campaign_paths(
+        str(tmp_path),
+        config["model_type"],
+        config["logging"]["experiment_name"],
+        proposed_campaign,
+    )
+    assert proposed_paths == current_paths
+
+    current_runner = CampaignRunner.__new__(CampaignRunner)
+    current_runner.campaign_hash = current_campaign
+    proposed_runner = CampaignRunner.__new__(CampaignRunner)
+    proposed_runner.campaign_hash = proposed_campaign
+    assert proposed_runner._study_identity("alpha") == (
+        current_runner._study_identity("alpha")
+    )
+
+    runtime_profile_config = copy.deepcopy(config)
+    runtime_profile_config["training"]["adaptive_batching"].update({
+        "memory_model_version": 2,
+        "promotion_reason": "head_only_measured_promotion",
+        "training_memory_mode": "head_only",
+        "successful_memory_observations": [{
+            "micro_batch_size": 32,
+            "measured_peak_reserved_bytes": 933,
+        }],
+    })
+    assert get_campaign_identity(
+        runtime_profile_config,
+        hpo_with_top_region,
+    ) == current_campaign
+    assert get_run_identity(runtime_profile_config, False) == (
+        get_run_identity(config, False)
     )
 
 
@@ -1644,6 +1716,77 @@ def test_progressive_hpo_unresolved_outcome_continues() -> None:
 
     assert assessment.outcome == "responsive_unresolved"
     assert assessment.should_expand is True
+
+
+@pytest.mark.parametrize(
+    ("direction", "objectives"),
+    [
+        ("minimize", [0.500, 0.504, 0.508, 1.500]),
+        ("maximize", [1.500, 1.496, 1.492, 0.500]),
+    ],
+)
+def test_progressive_stable_top_region_stops(
+    direction: str,
+    objectives: list[float],
+) -> None:
+    """Three stable tied leaders stop despite poor tail variation."""
+    trials = [
+        {
+            "objective": objective,
+            "objective_history": [
+                {"epoch": epoch, "value": objective}
+                for epoch in range(5)
+            ],
+        }
+        for objective in objectives
+    ]
+
+    assessment = assess_progressive_study(
+        trials,
+        direction,
+        ProgressiveHpoArgs(minimum_resolution=0.01),
+    )
+
+    assert assessment.outcome == "top_region_converged"
+    assert assessment.should_expand is False
+    assert assessment.top_region_size == 3
+    assert assessment.top_region_span == pytest.approx(0.008)
+    assert assessment.top_region_stable is True
+    assert assessment.semantics_version == 2
+
+
+def test_progressive_unstable_top_region_continues() -> None:
+    """A tied region cannot converge while one leading history drifts."""
+    objectives = [0.500, 0.504, 0.508, 1.500]
+    trials = [
+        {
+            "objective": objective,
+            "objective_history": [
+                {"epoch": epoch, "value": objective}
+                for epoch in range(5)
+            ],
+        }
+        for objective in objectives
+    ]
+    trials[1]["objective_history"] = [
+        {"epoch": epoch, "value": 0.544 - epoch * 0.01}
+        for epoch in range(5)
+    ]
+
+    assessment = assess_progressive_study(
+        trials,
+        "minimize",
+        ProgressiveHpoArgs(minimum_resolution=0.01),
+    )
+
+    assert assessment.outcome == "responsive_unresolved"
+    assert assessment.should_expand is True
+    assert assessment.top_region_stable is False
+
+
+def test_progressive_default_top_region_size_is_three() -> None:
+    """The less-conservative convergence evidence uses three leaders."""
+    assert ProgressiveHpoArgs().top_region_size == 3
 
 
 def test_auto_filter_encoder_lr_scale_for_frozen_encoder() -> None:

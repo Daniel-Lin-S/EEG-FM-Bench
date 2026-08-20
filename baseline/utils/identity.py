@@ -760,6 +760,25 @@ def build_run_semantic_config_for_version(
     return semantic
 
 
+def build_run_compatibility_config(
+    config: Mapping[str, Any],
+    multitask: bool,
+    identity_version: int | None,
+) -> dict[str, Any]:
+    """Return result-affecting fields for completed-run reuse only."""
+    semantic = build_run_semantic_config_for_version(
+        config,
+        multitask,
+        identity_version,
+        apply_historical_defaults=True,
+    )
+    _normalize_semantic_config_paths(semantic)
+    _remove_runtime_fields(semantic)
+    _remove_model_runtime_fields(semantic)
+    _remove_inactive_training_fields(semantic)
+    return semantic
+
+
 def get_run_identity_for_version(
     config: Mapping[str, Any],
     multitask: bool,

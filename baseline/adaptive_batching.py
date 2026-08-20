@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Sequence
 
 import torch
 from torch import nn
@@ -18,6 +18,10 @@ from torch import nn
 
 BYTES_PER_OPTIMIZER_STATE_VALUE = 4
 ADAMW_STATE_VALUES_PER_PARAMETER = 2
+MEASURED_MEMORY_MODEL_VERSION = 2
+FULL_MEMORY_MODE = "full"
+HEAD_ONLY_MEMORY_MODE = "head_only"
+LORA_MEMORY_MODE = "lora"
 
 
 @dataclass(frozen=True)
@@ -173,6 +177,185 @@ def select_safe_micro_batch(
     return candidates[-1], predicted_one
 
 
+def select_measured_micro_batch(
+    candidates: list[int],
+    observations: Sequence[Mapping[str, Any]],
+    fixed_bytes: int,
+    process_limit_bytes: int,
+    uncertainty_factor: float = 1.0,
+) -> tuple[int, int] | None:
+    """Select a candidate from distinct measured reserved-memory peaks.
+
+    Parameters
+    ----------
+    candidates : list[int]
+        Exact per-rank batch divisors in descending order.
+    observations : sequence of mappings
+        Successful measurements containing ``micro_batch_size`` and
+        ``measured_peak_reserved_bytes``.
+    fixed_bytes : int
+        Analytical lower bound for persistent training memory.
+    process_limit_bytes : int
+        Current allocator ceiling after occupancy and reserve handling.
+    uncertainty_factor : float, optional, default=1.0
+        Multiplier applied to the fitted sample-scaled memory slope.
+
+    Returns
+    -------
+    tuple[int, int] or None
+        Selected candidate and predicted reserved peak, or ``None`` when
+        fewer than two distinct usable observations are available.
+    """
+    if not candidates:
+        raise ValueError("Expected at least one micro-batch candidate.")
+    if fixed_bytes < 0 or process_limit_bytes < 0:
+        raise ValueError("CUDA memory byte counts cannot be negative.")
+    if not math.isfinite(uncertainty_factor) or uncertainty_factor < 1.0:
+        raise ValueError(
+            "Expected uncertainty_factor >= 1, but got "
+            f"{uncertainty_factor}."
+        )
+
+    peaks_by_batch: dict[int, int] = {}
+    for index, observation in enumerate(observations):
+        micro_batch = observation.get("micro_batch_size")
+        peak_bytes = observation.get("measured_peak_reserved_bytes")
+        if (
+            isinstance(micro_batch, bool)
+            or not isinstance(micro_batch, int)
+            or micro_batch <= 0
+            or isinstance(peak_bytes, bool)
+            or not isinstance(peak_bytes, int)
+            or peak_bytes <= 0
+        ):
+            raise ValueError(
+                "Expected positive integer memory observation values at "
+                f"index {index}, but got batch={micro_batch!r}, "
+                f"peak={peak_bytes!r}."
+            )
+        peaks_by_batch[micro_batch] = max(
+            peak_bytes,
+            peaks_by_batch.get(micro_batch, 0),
+        )
+    if len(peaks_by_batch) < 2:
+        return None
+
+    points = sorted(peaks_by_batch.items())
+    slopes = [
+        (right_peak - left_peak) / (right_batch - left_batch)
+        for left_index, (left_batch, left_peak) in enumerate(points)
+        for right_batch, right_peak in points[left_index + 1:]
+        if right_peak > left_peak
+    ]
+    if not slopes:
+        return None
+    bytes_per_sample = max(slopes)
+    intercept = max(
+        float(fixed_bytes),
+        max(
+            peak_bytes - bytes_per_sample * micro_batch
+            for micro_batch, peak_bytes in points
+        ),
+    )
+    for candidate in candidates:
+        predicted = math.ceil(
+            intercept
+            + uncertainty_factor * bytes_per_sample * candidate
+        )
+        if predicted <= process_limit_bytes:
+            return candidate, predicted
+    predicted_one = math.ceil(
+        intercept + uncertainty_factor * bytes_per_sample
+    )
+    return candidates[-1], predicted_one
+
+
+def merge_memory_observation(
+    observations: Sequence[Mapping[str, Any]],
+    observation: Mapping[str, Any],
+) -> list[dict[str, int]]:
+    """Return conservative successful peaks indexed by micro-batch size."""
+    merged: dict[int, dict[str, int]] = {}
+    for index, candidate in enumerate([*observations, observation]):
+        micro_batch = candidate.get("micro_batch_size")
+        reserved = candidate.get("measured_peak_reserved_bytes")
+        allocated = candidate.get("measured_peak_allocated_bytes")
+        if (
+            isinstance(micro_batch, bool)
+            or not isinstance(micro_batch, int)
+            or micro_batch <= 0
+            or isinstance(reserved, bool)
+            or not isinstance(reserved, int)
+            or reserved <= 0
+        ):
+            raise ValueError(
+                "Expected positive integer memory observation values at "
+                f"index {index}, but got batch={micro_batch!r}, "
+                f"peak={reserved!r}."
+            )
+        payload = {
+            "micro_batch_size": micro_batch,
+            "measured_peak_reserved_bytes": reserved,
+        }
+        if (
+            not isinstance(allocated, bool)
+            and isinstance(allocated, int)
+            and allocated > 0
+        ):
+            payload["measured_peak_allocated_bytes"] = allocated
+        elif allocated is not None:
+            raise ValueError(
+                "Expected a positive allocated-memory observation at "
+                f"index {index}, but got {allocated!r}."
+            )
+        previous = merged.get(micro_batch)
+        if previous is None or reserved > previous[
+            "measured_peak_reserved_bytes"
+        ]:
+            merged[micro_batch] = payload
+    return [merged[key] for key in sorted(merged)]
+
+
+def remove_memory_observation(
+    observations: Sequence[Mapping[str, Any]],
+    micro_batch_size: int,
+) -> list[dict[str, int]]:
+    """Remove a candidate invalidated by an actual training OOM."""
+    if (
+        isinstance(micro_batch_size, bool)
+        or not isinstance(micro_batch_size, int)
+        or micro_batch_size <= 0
+    ):
+        raise ValueError(
+            "Expected a positive micro_batch_size, but got "
+            f"{micro_batch_size}."
+        )
+    retained = [
+        observation
+        for observation in observations
+        if observation.get("micro_batch_size") != micro_batch_size
+    ]
+    if not retained:
+        return []
+    first, *remaining = retained
+    merged = merge_memory_observation([], first)
+    for observation in remaining:
+        merged = merge_memory_observation(merged, observation)
+    return merged
+
+
+def resolve_training_memory_mode(
+    freeze_encoder: bool,
+    use_lora: bool,
+) -> str:
+    """Return the activation-memory policy after optimizer freezing."""
+    if use_lora:
+        return LORA_MEMORY_MODE
+    if freeze_encoder:
+        return HEAD_ONLY_MEMORY_MODE
+    return FULL_MEMORY_MODE
+
+
 def resolve_cuda_memory_limit(
     free_bytes: int,
     total_bytes: int,
@@ -244,6 +427,12 @@ def estimate_fixed_training_bytes(
         parameter.numel() * parameter.element_size()
         for parameter in model.parameters()
     )
+    trainable_parameter_bytes = sum(
+        parameter.numel() * parameter.element_size()
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
+    frozen_parameter_bytes = parameter_bytes - trainable_parameter_bytes
     trainable_elements = sum(
         parameter.numel()
         for parameter in model.parameters()
@@ -267,6 +456,8 @@ def estimate_fixed_training_bytes(
     )
     return {
         "parameter_bytes": parameter_bytes,
+        "trainable_parameter_bytes": trainable_parameter_bytes,
+        "frozen_parameter_bytes": frozen_parameter_bytes,
         "gradient_bytes": gradient_bytes,
         "optimizer_state_bytes": optimizer_bytes,
         "estimated_fixed_bytes": (

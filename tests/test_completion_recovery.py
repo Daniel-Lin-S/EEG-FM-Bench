@@ -947,6 +947,51 @@ def test_versioned_completed_configurations_are_reused(
     assert path.read_bytes() == original_completion
 
 
+def test_v2_completion_ignores_new_runtime_and_inactive_fields(
+    tmp_path: Path,
+) -> None:
+    """A v2 result is reusable when only result-invariant fields changed."""
+    saved = _selected_config()
+    saved["data"].pop("pin_memory")
+    saved_batching = saved["training"]["adaptive_batching"]
+    for field in (
+        "conservative_divisor_steps",
+        "max_probe_failures",
+        "memory_uncertainty_factor",
+        "temporary_cap_seconds",
+    ):
+        saved_batching.pop(field)
+    saved["training"]["freeze_encoder"] = True
+    saved["training"]["encoder_lr_scale"] = 0.75
+
+    selected = copy.deepcopy(saved)
+    selected["data"]["pin_memory"] = True
+    selected["training"]["adaptive_batching"].update({
+        "conservative_divisor_steps": 1,
+        "max_probe_failures": 2,
+        "memory_uncertainty_factor": 1.5,
+        "temporary_cap_seconds": 300,
+    })
+    selected["training"]["encoder_lr_scale"] = 0.5
+
+    _save_legacy_config(tmp_path, saved)
+    path = _write_completion(
+        tmp_path,
+        get_run_identity_for_version(saved, False, 2),
+        config_hash_version=2,
+    )
+
+    result = check_completion_compatibility(
+        path,
+        CAMPAIGN_HASH,
+        SEED,
+        selected,
+    )
+
+    assert result.compatible is True
+    assert result.mode == "versioned_semantic_compatible"
+
+
 def test_unversioned_twelve_character_completion_is_reused(
     tmp_path: Path,
 ) -> None:

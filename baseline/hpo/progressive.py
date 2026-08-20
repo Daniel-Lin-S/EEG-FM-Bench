@@ -1,8 +1,8 @@
 """Assess whether an Optuna study should stop or receive another block.
 
 Inputs are completed trial objectives and their epoch-level histories.
-Outputs distinguish flat, separated, and responsive-unresolved studies.
-No campaign artifacts or Optuna state are modified by this module.
+Outputs distinguish flat, separated, stable-top-region, and unresolved
+studies. No campaign artifacts or Optuna state are modified by this module.
 """
 
 from __future__ import annotations
@@ -17,8 +17,10 @@ from baseline.hpo.config import ProgressiveHpoArgs
 
 FLAT_OUTCOME = "flat"
 SEPARATED_OUTCOME = "separated"
+TOP_REGION_OUTCOME = "top_region_converged"
 UNRESOLVED_OUTCOME = "responsive_unresolved"
 INSUFFICIENT_OUTCOME = "insufficient_completed_trials"
+ASSESSMENT_SEMANTICS_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -32,6 +34,10 @@ class ProgressiveAssessment:
     between_trial_sd: float | None
     winner_gap: float | None
     incumbent_stable: bool
+    top_region_size: int
+    top_region_span: float | None
+    top_region_stable: bool
+    semantics_version: int
 
     def as_dict(self) -> dict[str, Any]:
         """Return a JSON-compatible diagnostic mapping."""
@@ -183,7 +189,7 @@ def _resolution_threshold(
     )
 
 
-def _incumbent_is_stable(
+def _trial_is_stable(
     trial: Mapping[str, Any],
     args: ProgressiveHpoArgs,
     threshold: float,
@@ -237,6 +243,10 @@ def assess_progressive_study(
             between_trial_sd=None,
             winner_gap=None,
             incumbent_stable=False,
+            top_region_size=args.top_region_size,
+            top_region_span=None,
+            top_region_stable=False,
+            semantics_version=ASSESSMENT_SEMANTICS_VERSION,
         )
 
     objectives = [float(trial["objective"]) for trial in clean_trials]
@@ -250,12 +260,32 @@ def assess_progressive_study(
         float(ordered[0]["objective"])
         - float(ordered[1]["objective"])
     )
-    stable = _incumbent_is_stable(ordered[0], args, threshold)
+    stable = _trial_is_stable(ordered[0], args, threshold)
+    top_region = ordered[:args.top_region_size]
+    top_region_complete = len(top_region) == args.top_region_size
+    top_region_span = None
+    top_region_stable = False
+    if top_region_complete:
+        top_region_span = abs(
+            float(top_region[-1]["objective"])
+            - float(top_region[0]["objective"])
+        )
+        top_region_stable = all(
+            _trial_is_stable(trial, args, threshold)
+            for trial in top_region
+        )
     if between_sd <= threshold:
         outcome = FLAT_OUTCOME
         should_expand = False
     elif winner_gap > threshold and stable:
         outcome = SEPARATED_OUTCOME
+        should_expand = False
+    elif (
+        top_region_span is not None
+        and top_region_span <= threshold
+        and top_region_stable
+    ):
+        outcome = TOP_REGION_OUTCOME
         should_expand = False
     else:
         outcome = UNRESOLVED_OUTCOME
@@ -268,4 +298,8 @@ def assess_progressive_study(
         between_trial_sd=between_sd,
         winner_gap=winner_gap,
         incumbent_stable=stable,
+        top_region_size=args.top_region_size,
+        top_region_span=top_region_span,
+        top_region_stable=top_region_stable,
+        semantics_version=ASSESSMENT_SEMANTICS_VERSION,
     )

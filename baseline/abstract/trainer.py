@@ -40,9 +40,11 @@ from torch.utils.data import DataLoader
 from baseline.abstract.adapter import AbstractDataLoaderFactory
 from baseline.abstract.config import AbstractConfig, BaseLoggingArgs
 from baseline.adaptive_batching import (
+    MEASURED_MEMORY_MODEL_VERSION,
     configure_cuda_allocator,
     estimate_fixed_training_bytes,
     profile_payload,
+    resolve_training_memory_mode,
 )
 from baseline.hpo.artifacts import check_completion_compatibility
 from baseline.utils.identity import IDENTITY_VERSION, short_identity
@@ -408,6 +410,13 @@ class AbstractTrainer(ABC):
             self.model,
             self.optimizer,
         )
+        self.adaptive_batch_profile.update({
+            "memory_model_version": MEASURED_MEMORY_MODEL_VERSION,
+            "training_memory_mode": resolve_training_memory_mode(
+                self.cfg.training.freeze_encoder,
+                self.cfg.training.lora.use_lora,
+            ),
+        })
         self.adaptive_batch_profile = profile_payload(
             self.adaptive_batch_profile,
             fixed,

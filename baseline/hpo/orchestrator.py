@@ -29,9 +29,13 @@ import yaml
 from pydantic import BaseModel
 
 from baseline.adaptive_batching import (
+    HEAD_ONLY_MEMORY_MODE,
     configure_cuda_allocator,
     derive_batch_candidates,
     is_cuda_oom,
+    merge_memory_observation,
+    remove_memory_observation,
+    select_measured_micro_batch,
     select_safe_micro_batch,
 )
 from baseline.abstract.factory import ModelRegistry
@@ -48,6 +52,7 @@ from baseline.hpo.artifacts import (
 )
 from baseline.hpo.config import HpoConfig
 from baseline.hpo.progressive import (
+    ProgressiveAssessment,
     assess_progressive_study,
     has_complete_progressive_evidence,
     progressive_assessment_block,
@@ -94,6 +99,27 @@ UNBUDGETED_TRIAL_STATES = frozenset({
 })
 HPO_RECOVERY_SEMANTICS_VERSION = 1
 MAX_HPO_RECOVERY_GENERATIONS = 100
+
+
+def _log_progressive_assessment(
+    scope: str,
+    assessment: ProgressiveAssessment,
+) -> None:
+    """Log top-region diagnostics for every allocation decision."""
+    span = (
+        f"{assessment.top_region_span:.6g}"
+        if assessment.top_region_span is not None
+        else "N/A"
+    )
+    logger.info(
+        "HPO scope %s top-region diagnostics: size=%d, span=%s, "
+        "stable=%s, semantics=%d.",
+        scope,
+        assessment.top_region_size,
+        span,
+        assessment.top_region_stable,
+        assessment.semantics_version,
+    )
 
 
 def _study_has_pruned_without_completion(study: Any) -> bool:
@@ -2150,9 +2176,111 @@ class CampaignRunner:
             finally:
                 calibration = None
                 _release_training_state()
+            initial_observation = self._memory_observation(memory_model)
+            memory_model["successful_memory_observations"] = (
+                merge_memory_observation([], initial_observation)
+            )
             cache[signature] = memory_model
             self.adaptive_batch_cache = cache
             return signature, cache, memory_model
+
+    @staticmethod
+    def _memory_observation(
+        memory_profile: Mapping[str, Any],
+        micro_batch_size: Optional[int] = None,
+    ) -> Dict[str, int]:
+        """Return one validated successful CUDA memory observation."""
+        batch_size = micro_batch_size
+        if batch_size is None:
+            batch_size = memory_profile.get("calibration_batch_size")
+        reserved = memory_profile.get(
+            "calibration_peak_reserved_bytes"
+        )
+        allocated = memory_profile.get(
+            "calibration_peak_allocated_bytes"
+        )
+        if (
+            isinstance(batch_size, bool)
+            or not isinstance(batch_size, int)
+            or batch_size <= 0
+            or isinstance(reserved, bool)
+            or not isinstance(reserved, int)
+            or reserved <= 0
+        ):
+            raise ValueError(
+                "Expected a positive calibration batch and reserved-memory "
+                f"peak, but got batch={batch_size!r}, peak={reserved!r}."
+            )
+        observation = {
+            "micro_batch_size": batch_size,
+            "measured_peak_reserved_bytes": reserved,
+        }
+        if (
+            not isinstance(allocated, bool)
+            and isinstance(allocated, int)
+            and allocated > 0
+        ):
+            observation["measured_peak_allocated_bytes"] = allocated
+        elif allocated is not None:
+            raise ValueError(
+                "Expected a positive allocated-memory peak, but got "
+                f"{allocated!r}."
+            )
+        return observation
+
+    def _record_successful_memory_observation(
+        self,
+        signature: str,
+        cache: Dict[str, Dict[str, Any]],
+        memory_profile: Dict[str, Any],
+        probe_profile: Mapping[str, Any],
+        micro_batch_size: int,
+    ) -> None:
+        """Cache one successful probe without changing trial selection."""
+        observation = self._memory_observation(
+            probe_profile,
+            micro_batch_size,
+        )
+        existing = memory_profile.get(
+            "successful_memory_observations",
+            [],
+        )
+        if not isinstance(existing, list):
+            raise TypeError(
+                "Expected successful_memory_observations to be a list."
+            )
+        merged = merge_memory_observation(existing, observation)
+        memory_profile["successful_memory_observations"] = merged
+        cached = dict(cache.get(signature, {}))
+        cached["successful_memory_observations"] = merged
+        cache[signature] = cached
+        self.adaptive_batch_cache = cache
+
+    def _invalidate_memory_observation(
+        self,
+        signature: str,
+        cache: Dict[str, Dict[str, Any]],
+        memory_profile: Dict[str, Any],
+        micro_batch_size: int,
+    ) -> None:
+        """Discard a probe result contradicted by an actual training OOM."""
+        existing = memory_profile.get(
+            "successful_memory_observations",
+            [],
+        )
+        if not isinstance(existing, list):
+            raise TypeError(
+                "Expected successful_memory_observations to be a list."
+            )
+        retained = remove_memory_observation(
+            existing,
+            micro_batch_size,
+        )
+        memory_profile["successful_memory_observations"] = retained
+        cached = dict(cache.get(signature, {}))
+        cached["successful_memory_observations"] = retained
+        cache[signature] = cached
+        self.adaptive_batch_cache = cache
 
     def _predicted_candidates(
         self,
@@ -2160,7 +2288,7 @@ class CampaignRunner:
         memory_model: Mapping[str, Any],
         uncertainty_factor: float,
         conservative_steps: int,
-    ) -> tuple[list[int], int]:
+    ) -> tuple[list[int], int, Dict[str, Any]]:
         """Return candidates starting below the predicted memory ceiling."""
         eligible = candidates
         oom_cap = memory_model.get("temporary_oom_cap")
@@ -2170,32 +2298,118 @@ class CampaignRunner:
                 for candidate in candidates
                 if candidate <= int(oom_cap)
             ]
-        selected, _ = select_safe_micro_batch(
+        if not eligible:
+            raise RuntimeError(
+                "Adaptive batching has no candidate under its temporary "
+                f"OOM cap {oom_cap!r}."
+            )
+        observations = memory_model.get(
+            "successful_memory_observations",
+            [],
+        )
+        if not isinstance(observations, list):
+            raise TypeError(
+                "Expected successful_memory_observations to be a list."
+            )
+        measured = select_measured_micro_batch(
             eligible,
+            observations,
             int(memory_model["estimated_fixed_bytes"]),
-            int(memory_model["calibration_peak_reserved_bytes"]),
-            int(memory_model["calibration_batch_size"]),
             int(memory_model["process_limit_bytes"]),
             uncertainty_factor,
         )
+        prediction_method = "measured_affine"
+        effective_steps = conservative_steps
+        if measured is None:
+            prediction_method = "single_point"
+            selected, _ = select_safe_micro_batch(
+                eligible,
+                int(memory_model["estimated_fixed_bytes"]),
+                int(memory_model["calibration_peak_reserved_bytes"]),
+                int(memory_model["calibration_batch_size"]),
+                int(memory_model["process_limit_bytes"]),
+                uncertainty_factor,
+            )
+        else:
+            selected, _ = measured
+            if (
+                memory_model.get("training_memory_mode")
+                == HEAD_ONLY_MEMORY_MODE
+            ):
+                effective_steps = 0
         selected = _synchronize_micro_batch(selected)
         selected_index = candidates.index(selected)
         conservative_index = min(
-            selected_index + conservative_steps,
+            selected_index + effective_steps,
             len(candidates) - 1,
         )
-        selected = _synchronize_micro_batch(
-            candidates[conservative_index]
+        known_safe_indices = [
+            candidates.index(int(observation["micro_batch_size"]))
+            for observation in observations
+            if int(observation.get("micro_batch_size", 0)) in eligible
+            and int(
+                observation.get(
+                    "measured_peak_reserved_bytes",
+                    int(memory_model["process_limit_bytes"]) + 1,
+                )
+            ) <= int(memory_model["process_limit_bytes"])
+        ]
+        reused_known_safe = False
+        if known_safe_indices:
+            known_safe_index = min(known_safe_indices)
+            if known_safe_index < conservative_index:
+                conservative_index = known_safe_index
+                reused_known_safe = True
+        selected = _synchronize_micro_batch(candidates[conservative_index])
+        if measured is None:
+            _, predicted_peak = select_safe_micro_batch(
+                [selected],
+                int(memory_model["estimated_fixed_bytes"]),
+                int(memory_model["calibration_peak_reserved_bytes"]),
+                int(memory_model["calibration_batch_size"]),
+                int(memory_model["process_limit_bytes"]),
+                uncertainty_factor,
+            )
+        else:
+            measured_selected = select_measured_micro_batch(
+                [selected],
+                observations,
+                int(memory_model["estimated_fixed_bytes"]),
+                int(memory_model["process_limit_bytes"]),
+                uncertainty_factor,
+            )
+            if measured_selected is None:
+                raise RuntimeError(
+                    "Measured memory selection lost its fitted model."
+                )
+            _, predicted_peak = measured_selected
+        promotion_reason = "none"
+        largest_observed = max(
+            (
+                int(observation.get("micro_batch_size", 0))
+                for observation in observations
+            ),
+            default=0,
         )
-        _, predicted_peak = select_safe_micro_batch(
-            [selected],
-            int(memory_model["estimated_fixed_bytes"]),
-            int(memory_model["calibration_peak_reserved_bytes"]),
-            int(memory_model["calibration_batch_size"]),
-            int(memory_model["process_limit_bytes"]),
-            uncertainty_factor,
+        if (
+            prediction_method == "measured_affine"
+            and memory_model.get("training_memory_mode")
+            == HEAD_ONLY_MEMORY_MODE
+            and selected > largest_observed
+        ):
+            promotion_reason = "head_only_measured_promotion"
+        elif reused_known_safe:
+            promotion_reason = "known_safe_reuse"
+        diagnostics = {
+            "memory_prediction_method": prediction_method,
+            "effective_conservative_divisor_steps": effective_steps,
+            "promotion_reason": promotion_reason,
+        }
+        return (
+            candidates[candidates.index(selected):],
+            predicted_peak,
+            diagnostics,
         )
-        return candidates[candidates.index(selected):], predicted_peak
 
     @staticmethod
     def _occupancy_band(memory_profile: Mapping[str, Any]) -> str:
@@ -2321,12 +2535,17 @@ class CampaignRunner:
             memory_profile = dict(memory_profile)
             memory_profile.update(current_limit.as_dict())
             self._apply_temporary_oom_cap(memory_profile)
-            candidates, predicted_peak = self._predicted_candidates(
+            (
+                candidates,
+                predicted_peak,
+                prediction_diagnostics,
+            ) = self._predicted_candidates(
                 candidates,
                 memory_profile,
                 batching.memory_uncertainty_factor,
                 batching.conservative_divisor_steps,
             )
+            memory_profile.update(prediction_diagnostics)
             memory_profile["estimated_selected_peak_bytes"] = (
                 predicted_peak
             )
@@ -2368,10 +2587,22 @@ class CampaignRunner:
                     probe_attempts.append({
                         "micro_batch_size": micro_batch,
                         "status": "success",
+                        "measured_peak_allocated_bytes": (
+                            probe_profile.get(
+                                "calibration_peak_allocated_bytes"
+                            )
+                        ),
                         "measured_peak_reserved_bytes": probe_profile.get(
                             "calibration_peak_reserved_bytes"
                         ),
                     })
+                    self._record_successful_memory_observation(
+                        signature,
+                        cache,
+                        memory_profile,
+                        probe_profile,
+                        micro_batch,
+                    )
                 except BaseException as exc:
                     if not is_cuda_oom(exc):
                         raise
@@ -2427,6 +2658,12 @@ class CampaignRunner:
                         micro_batch,
                     )
                     if micro_batch != 1:
+                        self._invalidate_memory_observation(
+                            signature,
+                            cache,
+                            memory_profile,
+                            micro_batch,
+                        )
                         next_micro_batch = (
                             1
                             if probe_failures >= batching.max_probe_failures
@@ -3264,6 +3501,7 @@ class CampaignRunner:
                     )
                     last_assessment = assessment
                     last_assessed_completed_count = completed_count
+                    _log_progressive_assessment(scope, assessment)
                     if not assessment.should_expand:
                         logger.info(
                             "HPO scope %s: progressive stop at completed "
@@ -3633,6 +3871,12 @@ class CampaignRunner:
                 "parameter_digest": semantic_digest({
                     "parameters": decoded,
                 }),
+                "progressive_assessment": (
+                    last_assessment.as_dict()
+                    if last_assessment is not None
+                    else None
+                ),
+                "progressive_bypass": progressive_bypass,
             }
             best_path = (
                 artifact_root
@@ -3726,11 +3970,19 @@ class CampaignRunner:
                 )
             else:
                 provenance = self.selection_provenance.get(scope, {})
-                self.hpo_outcomes.append({
+                outcome: Dict[str, Any] = {
                     "scope": scope,
                     "status": "selected",
                     "study_identity": provenance.get("study_identity"),
-                })
+                }
+                progressive_assessment = provenance.get(
+                    "progressive_assessment"
+                )
+                if progressive_assessment is not None:
+                    outcome["progressive_assessment"] = (
+                        progressive_assessment
+                    )
+                self.hpo_outcomes.append(outcome)
             finally:
                 runtime = self._active_study_runtime
                 if runtime is not None and get_is_master():

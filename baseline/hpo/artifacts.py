@@ -25,7 +25,7 @@ from baseline.utils.identity import (
     SUPPORTED_CONFIG_HASH_VERSIONS,
     build_campaign_semantic_config,
     build_run_semantic_config,
-    build_run_semantic_config_for_version,
+    build_run_compatibility_config,
     get_campaign_identity,
     get_legacy_run_hash,
     get_run_identity_for_version,
@@ -879,17 +879,15 @@ def _versioned_runtime_batch_compatibility(
             completion,
         )
         multitask = bool(saved_config.get("multitask"))
-        saved_semantic = build_run_semantic_config_for_version(
+        saved_semantic = build_run_compatibility_config(
             saved_config,
             multitask,
             identity_version,
-            apply_historical_defaults=True,
         )
-        expected_semantic = build_run_semantic_config_for_version(
+        expected_semantic = build_run_compatibility_config(
             expected_config,
             bool(expected_config.get("multitask")),
             identity_version,
-            apply_historical_defaults=True,
         )
     except ValueError as exc:
         return _compatibility_failure(str(exc), completion)

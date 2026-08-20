@@ -18,13 +18,22 @@ from torch import nn
 
 from baseline.abstract.trainer import AbstractTrainer
 from baseline.adaptive_batching import (
+    FULL_MEMORY_MODE,
+    HEAD_ONLY_MEMORY_MODE,
+    LORA_MEMORY_MODE,
     derive_batch_candidates,
+    estimate_fixed_training_bytes,
     exact_divisors,
+    merge_memory_observation,
+    remove_memory_observation,
     resolve_cuda_memory_limit,
+    resolve_training_memory_mode,
+    select_measured_micro_batch,
     select_safe_micro_batch,
 )
 from baseline.brainomni.brainomni_config import BrainOmniConfig
 from baseline.hpo.config import HpoConfig
+from baseline.hpo.orchestrator import CampaignRunner
 
 TEST_FS = 256
 
@@ -130,6 +139,264 @@ def test_calibrated_selector_uses_largest_predicted_divisor() -> None:
 
     assert selected == 4
     assert predicted == 800
+
+
+def test_measured_selector_promotes_frozen_tuev_shape() -> None:
+    """Two frozen measurements predict that the global batch fits."""
+    selected = select_measured_micro_batch(
+        candidates=[128, 64, 32, 16, 8, 4, 2, 1],
+        observations=[
+            {
+                "micro_batch_size": 1,
+                "measured_peak_reserved_bytes": 352,
+            },
+            {
+                "micro_batch_size": 32,
+                "measured_peak_reserved_bytes": 933,
+            },
+        ],
+        fixed_bytes=153,
+        process_limit_bytes=27_378,
+        uncertainty_factor=1.5,
+    )
+
+    assert selected is not None
+    assert selected[0] == 128
+    assert selected[1] < 27_378
+
+
+def test_measured_selector_keeps_full_tuab_shape_conservative() -> None:
+    """Full fine-tuning measurements do not predict a larger batch."""
+    selected = select_measured_micro_batch(
+        candidates=[128, 64, 32, 16, 8, 4, 2, 1],
+        observations=[
+            {
+                "micro_batch_size": 1,
+                "measured_peak_reserved_bytes": 841,
+            },
+            {
+                "micro_batch_size": 32,
+                "measured_peak_reserved_bytes": 13_562,
+            },
+        ],
+        fixed_bytes=605,
+        process_limit_bytes=27_378,
+        uncertainty_factor=1.5,
+    )
+
+    assert selected is not None
+    assert selected[0] == 32
+
+
+def test_memory_observations_keep_conservative_duplicate_peak() -> None:
+    """Repeated candidates retain their largest successful peak."""
+    merged = merge_memory_observation(
+        [{
+            "micro_batch_size": 32,
+            "measured_peak_reserved_bytes": 900,
+        }],
+        {
+            "micro_batch_size": 32,
+            "measured_peak_reserved_bytes": 950,
+            "measured_peak_allocated_bytes": 800,
+        },
+    )
+
+    assert merged == [{
+        "micro_batch_size": 32,
+        "measured_peak_reserved_bytes": 950,
+        "measured_peak_allocated_bytes": 800,
+    }]
+
+
+def test_training_oom_invalidates_successful_probe_observation() -> None:
+    """An actual OOM removes the contradicted disposable probe result."""
+    retained = remove_memory_observation(
+        [
+            {
+                "micro_batch_size": 1,
+                "measured_peak_reserved_bytes": 352,
+            },
+            {
+                "micro_batch_size": 32,
+                "measured_peak_reserved_bytes": 933,
+            },
+        ],
+        32,
+    )
+
+    assert retained == [{
+        "micro_batch_size": 1,
+        "measured_peak_reserved_bytes": 352,
+    }]
+
+
+@pytest.mark.parametrize(
+    ("freeze_encoder", "use_lora", "expected"),
+    [
+        (False, False, FULL_MEMORY_MODE),
+        (True, False, HEAD_ONLY_MEMORY_MODE),
+        (False, True, LORA_MEMORY_MODE),
+        (True, True, LORA_MEMORY_MODE),
+    ],
+)
+def test_training_memory_mode_respects_optimizer_strategy(
+    freeze_encoder: bool,
+    use_lora: bool,
+    expected: str,
+) -> None:
+    """Only a completely frozen non-LoRA encoder is head-only."""
+    assert resolve_training_memory_mode(
+        freeze_encoder,
+        use_lora,
+    ) == expected
+
+
+def test_fixed_memory_profile_separates_trainable_and_frozen_bytes() -> None:
+    """Analytical diagnostics reflect freezing applied by the optimizer."""
+    model = nn.Sequential(
+        nn.Linear(2, 2, bias=False),
+        nn.Linear(2, 1, bias=False),
+    )
+    for parameter in model[0].parameters():
+        parameter.requires_grad = False
+    optimizer = torch.optim.AdamW(model[1].parameters())
+
+    profile = estimate_fixed_training_bytes(model, optimizer)
+
+    assert profile["parameter_bytes"] == 24
+    assert profile["frozen_parameter_bytes"] == 16
+    assert profile["trainable_parameter_bytes"] == 8
+    assert profile["gradient_bytes"] == 8
+    assert profile["optimizer_state_bytes"] == 16
+
+
+def test_adaptive_signature_separates_freezing_strategies() -> None:
+    """Invocation memory observations cannot cross training strategies."""
+    runner = CampaignRunner.__new__(CampaignRunner)
+    full = BrainOmniConfig(fs=TEST_FS)
+    frozen = full.model_copy(deep=True)
+    frozen.training.freeze_encoder = True
+    lora = full.model_copy(deep=True)
+    lora.training.lora.use_lora = True
+
+    signatures = {
+        runner._adaptive_signature(full),
+        runner._adaptive_signature(frozen),
+        runner._adaptive_signature(lora),
+    }
+
+    assert len(signatures) == 3
+
+
+def _measured_memory_profile(mode: str) -> dict[str, Any]:
+    """Return a frozen-like two-point profile for candidate tests."""
+    return {
+        "training_memory_mode": mode,
+        "estimated_fixed_bytes": 153,
+        "calibration_peak_reserved_bytes": 352,
+        "calibration_batch_size": 1,
+        "process_limit_bytes": 27_378,
+        "successful_memory_observations": [
+            {
+                "micro_batch_size": 1,
+                "measured_peak_reserved_bytes": 352,
+            },
+            {
+                "micro_batch_size": 32,
+                "measured_peak_reserved_bytes": 933,
+            },
+        ],
+    }
+
+
+def test_head_only_candidate_uses_measured_full_promotion() -> None:
+    """Head-only training validates one predicted full-batch candidate."""
+    runner = CampaignRunner.__new__(CampaignRunner)
+    candidates, _, diagnostics = runner._predicted_candidates(
+        [128, 64, 32, 16, 8, 4, 2, 1],
+        _measured_memory_profile(HEAD_ONLY_MEMORY_MODE),
+        uncertainty_factor=1.5,
+        conservative_steps=1,
+    )
+
+    assert candidates[0] == 128
+    assert diagnostics["effective_conservative_divisor_steps"] == 0
+    assert diagnostics["promotion_reason"] == (
+        "head_only_measured_promotion"
+    )
+
+
+def test_head_only_candidate_respects_live_limit_and_oom_cap() -> None:
+    """Measured promotion remains bounded by current occupancy and caps."""
+    runner = CampaignRunner.__new__(CampaignRunner)
+    occupied = _measured_memory_profile(HEAD_ONLY_MEMORY_MODE)
+    occupied["process_limit_bytes"] = 900
+    occupied_candidates, _, _ = runner._predicted_candidates(
+        [128, 64, 32, 16, 8, 4, 2, 1],
+        occupied,
+        uncertainty_factor=1.5,
+        conservative_steps=1,
+    )
+    capped = _measured_memory_profile(HEAD_ONLY_MEMORY_MODE)
+    capped["temporary_oom_cap"] = 64
+    capped_candidates, _, _ = runner._predicted_candidates(
+        [128, 64, 32, 16, 8, 4, 2, 1],
+        capped,
+        uncertainty_factor=1.5,
+        conservative_steps=1,
+    )
+
+    assert occupied_candidates[0] == 16
+    assert capped_candidates[0] == 64
+
+
+@pytest.mark.parametrize("mode", [FULL_MEMORY_MODE, LORA_MEMORY_MODE])
+def test_non_head_only_candidate_retains_divisor_safety(
+    mode: str,
+) -> None:
+    """Full and LoRA modes retain the configured safety step."""
+    runner = CampaignRunner.__new__(CampaignRunner)
+    candidates, _, diagnostics = runner._predicted_candidates(
+        [128, 64, 32, 16, 8, 4, 2, 1],
+        _measured_memory_profile(mode),
+        uncertainty_factor=1.5,
+        conservative_steps=1,
+    )
+
+    assert candidates[0] == 64
+    assert diagnostics["effective_conservative_divisor_steps"] == 1
+
+
+def test_known_safe_candidate_does_not_regress() -> None:
+    """A pessimistic full model reuses a measured candidate that still fits."""
+    runner = CampaignRunner.__new__(CampaignRunner)
+    profile = {
+        "training_memory_mode": FULL_MEMORY_MODE,
+        "estimated_fixed_bytes": 605,
+        "calibration_peak_reserved_bytes": 841,
+        "calibration_batch_size": 1,
+        "process_limit_bytes": 27_378,
+        "successful_memory_observations": [
+            {
+                "micro_batch_size": 1,
+                "measured_peak_reserved_bytes": 841,
+            },
+            {
+                "micro_batch_size": 32,
+                "measured_peak_reserved_bytes": 13_562,
+            },
+        ],
+    }
+    candidates, _, diagnostics = runner._predicted_candidates(
+        [128, 64, 32, 16, 8, 4, 2, 1],
+        profile,
+        uncertainty_factor=1.5,
+        conservative_steps=1,
+    )
+
+    assert candidates[0] == 32
+    assert diagnostics["promotion_reason"] == "known_safe_reuse"
 
 
 def test_adaptive_configuration_validation_and_defaults() -> None:

@@ -2,7 +2,7 @@
 
 This repository evaluates EEG models on various downstream applications.
 
-Use `./.conda` environment for testing codes.
+Use the python environment specified in `.vscode/settings.json` or other user configurations for testing codes.
 
 ## Grill me
 

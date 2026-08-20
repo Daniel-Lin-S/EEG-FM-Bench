@@ -217,6 +217,8 @@ class ProgressiveHpoArgs(BaseModel):
         Absolute lower bound for meaningful objective differences.
     noise_multiplier : float, optional, default=2.0
         Pooled residual standard-deviation multiplier.
+    top_region_size : int, optional, default=3
+        Leading stable trials required for a converged objective plateau.
     """
 
     enabled: bool = True
@@ -225,6 +227,7 @@ class ProgressiveHpoArgs(BaseModel):
     residual_epochs: int = Field(default=5, ge=3)
     minimum_resolution: float = Field(default=1.0e-3, gt=0.0)
     noise_multiplier: float = Field(default=2.0, gt=0.0)
+    top_region_size: int = Field(default=3, ge=2)
 
 
 class HpoPatienceArgs(BaseModel):
