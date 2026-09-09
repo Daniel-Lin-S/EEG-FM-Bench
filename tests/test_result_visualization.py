@@ -464,3 +464,106 @@ def test_bh_adjustment_is_applied_per_metric() -> None:
     assert statistics[1]["q_value"] == pytest.approx(0.03)
     assert statistics[2]["q_value"] == pytest.approx(0.8)
     assert statistics[3]["q_value"] == pytest.approx(0.04)
+
+
+@pytest.mark.parametrize("absolute_parent", [False, True])
+def test_comparison_inheritance_and_subset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    absolute_parent: bool,
+) -> None:
+    """Resolve nested parents independently of cwd and apply child overrides."""
+    parent = tmp_path / "common.yaml"
+    _write_comparison_config(
+        parent,
+        [("A", tmp_path / "a"), ("B", tmp_path / "b")],
+        tmp_path / "output",
+    )
+    payload = yaml.safe_load(parent.read_text())
+    payload["datasets"].append({"name": "second", "task": "multiclass"})
+    payload["plot"] = {
+        "show_individual_points": True,
+        "naive_artifact": "A",
+    }
+    payload["output_dir"] = "${destination}"
+    parent.write_text(yaml.safe_dump(payload), encoding="utf-8")
+    child_dir = tmp_path / "nested"
+    child_dir.mkdir()
+    middle = child_dir / "middle.yaml"
+    middle.write_text(
+        "extends: ../common.yaml\nplot:\n  show_individual_points: false\n",
+        encoding="utf-8",
+    )
+    child = child_dir / "comparison.yaml"
+    child.write_text(
+        yaml.safe_dump({
+            "extends": str(middle) if absolute_parent else "middle.yaml",
+            "destination": str(tmp_path / "child_output"),
+            "dataset_subset": ["second", "toy"],
+            "task_metrics": {"binary": [ACC_METRIC]},
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path.parent)
+    config = load_result_comparison_config(child)
+    assert [dataset.name for dataset in config.datasets] == ["second", "toy"]
+    assert config.output_dir == tmp_path / "child_output"
+    assert config.plot.show_individual_points is False
+    assert config.plot.naive_artifact == "A"
+    assert config.task_metrics.binary == [ACC_METRIC]
+    assert config.task_metrics.multiclass == [ACC_METRIC, LOSS_METRIC]
+
+
+@pytest.mark.parametrize(
+    "content, error, message",
+    [
+        ("extends: missing.yaml\n", FileNotFoundError, "does not exist"),
+        ("extends: self.yaml\n", ValueError, "inheritance cycle"),
+        ("extends: []\n", ValueError, "non-empty extends path"),
+        ("extends: null\n", ValueError, "non-empty extends path"),
+        ("- item\n", ValueError, "Expected comparison YAML mapping"),
+    ],
+)
+def test_comparison_invalid_inheritance(
+    tmp_path: Path,
+    content: str,
+    error: type[Exception],
+    message: str,
+) -> None:
+    """Reject missing parents, cycles, invalid paths, and non-mapping YAML."""
+    path = tmp_path / "self.yaml"
+    path.write_text(content, encoding="utf-8")
+    with pytest.raises(error, match=message):
+        load_result_comparison_config(path)
+
+
+@pytest.mark.parametrize(
+    "subset, message",
+    [
+        (None, "non-empty list"),
+        ([], "non-empty list"),
+        ("toy", "non-empty list"),
+        ([1], "non-empty list"),
+        (["toy", "toy"], "unique dataset names"),
+        (["absent"], "unconfigured datasets"),
+    ],
+)
+def test_comparison_invalid_dataset_subset(
+    tmp_path: Path,
+    subset: object,
+    message: str,
+) -> None:
+    """Do not silently ignore malformed or unknown dataset selections."""
+    parent = tmp_path / "common.yaml"
+    _write_comparison_config(
+        parent,
+        [("A", tmp_path / "a"), ("B", tmp_path / "b")],
+        tmp_path / "output",
+    )
+    child = tmp_path / "comparison.yaml"
+    child.write_text(
+        yaml.safe_dump({"extends": "common.yaml", "dataset_subset": subset}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match=message):
+        load_result_comparison_config(child)

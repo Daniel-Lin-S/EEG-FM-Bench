@@ -2,7 +2,12 @@
 
 The comparison YAML provides completed artifact roots and optionally XLSX
 paper-result sources. It is intentionally local because source paths must not
-appear in public configuration files.
+appear in public configuration files. Optional ``extends`` names one YAML
+file relative to the declaring file (absolute paths also work). Mappings
+merge recursively; child values and lists replace inherited values.
+``dataset_subset`` optionally selects an ordered list of dataset names
+from the merged definitions. The output is a validated configuration;
+loading does not read result artifacts or write files.
 """
 
 from __future__ import annotations
@@ -10,7 +15,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
@@ -429,21 +434,101 @@ def load_result_comparison_config(
     ValueError
         If YAML content is not a mapping accepted by the schema.
     """
-    if not config_path.is_file():
-        raise FileNotFoundError(
-            f"Comparison configuration does not exist: "
-            f"{config_path.resolve()}."
-        )
-    loaded = OmegaConf.load(config_path)
+    loaded = _load_comparison_mapping(config_path, ())
     resolved = OmegaConf.to_container(
         loaded,
         resolve=True,
         throw_on_missing=True,
     )
-    if not isinstance(resolved, dict):
-        raise ValueError(
-            "Expected comparison YAML mapping at "
-            f"{config_path.resolve()}, but got "
-            f"{type(resolved).__name__}."
+    config = ResultComparisonConfig.model_validate(resolved)
+    if "dataset_subset" in resolved:
+        config = _select_config_datasets(
+            config, resolved["dataset_subset"],
         )
-    return ResultComparisonConfig.model_validate(resolved)
+    return config
+
+
+def _load_comparison_mapping(
+    config_path: Path,
+    ancestors: tuple[Path, ...],
+) -> DictConfig:
+    """Merge an inheritance chain without resolving interpolations early.
+
+    Parameters
+    ----------
+    config_path : pathlib.Path
+        YAML mapping to load, with an optional single ``extends`` path.
+    ancestors : tuple[pathlib.Path, ...]
+        Resolved paths already visited in this inheritance chain.
+
+    Returns
+    -------
+    DictConfig
+        Merged mapping with inheritance directives removed.
+    """
+    config_path = config_path.resolve()
+    if config_path in ancestors:
+        chain = " -> ".join(map(str, (*ancestors, config_path)))
+        raise ValueError(f"Comparison configuration inheritance cycle: {chain}")
+    if not config_path.is_file():
+        raise FileNotFoundError(
+            f"Comparison configuration does not exist: {config_path}."
+        )
+    loaded = OmegaConf.load(config_path)
+    if not isinstance(loaded, DictConfig):
+        raise ValueError(
+            f"Expected comparison YAML mapping at {config_path}, "
+            f"but got {type(loaded).__name__}."
+        )
+    if "extends" not in loaded:
+        return loaded
+    parent = loaded.pop("extends")
+    if not isinstance(parent, str) or not parent.strip():
+        raise ValueError(
+            f"Expected a non-empty extends path at {config_path}, "
+            f"but got {parent!r}."
+        )
+    inherited = _load_comparison_mapping(
+        config_path.parent / parent,
+        (*ancestors, config_path),
+    )
+    return OmegaConf.merge(inherited, loaded)
+
+
+def _select_config_datasets(
+    config: ResultComparisonConfig,
+    subset: object,
+) -> ResultComparisonConfig:
+    """Select dataset definitions by name while preserving requested order.
+
+    Parameters
+    ----------
+    config : ResultComparisonConfig
+        Validated configuration containing the shared dataset definitions.
+    subset : object
+        Expected non-empty list of unique configured dataset names.
+
+    Returns
+    -------
+    ResultComparisonConfig
+        Revalidated configuration restricted to the requested datasets.
+    """
+    if (
+        not isinstance(subset, list)
+        or not subset
+        or any(not isinstance(name, str) or not name.strip() for name in subset)
+    ):
+        raise ValueError(
+            "dataset_subset must be a non-empty list of dataset names."
+        )
+    if len(subset) != len(set(subset)):
+        raise ValueError("dataset_subset must contain unique dataset names.")
+    datasets = {dataset.name: dataset for dataset in config.datasets}
+    unknown = sorted(set(subset) - datasets.keys())
+    if unknown:
+        raise ValueError(
+            f"dataset_subset references unconfigured datasets: {unknown}."
+        )
+    payload = config.model_dump()
+    payload["datasets"] = [datasets[name].model_dump() for name in subset]
+    return ResultComparisonConfig.model_validate(payload)

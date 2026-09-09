@@ -4,6 +4,15 @@
 # path with an absolute path, then run:
 #   python result_vis.py <comparison.local.yaml>
 #
+# Shared local settings can be inherited with:
+#   extends: comparison_common.local.yaml
+# Resolve extends relative to this YAML file. Child mappings override
+# individual keys; child lists replace inherited lists. Remove metrics,
+# datasets, and task_metrics below to inherit those shared definitions.
+# Optionally select inherited datasets in order without repeating metadata:
+#   dataset_subset: [dataset_a, dataset_b]
+# Missing files, inheritance cycles, and invalid subsets raise errors.
+#
 # Labels describe any comparison condition. They do not need to be model names.
 
 artifacts:
