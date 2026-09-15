@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 from omegaconf import OmegaConf
-from pydantic import ValidationError
+from pydantic import ValidationError, create_model
 
 import baseline.abstract.trainer as trainer_module
 import baseline.hpo.orchestrator as orchestrator_module
@@ -1787,6 +1787,46 @@ def test_progressive_unstable_top_region_continues() -> None:
 def test_progressive_default_top_region_size_is_three() -> None:
     """The less-conservative convergence evidence uses three leaders."""
     assert ProgressiveHpoArgs().top_region_size == 3
+
+
+@pytest.mark.parametrize("freeze_encoder", [None, False, True])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_encoder_hpo_filtering_respects_training_capability(
+    freeze_encoder: bool | None,
+    enabled: bool,
+) -> None:
+    """Only frozen encoders lose search paths; inputs remain unchanged."""
+    training_class = (
+        create_model("TrainingArgs")
+        if freeze_encoder is None
+        else create_model("TrainingArgs", freeze_encoder=(bool, ...))
+    )
+    training = (
+        training_class()
+        if freeze_encoder is None
+        else training_class(freeze_encoder=freeze_encoder)
+    )
+    config_class = create_model("Config", training=(training_class, ...))
+    config = config_class(training=training)
+    hpo = make_hpo_config().model_copy(update={"enabled": enabled})
+    original_config = config.model_dump(mode="json")
+    original_hpo = hpo.model_dump(mode="json")
+    expected_paths = (
+        frozenset({ENCODER_LR_SCALE_PATH})
+        if freeze_encoder is True
+        else frozenset()
+    )
+
+    inactive = orchestrator_module._inactive_hpo_search_paths(config)
+    effective = orchestrator_module._effective_hpo_config(config, hpo)
+
+    assert inactive == expected_paths
+    expected_hpo = copy.deepcopy(original_hpo)
+    for path in expected_paths:
+        expected_hpo["search_space"].pop(path)
+    assert effective.model_dump(mode="json") == expected_hpo
+    assert config.model_dump(mode="json") == original_config
+    assert hpo.model_dump(mode="json") == original_hpo
 
 
 def test_auto_filter_encoder_lr_scale_for_frozen_encoder() -> None:

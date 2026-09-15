@@ -11,6 +11,9 @@ from einops import rearrange, pack, unpack
 from vector_quantize_pytorch.vector_quantize_pytorch import rotate_to
 
 
+KMEANS_SAMPLE_SIZE = 4096
+
+
 def first(it):
     return it[0]
 
@@ -101,8 +104,84 @@ def uniform_init(*shape: int):
 
 
 @torch.no_grad()
-def kmeans(samples: torch.Tensor, nums_clusters: int, kmeans_iters: int):
+def squared_euclidean_distances(
+    samples: torch.Tensor,
+    centers: torch.Tensor,
+) -> torch.Tensor:
+    """Return pairwise squared distances without a 3-D workspace.
+
+    Parameters
+    ----------
+    samples : torch.Tensor
+        Sample matrix with shape ``(n_samples, dimension)``.
+    centers : torch.Tensor
+        Center matrix with shape ``(n_centers, dimension)``.
+
+    Returns
+    -------
+    torch.Tensor
+        Squared distances with shape ``(n_samples, n_centers)``.
+    """
+    if samples.ndim != 2 or centers.ndim != 2:
+        raise ValueError(
+            "Expected two-dimensional sample and center matrices, but got "
+            f"shapes {tuple(samples.shape)} and {tuple(centers.shape)}."
+        )
+    if samples.shape[1] != centers.shape[1]:
+        raise ValueError(
+            "Sample and center dimensions must match, but got "
+            f"{samples.shape[1]} and {centers.shape[1]}."
+        )
+    if not torch.isfinite(samples).all():
+        raise ValueError("K-means samples contain non-finite values.")
+    if not torch.isfinite(centers).all():
+        raise ValueError("K-means centers contain non-finite values.")
+    compute_dtype = (
+        torch.float32
+        if samples.dtype in {torch.float16, torch.bfloat16}
+        else samples.dtype
+    )
+    samples_for_distance = samples.to(dtype=compute_dtype)
+    centers_for_distance = centers.to(dtype=compute_dtype)
+    sample_norms = samples_for_distance.square().sum(
+        dim=1,
+        keepdim=True,
+    )
+    center_norms = centers_for_distance.square().sum(
+        dim=1,
+    ).unsqueeze(0)
+    distances = sample_norms + center_norms
+    distances.addmm_(
+        samples_for_distance,
+        centers_for_distance.transpose(0, 1),
+        beta=1.0,
+        alpha=-2.0,
+    )
+    return distances.clamp_min_(0.0)
+
+
+@torch.no_grad()
+def kmeans(
+    samples: torch.Tensor,
+    nums_clusters: int,
+    kmeans_iters: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Cluster flattened samples using bounded-memory squared distances."""
+    if nums_clusters <= 0:
+        raise ValueError(
+            "Expected a positive number of k-means clusters, but got "
+            f"{nums_clusters}."
+        )
+    if kmeans_iters <= 0:
+        raise ValueError(
+            "Expected a positive number of k-means iterations, but got "
+            f"{kmeans_iters}."
+        )
     samples = rearrange(samples, "... d -> (...) d")
+    if samples.shape[0] == 0:
+        raise ValueError("K-means requires at least one sample vector.")
+    if not torch.isfinite(samples).all():
+        raise ValueError("K-means samples contain non-finite values.")
     dim, dtype = samples.shape[1], samples.dtype
     if samples.shape[0] < nums_clusters:
         random_noise = torch.randn(
@@ -112,15 +191,19 @@ def kmeans(samples: torch.Tensor, nums_clusters: int, kmeans_iters: int):
         )
         samples = torch.cat([samples, random_noise], dim=0)
     centers = sample_vectors(samples, nums_clusters)
-    for i in range(kmeans_iters):
-        diffs = ((samples.unsqueeze(1) - centers) ** 2).sum(dim=-1)
-        buckets = diffs.argmin(dim=-1)
+    for _ in range(kmeans_iters):
+        distances = squared_euclidean_distances(samples, centers)
+        buckets = distances.argmin(dim=-1)
         bins = torch.bincount(buckets, minlength=nums_clusters)
         zero_mask = bins == 0
         bins[zero_mask] = 1
 
         new_centers = centers.new_zeros(nums_clusters, dim, dtype=dtype)
-        new_centers.scatter_add_(0, buckets.unsqueeze(-1).repeat([1, dim]), samples)
+        new_centers.scatter_add_(
+            0,
+            buckets.unsqueeze(-1).expand(-1, dim),
+            samples,
+        )
         new_centers = new_centers / bins[..., None]
         centers = torch.where(zero_mask[..., None], centers, new_centers)
 
@@ -255,7 +338,7 @@ class EuclideanCodebook(nn.Module):
         if self.inited:
             return
         embed, cluster_size = kmeans(
-            sample_vectors(data, 4096),
+            sample_vectors(data, KMEANS_SAMPLE_SIZE),
             self.codebook_size,
             self.kmeans_iters,
         )

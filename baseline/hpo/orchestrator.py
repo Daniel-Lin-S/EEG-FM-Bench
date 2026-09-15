@@ -435,13 +435,19 @@ def _effective_hpo_config(
 ) -> HpoConfig:
     """Remove search parameters that cannot affect the resolved model."""
     payload = hpo_config.model_dump(mode="json")
-    if bool(config.training.freeze_encoder):
-        payload["search_space"].pop(ENCODER_LR_SCALE_PATH, None)
+    for path in _inactive_hpo_search_paths(config):
+        payload["search_space"].pop(path, None)
     return HpoConfig.model_validate(payload)
 
 
 def _inactive_hpo_search_paths(config: BaseModel) -> frozenset[str]:
-    """Return search paths that cannot affect the resolved training."""
+    """Return inactive paths when training supports encoder freezing.
+
+    Training schemas without ``freeze_encoder`` do not participate in
+    encoder-specific filtering.
+    """
+    if not hasattr(config.training, "freeze_encoder"):
+        return frozenset()
     if bool(config.training.freeze_encoder):
         return frozenset({ENCODER_LR_SCALE_PATH})
     return frozenset()
