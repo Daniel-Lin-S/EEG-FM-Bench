@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import math
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from pydantic import Field
+
+from baseline.brainomni.validation import require_frozen_tokenizer
 
 from baseline.abstract.config import (
 	AbstractConfig,
@@ -34,7 +36,9 @@ class BrainOmniModelArgs(BaseModelArgs):
 	signal_normalize_eps, position_normalize_eps : float
 		Positive numerical floors used by signal and position normalization.
 	freeze_tokenizer : bool
-		Whether tokenizer parameters are excluded from gradient updates.
+		Must be True; downstream evaluation does not train the tokenizer.
+	attention_dropout_policy : {"train_only"}
+		Attention dropout is active only in training; versions run identity.
 	strict_load : bool
 		Whether checkpoint state-dict loading must match the encoder exactly.
 	window_length, n_filters, ratios, kernel_size, last_kernel_size, n_dim, n_head,
@@ -52,7 +56,8 @@ class BrainOmniModelArgs(BaseModelArgs):
 	position_normalize_eps: float = 1e-8
 
 	# Checkpoint loading behavior
-	freeze_tokenizer: bool = False
+	freeze_tokenizer: bool = True
+	attention_dropout_policy: Literal["train_only"] = "train_only"
 	strict_load: bool = False
 
 	# Fallback architecture configuration (used when pretrained_path is None)
@@ -177,6 +182,11 @@ class BrainOmniConfig(AbstractConfig):
 		bool
 			``True`` if configuration is valid.
 		"""
+		try:
+			require_frozen_tokenizer(self.model.freeze_tokenizer)
+		except ValueError:
+			return False
+
 		if not math.isfinite(self.model.signal_normalize_eps):
 			return False
 		if self.model.signal_normalize_eps <= 0.0:

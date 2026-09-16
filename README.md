@@ -1128,3 +1128,18 @@ See the [LICENSE](LICENSE) file for complete terms and conditions.
 [⬆ Back to Top](#eeg-fm-bench-a-comprehensive-benchmark-for-eeg-foundation-models)
 
 </div>
+
+### BrainOmni tokenizer policy
+
+BrainOmni downstream evaluation requires `model.freeze_tokenizer: true`
+(the default). Explicit `false` warns and rejects the configuration before
+creating a campaign. The tokenizer remains in evaluation mode without
+gradient updates. With `training.freeze_encoder: false`, `ft-full` trains
+the downstream transformer and classifier; with `true`, the encoder is
+frozen. Neither setting trains the tokenizer. Random-tokenizer templates
+are not provided as end-to-end random-initialisation baselines.
+
+BrainOmni attention dropout is enabled only during training. The resolved
+`model.attention_dropout_policy: train_only` distinguishes corrected runs
+from historical campaigns with evaluation dropout. Historical artifacts
+remain unchanged and are not automatically reused for corrected runs.

@@ -26,7 +26,7 @@ model:
   normalize_input: true
   normalize_position: true
 
-  freeze_tokenizer: false
+  freeze_tokenizer: true
 
   # add architecture-related parameters as well if the
   # architecture is different from the public pre-trained version of BrainOmni

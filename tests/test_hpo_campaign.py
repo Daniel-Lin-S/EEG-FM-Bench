@@ -1889,3 +1889,41 @@ def test_unfrozen_encoder_keeps_encoder_lr_scale() -> None:
 
     assert "training.encoder_lr_scale" in hpo.search_space
     assert "training.max_lr" in hpo.search_space
+
+
+@pytest.mark.parametrize("namespaced", [False, True])
+def test_audit_study_without_winner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, namespaced: bool,
+) -> None:
+    """Failed-only studies have no selected config and never crash audits."""
+    runner = CampaignRunner.__new__(CampaignRunner)
+    runner.paths = CampaignPaths(tmp_path / "log", tmp_path / "ckpt")
+    runner.campaign_hash = "campaign"
+    runner.campaign_aliases = frozenset()
+    runner.hpo_config = make_hpo_config()
+    identity, _ = runner._study_identity("alpha")
+    scope_root = _hpo_scope_root(runner.paths.log_root, "alpha")
+    directory = scope_root / "studies" / identity if namespaced else scope_root
+    directory.mkdir(parents=True)
+    storage = directory / "study.sqlite3"
+    storage.touch()
+    record = {
+        "study_name": identity, "storage_path": str(storage.resolve()),
+        "semantic_payload_present": True, "semantic_payload_valid": True,
+        "campaign_identity": "campaign", "scope": "alpha",
+        "identity_version": 5, "direction": "MINIMIZE",
+        "distributions_consistent": True,
+        "distributions": orchestrator_module._serialized_trial_distributions(
+            runner.hpo_config,
+        ),
+        "complete": 0, "pruned": 0, "failed": 5, "running": 0,
+        "best_trial": None, "best_value": None,
+    }
+    monkeypatch.setattr(
+        orchestrator_module, "_read_sqlite_studies",
+        lambda path: [record] if path == storage else [],
+    )
+    report, selected = runner._audit_hpo_scope("alpha", {})
+    assert report["status"] == "no_completed_trial"
+    assert selected is None
+    assert storage.read_bytes() == b""

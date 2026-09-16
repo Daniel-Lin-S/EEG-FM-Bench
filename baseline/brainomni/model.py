@@ -17,6 +17,8 @@ from typing import Any, Dict, Tuple
 import torch
 from torch import nn
 
+from baseline.brainomni.validation import require_frozen_tokenizer
+
 
 logger = logging.getLogger("baseline")
 
@@ -194,8 +196,13 @@ def build_brainomni_from_cfg(model_cfg: Dict[str, Any]) -> nn.Module:
     nn.Module
         Instantiated BrainOmni model.
     """
+    require_frozen_tokenizer(model_cfg.get("freeze_tokenizer", True))
     brainomni_cls = import_brainomni_class()
-    return brainomni_cls(**model_cfg)
+    model = brainomni_cls(**model_cfg)
+    if hasattr(model, "tokenizer"):
+        model.tokenizer.requires_grad_(False)
+        model.tokenizer.eval()
+    return model
 
 
 def load_brainomni_weights(
@@ -274,7 +281,7 @@ def _migrate_legacy_weight_norm_state_dict(
 def load_brainomni_from_pretrained(
     pretrained_path: str,
     strict: bool = False,
-    freeze_tokenizer: bool = False,
+    freeze_tokenizer: bool = True,
     map_location: str | torch.device = "cpu",
 ) -> Tuple[nn.Module, int]:
     """Build and load a BrainOmni model from pretrained directory.
@@ -286,8 +293,8 @@ def load_brainomni_from_pretrained(
         and ``BrainOmni.pt`` weights.
     strict : bool, optional
         Whether to enforce strict state-dict loading.
-    freeze_tokenizer : bool, optional
-        Whether to freeze tokenizer parameters after loading.
+    freeze_tokenizer : bool, optional, default=True
+        Must be True; False warns and raises before checkpoint access.
     map_location : str | torch.device, optional
         Torch load device.
 
@@ -296,6 +303,7 @@ def load_brainomni_from_pretrained(
     Tuple[nn.Module, int]
         Loaded BrainOmni model and embedding dimension ``lm_dim``.
     """
+    require_frozen_tokenizer(freeze_tokenizer)
     pretrained_dir = resolve_pretrained_dir(pretrained_path)
     model_cfg = load_brainomni_model_cfg(pretrained_dir)
 
@@ -311,10 +319,6 @@ def load_brainomni_from_pretrained(
         logger.warning("BrainOmni checkpoint loading missing keys: %s", missing_keys)
     if unexpected_keys:
         logger.warning("BrainOmni checkpoint loading unexpected keys: %s", unexpected_keys)
-
-    if freeze_tokenizer and hasattr(model, "tokenizer"):
-        for param in model.tokenizer.parameters():
-            param.requires_grad = False
 
     lm_dim = int(getattr(model, "lm_dim"))
     return model, lm_dim

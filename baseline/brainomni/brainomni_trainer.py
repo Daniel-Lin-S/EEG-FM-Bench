@@ -19,6 +19,7 @@ from baseline.brainomni.model import (
 	load_brainomni_from_pretrained,
 	load_brainomni_weights,
 )
+from baseline.brainomni.validation import require_frozen_tokenizer
 
 
 logger = logging.getLogger("baseline")
@@ -77,6 +78,7 @@ class BrainOmniTrainer(AbstractTrainer):
 	"""BrainOmni trainer implementing the abstract baseline interfaces."""
 
 	def __init__(self, cfg: BrainOmniConfig) -> None:
+		require_frozen_tokenizer(cfg.model.freeze_tokenizer)
 		super().__init__(cfg)
 		self.cfg = cfg
 
@@ -126,6 +128,7 @@ class BrainOmniTrainer(AbstractTrainer):
 		)
 
 		model = self.apply_lora(model)
+		self.encoder.tokenizer.requires_grad_(False)
 		model = model.to(self.device)
 		model = self.maybe_wrap_ddp(model, find_unused_parameters=True)
 
@@ -169,6 +172,7 @@ class BrainOmniTrainer(AbstractTrainer):
 
 	def _build_encoder(self, cfg: BrainOmniModelArgs) -> Tuple[nn.Module, int]:
 		"""Build BrainOmni encoder from pretrained checkpoint or fallback config."""
+		require_frozen_tokenizer(cfg.freeze_tokenizer)
 		if cfg.pretrained_path:
 			logger.info("Loading BrainOmni pretrained checkpoint from: %s", cfg.pretrained_path)
 			encoder, embed_dim = load_brainomni_from_pretrained(
@@ -205,9 +209,6 @@ class BrainOmniTrainer(AbstractTrainer):
 		}
 
 		encoder = build_brainomni_from_cfg(model_cfg=constructor_cfg)
-		if cfg.freeze_tokenizer and hasattr(encoder, "tokenizer"):
-			for param in encoder.tokenizer.parameters():
-				param.requires_grad = False
 
 		embed_dim = int(getattr(encoder, "lm_dim"))
 		return encoder, embed_dim

@@ -5071,6 +5071,9 @@ class CampaignRunner:
             for record in records
             if record is not selected_record
         ]
+        if selected_record["best_trial"] is None:
+            report["status"] = "no_completed_trial"
+            return report, None
         storage_path = Path(selected_record["storage_path"])
         legacy_path = (scope_root / "study.sqlite3").resolve()
         if storage_path == legacy_path:

@@ -1,3 +1,11 @@
+"""Residual quantization of tensors with a final embedding dimension.
+
+Inputs have shape ``(batch, ..., dimension)``. Quantizers return matching
+reconstructions, integer code indices and scalar commitment losses. EMA
+checkpoints retain ``embed`` (centroids), ``cluster_size`` (counts), and
+``embed_avg`` (accumulated vector sums), all indexed by code.
+"""
+
 from __future__ import annotations
 import torch
 import torch.nn as nn
@@ -12,6 +20,7 @@ from vector_quantize_pytorch.vector_quantize_pytorch import rotate_to
 
 
 KMEANS_SAMPLE_SIZE = 4096
+INITIAL_CODE_COUNT = 1.0
 
 
 def first(it):
@@ -329,12 +338,23 @@ class EuclideanCodebook(nn.Module):
         self.epsilon = epsilon
         self.threshold_ema_dead_code = threshold_ema_dead_code
         self.register_buffer("inited", torch.Tensor([not kmeans_init]))
-        self.register_buffer("cluster_size", torch.zeros(codebook_size))
+        initial_count = 0.0 if kmeans_init else INITIAL_CODE_COUNT
+        self.register_buffer(
+            "cluster_size", torch.full((codebook_size,), initial_count)
+        )
         self.register_buffer("embed", embed)
         self.register_buffer("embed_avg", embed.clone())
 
     @torch.jit.ignore
-    def init_embed_(self, data):
+    @torch.no_grad()
+    def init_embed_(self, data: torch.Tensor) -> None:
+        """Initialize synchronized centroids, EMA counts and vector sums.
+
+        Parameters
+        ----------
+        data : torch.Tensor
+            Non-empty vectors of shape ``(samples, dimension)``.
+        """
         if self.inited:
             return
         embed, cluster_size = kmeans(
@@ -342,21 +362,42 @@ class EuclideanCodebook(nn.Module):
             self.codebook_size,
             self.kmeans_iters,
         )
-        # embed, cluster_size = embed.to(data.device), cluster_size.to(data.device)
         self.embed.data.copy_(embed)
-        self.embed_avg.data.copy_(embed.clone())
+        self.embed_avg.data.copy_(embed * cluster_size.unsqueeze(1))
         self.cluster_size.data.copy_(cluster_size)
         self.inited.data.copy_(torch.Tensor([True]))
         # Make sure all buffers across workers are in sync after initialization
         broadcast_tensors(self.buffers())
 
-    def replace_(self, samples, mask):
-        modified_codebook = torch.where(
-            mask[..., None], sample_vectors(samples, self.codebook_size), self.embed
-        )
-        self.embed.data.copy_(modified_codebook)
+    @torch.no_grad()
+    def replace_(self, samples: torch.Tensor, mask: torch.Tensor) -> None:
+        """Reset selected centroids, counts and vector sums together.
 
-    def expire_codes_(self, batch_samples):
+        Parameters
+        ----------
+        samples : torch.Tensor
+            Candidate vectors of shape ``(samples, dimension)``.
+        mask : torch.Tensor
+            Boolean replacement mask of shape ``(codebook_size,)``.
+        """
+        replacements = sample_vectors(samples, self.codebook_size)
+        self.embed.copy_(torch.where(mask[:, None], replacements, self.embed))
+        self.cluster_size.masked_fill_(mask, self.threshold_ema_dead_code)
+        self.embed_avg.copy_(torch.where(
+            mask[:, None],
+            replacements * self.threshold_ema_dead_code,
+            self.embed_avg,
+        ))
+
+    @torch.no_grad()
+    def expire_codes_(self, batch_samples: torch.Tensor) -> None:
+        """Revive dead entries after the EMA update and broadcast all state.
+
+        Parameters
+        ----------
+        batch_samples : torch.Tensor
+            Candidate vectors with final axis ``dimension``.
+        """
         if self.threshold_ema_dead_code == 0:
             return
 
@@ -402,24 +443,45 @@ class EuclideanCodebook(nn.Module):
         quantize = self.dequantize(embed_ind)
         return quantize
 
-    def forward(self, x):
+    def forward(
+        self, x: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Quantize vectors and update EMA state only during training.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Finite vectors shaped ``(batch, ..., dimension)``.
+
+        Returns
+        -------
+        tuple[torch.Tensor, torch.Tensor]
+            Quantized vectors matching x and integer indices shaped
+            ``(batch, ...)``. Evaluation preserves initialized state.
+        """
         shape, dtype = x.shape, x.dtype
+        if x.ndim < 2 or x.shape[-1] != self.embed.shape[-1]:
+            raise ValueError(
+                "Expected codebook input with shape (batch, ..., "
+                f"{self.embed.shape[-1]}), got {tuple(x.shape)}."
+            )
+        if x.numel() == 0 or not torch.isfinite(x).all():
+            raise ValueError("Codebook input must be non-empty and finite.")
         x = rearrange(x, "... d -> (...) d")
         self.init_embed_(x)
         embed_ind = self.quantize(x)
-        embed_onehot = F.one_hot(embed_ind, self.codebook_size).type(dtype)
+        embed_onehot = F.one_hot(embed_ind, self.codebook_size).float()
         embed_ind = embed_ind.view(*shape[:-1])
         quantize = self.dequantize(embed_ind).type(dtype)
 
         if self.training:
-            self.expire_codes_(x)
             # 统计的是每一条编码使用过多少次（未归一化），更新
             one_hot_sum = embed_onehot.sum(0)
             all_reduce_tensors([one_hot_sum], op=dist.ReduceOp.SUM)
             ema_inplace(self.cluster_size, one_hot_sum, self.decay)
             # 将每条编码对应的embedding全部加起来（未归一化）,更新
-            embed_sum = embed_onehot.t() @ x
-            embed_sum = embed_sum.to(torch.float32)
+            with torch.autocast(x.device.type, enabled=False):
+                embed_sum = embed_onehot.t() @ x.float()
             all_reduce_tensors([embed_sum], op=dist.ReduceOp.SUM)
             ema_inplace(self.embed_avg, embed_sum, self.decay)
             # 进行一次平滑
@@ -429,8 +491,13 @@ class EuclideanCodebook(nn.Module):
             )
             # 将新的embed替换
             embed_normalized = self.embed_avg / cluster_size.unsqueeze(1)
+            if not torch.isfinite(embed_normalized).all():
+                raise ValueError("EMA update produced non-finite centroids.")
             self.embed.data.copy_(embed_normalized)
+            self.expire_codes_(x)
 
+        if not torch.isfinite(quantize).all():
+            raise ValueError("Codebook output must be finite.")
         return quantize, embed_ind
 
 
